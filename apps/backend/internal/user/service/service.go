@@ -35,47 +35,48 @@ type Service struct {
 }
 
 type UpdateUserSettingsRequest struct {
-	WorkspaceID                 *string
-	KanbanViewMode              *string
-	WorkflowFilterID            *string
-	RepositoryIDs               *[]string
-	TasksListSort               *string
-	TasksListGroup              *string
-	TasksListShowDetails        *bool
-	InitialSetupComplete        *bool
-	PreferredShell              *string
-	DefaultEditorID             *string
-	EnablePreviewOnClick        *bool
-	ChatSubmitKey               *string
-	ReviewAutoMarkOnScroll      *bool
-	ConfirmTaskArchive          *bool
-	MCPTaskAgentProfileDefault  *string
-	ShowReleaseNotification     *bool
-	ReleaseNotesLastSeenVersion *string
-	LspAutoStartLanguages       *[]string
-	LspAutoInstallLanguages     *[]string
-	LspServerConfigs            *map[string]map[string]interface{}
-	SavedLayouts                *[]models.SavedLayout
-	SidebarViews                *[]models.SidebarView
-	SidebarActiveViewID         *string
-	SidebarDraft                **models.SidebarViewDraft
-	SidebarTaskPrefs            *models.SidebarTaskPrefs
-	TaskCreateLastUsed          *models.TaskCreateLastUsed
-	JiraSavedViews              **json.RawMessage
-	JiraTaskPresets             **json.RawMessage
-	GitHubSavedPresets          **json.RawMessage
-	GitHubDefaultQueryPresets   **json.RawMessage
-	GitLabSavedPresets          **json.RawMessage
-	DefaultUtilityAgentID       *string
-	DefaultUtilityModel         *string
-	KeyboardShortcuts           *map[string]interface{}
-	TerminalLinkBehavior        *string
-	TerminalFontFamily          *string
-	TerminalFontSize            *int
-	ChangesPanelLayout          *string
-	SystemMetricsDisplay        *SystemMetricsDisplaySettingsPatch
-	AppStatusBarOrder           *models.AppStatusBarOrder
-	VoiceMode                   *models.VoiceModeSettings
+	WorkspaceID                  *string
+	KanbanViewMode               *string
+	WorkflowFilterID             *string
+	RepositoryIDs                *[]string
+	TasksListSort                *string
+	TasksListGroup               *string
+	TasksListShowDetails         *bool
+	InitialSetupComplete         *bool
+	PreferredShell               *string
+	DefaultEditorID              *string
+	EnablePreviewOnClick         *bool
+	ChatSubmitKey                *string
+	ReviewAutoMarkOnScroll       *bool
+	ConfirmTaskArchive           *bool
+	MCPTaskAgentProfileDefault   *string
+	ShowReleaseNotification      *bool
+	ReleaseNotesLastSeenVersion  *string
+	LspAutoStartLanguages        *[]string
+	LspAutoInstallLanguages      *[]string
+	LspServerConfigs             *map[string]map[string]interface{}
+	SavedLayouts                 *[]models.SavedLayout
+	SidebarViews                 *[]models.SidebarView
+	SidebarActiveViewID          *string
+	SidebarDraft                 **models.SidebarViewDraft
+	SidebarTaskPrefs             *models.SidebarTaskPrefs
+	TaskCreateLastUsed           *models.TaskCreateLastUsed
+	JiraSavedViews               **json.RawMessage
+	JiraTaskPresets              **json.RawMessage
+	GitHubSavedPresets           **json.RawMessage
+	GitHubDefaultQueryPresets    **json.RawMessage
+	GitLabSavedPresets           **json.RawMessage
+	AzureDevOpsBrowsePreferences **json.RawMessage
+	DefaultUtilityAgentID        *string
+	DefaultUtilityModel          *string
+	KeyboardShortcuts            *map[string]interface{}
+	TerminalLinkBehavior         *string
+	TerminalFontFamily           *string
+	TerminalFontSize             *int
+	ChangesPanelLayout           *string
+	SystemMetricsDisplay         *SystemMetricsDisplaySettingsPatch
+	AppStatusBarOrder            *models.AppStatusBarOrder
+	VoiceMode                    *models.VoiceModeSettings
 }
 
 type SystemMetricsDisplaySettingsPatch struct {
@@ -547,6 +548,9 @@ func applyUserPreferenceBlobs(settings *models.UserSettings, req *UpdateUserSett
 	if err := applyUserPreferenceBlob("gitlab_saved_presets", req.GitLabSavedPresets, &settings.GitLabSavedPresets); err != nil {
 		return err
 	}
+	if err := applyUserPreferenceBlob("azure_devops_browse_preferences", req.AzureDevOpsBrowsePreferences, &settings.AzureDevOpsBrowsePreferences); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -618,6 +622,7 @@ func (s *Service) publishUserSettingsEvent(ctx context.Context, settings *models
 		"github_saved_presets":            settings.GitHubSavedPresets,
 		"github_default_query_presets":    settings.GitHubDefaultQueryPresets,
 		"gitlab_saved_presets":            settings.GitLabSavedPresets,
+		"azure_devops_browse_preferences": settings.AzureDevOpsBrowsePreferences,
 		"default_utility_agent_id":        settings.DefaultUtilityAgentID,
 		"default_utility_model":           settings.DefaultUtilityModel,
 		"keyboard_shortcuts":              settings.KeyboardShortcuts,

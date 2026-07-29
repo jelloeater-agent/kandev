@@ -118,6 +118,7 @@ function carryForwardSyncedLocalSettings(current: DisplaySettings) {
     githubSavedPresets: current.githubSavedPresets,
     githubDefaultQueryPresets: current.githubDefaultQueryPresets,
     gitlabSavedPresets: current.gitlabSavedPresets,
+    azureDevOpsBrowsePreferences: current.azureDevOpsBrowsePreferences,
   };
 }
 

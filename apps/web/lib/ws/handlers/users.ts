@@ -71,6 +71,7 @@ function buildSyncedLocalSettings(state: AppState, payload: UserSettingsUpdatedP
     githubSavedPresets: payload.github_saved_presets,
     githubDefaultQueryPresets: payload.github_default_query_presets,
     gitlabSavedPresets: payload.gitlab_saved_presets,
+    azureDevOpsBrowsePreferences: payload.azure_devops_browse_preferences,
   };
 }
 

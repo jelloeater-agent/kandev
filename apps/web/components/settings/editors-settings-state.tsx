@@ -293,6 +293,7 @@ function mapEditorSyncedLocalFields(
     githubSavedPresets: s.github_saved_presets,
     githubDefaultQueryPresets: s.github_default_query_presets,
     gitlabSavedPresets: s.gitlab_saved_presets,
+    azureDevOpsBrowsePreferences: s.azure_devops_browse_preferences,
   };
 }
 

@@ -61,6 +61,7 @@ export const defaultSettingsState: SettingsSliceState = {
     githubSavedPresets: undefined,
     githubDefaultQueryPresets: undefined,
     gitlabSavedPresets: undefined,
+    azureDevOpsBrowsePreferences: undefined,
     defaultUtilityAgentId: null,
     keyboardShortcuts: {},
     terminalFontFamily: null,

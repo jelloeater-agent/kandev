@@ -421,6 +421,7 @@ export type UserSettingsUpdatedPayload = {
   github_saved_presets?: unknown[] | null;
   github_default_query_presets?: object | null;
   gitlab_saved_presets?: unknown[] | null;
+  azure_devops_browse_preferences?: object | null;
   default_utility_agent_id?: string;
   keyboard_shortcuts?: Record<string, { key: string; modifiers?: Record<string, boolean> }>;
   terminal_link_behavior?: string;
