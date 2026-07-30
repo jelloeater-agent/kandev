@@ -1,5 +1,5 @@
 ---
-status: complete
+status: shipped
 created: 2026-07-30
 owner: kandev
 ---
@@ -21,8 +21,8 @@ has an unambiguous Mermaid-safe representation.
 - Valid semicolons that separate multiple Mermaid statements on one physical line remain statement
   separators.
 - Mermaid diagrams without affected sequence-message text retain their existing source semantics.
-- When Mermaid cannot render a diagram, Kandev writes one searchable browser-console error that
-  includes the parser error and the full original diagram source.
+- When a non-cancelled Mermaid render rejects, Kandev writes one searchable browser-console error
+  that includes the parser error and the full original diagram source.
 - When Kandev normalized the source before the failed render, the console error also includes the
   full normalized source so users can distinguish invalid input from a normalization defect.
 - Failed diagram source remains in the browser console and Kandev's in-memory frontend log buffer;
@@ -33,7 +33,7 @@ has an unambiguous Mermaid-safe representation.
   after the user focuses another task and returns.
 - Toast suppression is shared across chat and task-plan diagrams. Failures still render their
   inline error state and write full console diagnostics even when their toast is suppressed.
-- A Mermaid failure in a different task can show that task's first error toast. A full page reload
+- A Mermaid failure in a different task can show that task's first error toast. A full-page reload
   starts a new frontend runtime and resets the in-memory task-toast history.
 
 ## Scenarios
@@ -51,7 +51,7 @@ has an unambiguous Mermaid-safe representation.
   their original meaning.
 - **GIVEN** a non-sequence Mermaid diagram containing a literal semicolon, **WHEN** Kandev
   normalizes it, **THEN** sequence-message normalization does not alter that semicolon.
-- **GIVEN** a Mermaid render rejects with a parser error, **WHEN** Kandev handles the failure,
+- **GIVEN** a non-cancelled Mermaid render rejects with a parser error, **WHEN** Kandev handles the failure,
   **THEN** the browser console contains one `[mermaid]` error with the parser error and complete
   original diagram source.
 - **GIVEN** normalization changed a diagram before a failed render, **WHEN** Kandev logs the

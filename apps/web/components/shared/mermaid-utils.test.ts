@@ -83,6 +83,22 @@ describe("sanitizeMermaidCode", () => {
     expect(sanitizeMermaidCode(input)).toBe(input);
   });
 
+  it("escapes prose that starts with a sequence keyword but is not a complete statement", () => {
+    const input = "sequenceDiagram\n  A->>B: Retry; break if the server is unavailable";
+
+    expect(sanitizeMermaidCode(input)).toBe(
+      "sequenceDiagram\n  A->>B: Retry#59; break if the server is unavailable",
+    );
+  });
+
+  it("escapes prose that begins with end", () => {
+    const input = "sequenceDiagram\n  A->>B: Notify; end users receive updates";
+
+    expect(sanitizeMermaidCode(input)).toBe(
+      "sequenceDiagram\n  A->>B: Notify#59; end users receive updates",
+    );
+  });
+
   it("preserves CRLF line endings while escaping sequence-message prose", () => {
     const input = "sequenceDiagram\r\n  A->>B: First; second\r\n  B->>A: Done";
 

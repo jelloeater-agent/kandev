@@ -25,11 +25,6 @@ vi.mock("@/components/toast-provider", () => ({
   useToast: () => ({ toast: mockToast, updateToast: vi.fn(), dismissToast: vi.fn() }),
 }));
 
-vi.mock("@/components/state-provider", () => ({
-  useAppStore: <T,>(selector: (state: { tasks: { activeTaskId: string | null } }) => T) =>
-    selector({ tasks: { activeTaskId: "task-1" } }),
-}));
-
 // Track every call to mermaid.render so tests can assert how many fired and
 // with what input. Resolution / rejection is decided per-call by a queue the
 // tests set up before each render-driving action.

@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTheme } from "@/components/theme/app-theme";
-import { useAppStore } from "@/components/state-provider";
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -44,6 +43,7 @@ export type TextSelection = {
 };
 
 type TipTapPlanEditorProps = {
+  taskId: string;
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
@@ -301,7 +301,6 @@ function usePlanEditor(props: TipTapPlanEditorProps): PlanEditorState {
   const onCommentDeletedRef = useRef(onCommentDeleted);
   const onEditorReadyRef = useRef(onEditorReady);
   const [isReady, setIsReady] = useState(false);
-  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
 
   const slash = useSlashMenu();
   /* eslint-disable react-hooks/refs -- createPasteHandler reads ref for deferred access in event handler, not during render */
@@ -330,8 +329,8 @@ function usePlanEditor(props: TipTapPlanEditorProps): PlanEditorState {
 
   /* eslint-disable react-hooks/refs -- stableOrphanHandler reads ref for deferred access, not during render */
   const extensions = useMemo(
-    () => buildEditorExtensions(placeholder, slash.extension, stableOrphanHandler, activeTaskId),
-    [activeTaskId, placeholder, slash.extension, stableOrphanHandler],
+    () => buildEditorExtensions(placeholder, slash.extension, stableOrphanHandler, props.taskId),
+    [placeholder, props.taskId, slash.extension, stableOrphanHandler],
   );
   /* eslint-enable react-hooks/refs */
 

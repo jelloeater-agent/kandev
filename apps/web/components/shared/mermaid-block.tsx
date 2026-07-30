@@ -11,7 +11,6 @@ import {
 } from "./mermaid-utils";
 import { useMermaidScale, useMermaidViewportWidth } from "./mermaid-block-hooks";
 import { useToast } from "@/components/toast-provider";
-import { useAppStore } from "@/components/state-provider";
 import { showMermaidErrorToast } from "./mermaid-error-toast";
 
 type MermaidAPI = typeof import("mermaid").default;
@@ -37,6 +36,8 @@ const RENDER_DEBOUNCE_MS = 300;
 
 type MermaidBlockProps = {
   code: string;
+  /** Owning task when this diagram belongs to a task-bound surface. */
+  taskId?: string | null;
 };
 
 type ToastFn = ReturnType<typeof useToast>["toast"];
@@ -117,7 +118,7 @@ function useMermaidRender(
   return { svg, error };
 }
 
-export function MermaidBlock({ code }: MermaidBlockProps) {
+export function MermaidBlock({ code, taskId }: MermaidBlockProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgSizeRef = useRef<{ w: number; h: number } | null>(null);
   const [svgSize, setSvgSize] = useState<{ w: number; h: number } | null>(null);
@@ -125,8 +126,7 @@ export function MermaidBlock({ code }: MermaidBlockProps) {
   const [showCode, setShowCode] = useState(false);
   const { resolvedTheme } = useTheme();
   const { toast } = useToast();
-  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
-  const { svg, error } = useMermaidRender(code, resolvedTheme, toast, activeTaskId);
+  const { svg, error } = useMermaidRender(code, resolvedTheme, toast, taskId ?? null);
   const viewportWidth = useMermaidViewportWidth(scrollRegionElement);
   const { scale, zoomIn, zoomOut, zoomReset, resetAutoScale } = useMermaidScale(
     svgSize,

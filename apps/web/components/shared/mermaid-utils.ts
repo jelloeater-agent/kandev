@@ -89,7 +89,7 @@ const SEQUENCE_DIAGRAM_RE = /^\s*sequenceDiagram\b/;
 const SEQUENCE_MESSAGE_RE = /^(\s*.+?(?:<<-->>|<<->>|-->>|->>|--x|-x|--\)|-\)|-->|->).+?:)(.*)$/;
 const ENTITY_ESCAPE_RE = /^(?:#\d+|&[A-Za-z][A-Za-z0-9]+);/;
 const SEQUENCE_STATEMENT_RE =
-  /^\s*(?:[A-Za-z_][\w-]*\s*(?:<<-->>|<<->>|-->>|->>|--x|-x|--\)|-\)|-->|->)|participant\b|actor\b|note\b|loop\b|alt\b|else\b|opt\b|par\b|and\b|critical\b|option\b|break\b|rect\b|end\b|activate\b|deactivate\b|autonumber\b|title\b|link\b|links\b|box\b|create\b|destroy\b)/;
+  /^\s*(?:[A-Za-z_][\w-]*\s*(?:<<-->>|<<->>|-->>|->>|--x|-x|--\)|-\)|-->|->)|(?:participant|actor)\s+[A-Za-z_][\w-]*(?:\s+as\s+[^;\r\n]+)?(?=\s*(?:;|$))|(?:activate|deactivate|destroy)\s+[A-Za-z_][\w-]*(?=\s*(?:;|$))|create\s+(?:participant|actor)\s+[A-Za-z_][\w-]*(?:\s+as\s+[^;\r\n]+)?(?=\s*(?:;|$))|autonumber(?:\s+\d+(?:\s+\d+)?)?(?=\s*(?:;|$))|end(?=\s*(?:;|$)))/;
 
 function escapeMessageSemicolons(message: string): string {
   let result = "";
