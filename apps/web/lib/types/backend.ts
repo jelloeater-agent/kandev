@@ -1,4 +1,5 @@
 import type { TaskPlanEventPayload, TaskPlanRevisionEventPayload } from "./task-plan-events";
+import type { CaptureRequest } from "@/lib/logger/capture";
 
 export type BackendMessageType = keyof BackendMessageMap;
 
@@ -6,6 +7,7 @@ export type { BackendMessage } from "./backend-message";
 import type { BackendMessage } from "./backend-message";
 import type { OfficeBackendMessageMap } from "./office-events";
 export type { OfficeEventType, OfficeEventPayload } from "./office-events";
+export type { RunEventAppendedPayload } from "./session-runtime-payloads";
 
 import type {
   AvailableAgent,
@@ -35,6 +37,7 @@ import type {
   SessionModelsPayload,
   SessionPromptUsagePayload,
   SessionTodosPayload,
+  RunEventAppendedPayload,
 } from "./session-runtime-payloads";
 import type {
   ExecutorPayload,
@@ -544,6 +547,10 @@ export type BackendMessageMap = OfficeBackendMessageMap &
     "system.error": BackendMessage<"system.error", SystemErrorPayload>;
     "system.job.update": BackendMessage<"system.job.update", import("./system").SystemJob>;
     "system.metrics.updated": BackendMessage<"system.metrics.updated", SystemMetricsSnapshot>;
+    "system.logs.capture_requested": BackendMessage<
+      "system.logs.capture_requested",
+      CaptureRequest
+    >;
     "system.update_available": BackendMessage<"system.update_available", UpdateAvailablePayload>;
     "workspace.created": BackendMessage<"workspace.created", WorkspacePayload>;
     "workspace.updated": BackendMessage<"workspace.updated", WorkspacePayload>;
@@ -655,18 +662,6 @@ export type BackendMessageMap = OfficeBackendMessageMap &
     >;
     "run.event.appended": BackendMessage<"run.event.appended", RunEventAppendedPayload>;
   };
-
-// The WS gateway forwards run events verbatim: id at top level, row under `event`.
-export type RunEventAppendedPayload = {
-  run_id: string;
-  event: {
-    seq: number;
-    event_type: string;
-    level: string;
-    payload: string;
-    created_at: string;
-  };
-};
 
 // Workspace file types (extracted to reduce file size)
 export * from "./workspace-files";
