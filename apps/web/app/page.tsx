@@ -52,36 +52,6 @@ function buildUserSettingsState(
   return { ...mapUserSettingsResponse(resp), workspaceId };
 }
 
-function readAgentProfileId(
-  metadata: Record<string, unknown> | null | undefined,
-): string | undefined {
-  if (!metadata || typeof metadata !== "object") return undefined;
-  const value = metadata.agent_profile_id;
-  return typeof value === "string" ? value : undefined;
-}
-
-type QuickChatTask = Awaited<ReturnType<typeof listQuickChatSessions>>["tasks"][number];
-
-function mapQuickChatSessions(tasks: QuickChatTask[]): AppState["quickChat"]["sessions"] {
-  const quickChatUpdatedAt = (task: QuickChatTask) => Date.parse(task.updated_at ?? "") || 0;
-
-  return (
-    tasks
-      .filter((task) => task.primary_session_id)
-      .filter((task) => task.origin !== "automation_run")
-      // Legacy Next.js path only receives task.updated_at. The Go boot payload
-      // sorts by max(task/session updated_at) and is the authoritative SPA path.
-      .sort((a, b) => quickChatUpdatedAt(b) - quickChatUpdatedAt(a))
-      .map((task) => ({
-        kind: "chat" as const,
-        sessionId: task.primary_session_id!,
-        workspaceId: task.workspace_id,
-        name: task.title !== "Quick Chat" ? task.title : undefined,
-        agentProfileId: readAgentProfileId(task.metadata),
-      }))
-  );
-}
-
 function buildBaseState(
   workspaces: ListWorkspacesResponse,
   userSettingsResponse: UserSettingsResponse | null,
@@ -159,7 +129,10 @@ async function loadWorkspaceState({
     listRepositories(activeWorkspaceId, undefined, { cache: "no-store" }).catch(() => ({
       repositories: [],
     })),
-    listQuickChatSessions(activeWorkspaceId, { cache: "no-store" }).catch(() => ({ tasks: [] })),
+    listQuickChatSessions(activeWorkspaceId, { cache: "no-store" }).catch(() => ({
+      sessions: [],
+      task_sessions: [],
+    })),
   ]);
   // null preserves the user's explicit "All Workflows" choice.
   const workflowId = resolveDesiredWorkflowId({
@@ -167,7 +140,15 @@ async function loadWorkspaceState({
     settingsWorkflowId,
     workspaceWorkflows: workflowList.workflows,
   });
-  const quickChatSessions = mapQuickChatSessions(quickChatResponse.tasks);
+  const quickChatSessions: AppState["quickChat"]["sessions"] = quickChatResponse.sessions.map(
+    (session) => ({
+      kind: session.kind,
+      sessionId: session.session_id,
+      workspaceId: session.workspace_id,
+      name: session.name,
+      agentProfileId: session.agent_profile_id,
+    }),
+  );
 
   return {
     workflowId,

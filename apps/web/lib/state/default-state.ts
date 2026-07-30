@@ -17,7 +17,7 @@ import {
   defaultSystemState,
   defaultReviewState,
 } from "./slices";
-import { getStoredQuickChatNames } from "@/lib/local-storage";
+import { applyStoredQuickChatNames } from "@/lib/state/slices/ui/quick-chat-sync";
 import type { HydrationState } from "./store";
 import { migrateView } from "./slices/ui/ui-slice";
 
@@ -152,17 +152,9 @@ function mergeQuickChatState(initialState: HydrationState): DefaultState["quickC
   const quickChat = { ...defaultState.quickChat, ...initialState.quickChat };
   if (!initialState.quickChat?.sessions) return quickChat;
 
-  const storedNames = getStoredQuickChatNames();
   return {
     ...quickChat,
-    sessions: initialState.quickChat.sessions.map((session) => {
-      const localName = storedNames[session.sessionId];
-      return {
-        ...session,
-        kind: session.kind ?? "chat",
-        ...(localName ? { name: localName } : {}),
-      };
-    }),
+    sessions: applyStoredQuickChatNames(initialState.quickChat.sessions),
   };
 }
 

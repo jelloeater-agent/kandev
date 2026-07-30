@@ -326,13 +326,11 @@ export type AppState = KanbanSlice & {
   setSystemHealth: (response: SystemHealthResponse) => void;
   setSystemHealthLoading: (loading: boolean) => void;
   invalidateSystemHealth: () => void;
-  openQuickChat: (
-    sessionId: string,
-    workspaceId: string,
-    agentProfileId?: string,
-    kind?: UISliceTypes.QuickChatSessionKind,
-  ) => void;
+  openQuickChat: UIA["openQuickChat"];
   addQuickChatSession: UIA["addQuickChatSession"];
+  syncQuickChatSessions: UIA["syncQuickChatSessions"];
+  upsertQuickChatSessionFromEvent: UIA["upsertQuickChatSessionFromEvent"];
+  removeQuickChatSessionsForTask: UIA["removeQuickChatSessionsForTask"];
   closeQuickChat: () => void;
   closeQuickChatSession: (sessionId: string) => void;
   setActiveQuickChatSession: (sessionId: string, workspaceId: string) => void;
