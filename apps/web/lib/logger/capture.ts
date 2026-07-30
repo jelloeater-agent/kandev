@@ -1,18 +1,12 @@
 import { uploadFrontendBundleChunk } from "@/lib/api/domains/system-api";
+import type { DiagnosticLogCaptureRequest } from "@/lib/types/system";
 import type { LogEntry } from "./buffer";
 import { browserInstallationID, browserLogMetadata, snapshotBrowserLogs } from "./runtime";
 
 const TARGET_CHUNK_BYTES = 800 * 1024;
 
-export type CaptureRequest = {
-  bundle_id: string;
-  capture_deadline: string;
-  max_chunk_bytes: number;
-  max_browser_profiles: number;
-};
-
 export async function handleBrowserLogCapture(
-  request: CaptureRequest,
+  request: DiagnosticLogCaptureRequest,
   identityScope: string | null,
 ): Promise<void> {
   if (!identityScope || !request.bundle_id || Date.now() >= Date.parse(request.capture_deadline)) {

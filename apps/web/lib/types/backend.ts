@@ -1,5 +1,4 @@
 import type { TaskPlanEventPayload, TaskPlanRevisionEventPayload } from "./task-plan-events";
-import type { CaptureRequest } from "@/lib/logger/capture";
 
 export type BackendMessageType = keyof BackendMessageMap;
 
@@ -7,7 +6,8 @@ export type { BackendMessage } from "./backend-message";
 import type { BackendMessage } from "./backend-message";
 import type { OfficeBackendMessageMap } from "./office-events";
 export type { OfficeEventType, OfficeEventPayload } from "./office-events";
-export type { RunEventAppendedPayload } from "./session-runtime-payloads";
+import type { RunEventAppendedPayload } from "./run-events";
+export type { RunEventAppendedPayload } from "./run-events";
 
 import type {
   AvailableAgent,
@@ -29,15 +29,15 @@ import type { SecretListItem } from "@/lib/types/http-secrets";
 import type { GitEventPayload } from "@/lib/types/git-events";
 import type { GitHubRateLimitUpdate, TaskCIAutomationOptions, TaskPR } from "@/lib/types/github";
 import type { TaskMR } from "@/lib/types/gitlab";
-import type { SystemMetricsSnapshot } from "./system";
+import type { DiagnosticLogCaptureRequest, SystemMetricsSnapshot } from "./system";
 import type { FileChangeNotificationPayload } from "./workspace-files";
 import type {
   AgentCapabilitiesPayload,
   SessionInfoPayload,
   SessionModelsPayload,
+  SessionMCPStatusPayload,
   SessionPromptUsagePayload,
   SessionTodosPayload,
-  RunEventAppendedPayload,
 } from "./session-runtime-payloads";
 import type {
   ExecutorPayload,
@@ -409,6 +409,7 @@ export type UserSettingsUpdatedPayload = {
   show_anchored_prompt_bar?: boolean;
   show_scroll_to_last_prompt?: boolean;
   show_scroll_to_start?: boolean;
+  show_transcript_auto_scroll_control?: boolean;
   review_auto_mark_on_scroll?: boolean;
   confirm_task_archive?: boolean;
   mcp_task_agent_profile_default?: MCPTaskAgentProfileDefault;
@@ -492,6 +493,7 @@ export {
   type SessionModelInfoPayload,
   type ConfigOptionPayload,
   type SessionModelsPayload,
+  type SessionMCPStatusPayload,
   type SessionInfoPayload,
   type SessionTodosPayload,
 } from "./session-runtime-payloads";
@@ -549,7 +551,7 @@ export type BackendMessageMap = OfficeBackendMessageMap &
     "system.metrics.updated": BackendMessage<"system.metrics.updated", SystemMetricsSnapshot>;
     "system.logs.capture_requested": BackendMessage<
       "system.logs.capture_requested",
-      CaptureRequest
+      DiagnosticLogCaptureRequest
     >;
     "system.update_available": BackendMessage<"system.update_available", UpdateAvailablePayload>;
     "workspace.created": BackendMessage<"workspace.created", WorkspacePayload>;
@@ -608,6 +610,10 @@ export type BackendMessageMap = OfficeBackendMessageMap &
       AgentCapabilitiesPayload
     >;
     "session.models_updated": BackendMessage<"session.models_updated", SessionModelsPayload>;
+    "session.mcp_status_updated": BackendMessage<
+      "session.mcp_status_updated",
+      SessionMCPStatusPayload
+    >;
     "session.info_updated": BackendMessage<"session.info_updated", SessionInfoPayload>;
     "session.todos_updated": BackendMessage<"session.todos_updated", SessionTodosPayload>;
     "session.prompt_usage": BackendMessage<"session.prompt_usage", SessionPromptUsagePayload>;

@@ -62,6 +62,13 @@ export type DiagnosticBundleStatus =
   | "failed"
   | "expired";
 
+export type DiagnosticLogCaptureRequest = {
+  bundle_id: string;
+  capture_deadline: string;
+  max_chunk_bytes: number;
+  max_browser_profiles: number;
+};
+
 export interface DiagnosticBundleJob {
   id: string;
   status: DiagnosticBundleStatus;
