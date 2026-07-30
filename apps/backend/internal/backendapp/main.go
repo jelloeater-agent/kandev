@@ -628,10 +628,8 @@ func startAgentInfrastructure(
 	}
 
 	// Start the plugin system's event delivery and health monitor
-	// background loops. Gated on features.Plugins so an unconfigured/
-	// disabled deployment doesn't poll plugin health endpoints that were
-	// never registered.
-	if services.Plugins != nil && cfg.Features.Plugins {
+	// background loops.
+	if services.Plugins != nil {
 		startPluginsSubsystems(ctx, services.Plugins, eventBus, log, addCleanup)
 	}
 

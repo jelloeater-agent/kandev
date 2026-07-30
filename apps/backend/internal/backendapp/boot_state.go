@@ -28,14 +28,13 @@ const (
 )
 
 // ssoProvidersForBoot lists the plugin-contributed external-login options for
-// the pre-auth login screen. Empty unless auth is enabled and the plugins
-// feature is on with at least one active auth-capable plugin declaring
-// auth_providers.
+// the pre-auth login screen. Empty unless auth is enabled and at least one
+// active auth-capable plugin declares auth_providers.
 func ssoProvidersForBoot(p routeParams) []auth.SSOProvider {
 	if p.authSvc == nil || p.authSvc.Mode() == auth.ModeDisabled {
 		return nil
 	}
-	if !p.features.Plugins || p.services == nil || p.services.Plugins == nil {
+	if p.services == nil || p.services.Plugins == nil {
 		return nil
 	}
 	providers := p.services.Plugins.SSOProviders()
