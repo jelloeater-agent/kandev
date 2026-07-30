@@ -21,6 +21,9 @@ though the task's workflow step and runtime are already active.
   that session's `session.state_changed` event.
 - When reconciliation changes the task state, observers receive
   `task.state_changed` before `session.state_changed` announces `RUNNING`.
+- The WebSocket gateway consumes both lifecycle notifications through one
+  ordered NATS-style subscription, preserving that order when the event bus is
+  remote; the in-memory event bus supports the same wildcard semantics.
 - The task-state write remains guarded by the owning session's authoritative
   state. A concurrent clarification, cancellation, terminal transition, or
   archive prevents a stale runtime writer from promoting the task.
@@ -81,6 +84,9 @@ The ordering contract is defined by
 - **GIVEN** the sidebar is grouped by State, **WHEN** it observes a session
   transition to `RUNNING`, **THEN** the task is not rendered with a running
   spinner inside the `Review` group.
+- **GIVEN** a remote event bus delivers the two lifecycle events, **WHEN** the
+  gateway forwards them to WebSocket clients, **THEN** the task-state
+  notification is delivered before the running-session notification.
 - **GIVEN** a session and task already in `RUNNING`/`IN_PROGRESS`, **WHEN**
   additional tool or stream events arrive, **THEN** no redundant task-state
   write or state-change event is produced.

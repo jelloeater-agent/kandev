@@ -20,6 +20,9 @@ spec: "../../specs/tasks/runtime-state-publication-order.md"
   the running session.
 - Already-`RUNNING` stream churn performs no redundant task-state writes or
   state events, and the executor-success reconciliation remains available.
+- The WebSocket gateway forwards task and session lifecycle notifications from
+  one ordered wildcard subscription, preserving their order for remote event
+  buses.
 
 ## Verification
 
@@ -33,12 +36,22 @@ cd apps/backend && go test -race \
 cd apps/backend && go test \
   -run 'TestUpdateTaskStateIfSessionState_' \
   ./internal/task/repository/sqlite
+cd apps/backend && go test \
+  -run 'TestTaskEventBroadcaster_(UsesOrderedWildcardForLifecycleStates|OrdersLifecycleStateNotifications|NoDuplicateSubscriptions|PreservesAllFields)' \
+  ./internal/gateway/websocket
+cd apps/backend && go test \
+  -run TestMemoryEventBus_MultiTokenWildcard \
+  ./internal/events/bus
 ```
 
 ## Files likely touched
 
 - `apps/backend/internal/orchestrator/event_handlers_streaming.go`
 - `apps/backend/internal/orchestrator/event_handlers_streaming_test.go`
+- `apps/backend/internal/gateway/websocket/task_notifications.go`
+- `apps/backend/internal/gateway/websocket/task_notifications_test.go`
+- `apps/backend/internal/events/bus/memory.go`
+- `apps/backend/internal/events/bus/memory_test.go`
 
 ## Dependencies
 

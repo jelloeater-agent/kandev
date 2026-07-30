@@ -20,6 +20,11 @@ then calls `reconcileTaskStateForRuntimeLocked`. The sidebar immediately paints
 the running session indicator while Group by State still reads persisted
 `tasks.state = REVIEW`.
 
+The remote-delivery path also requires the gateway to preserve this ordering:
+task and session lifecycle notifications share one NATS-style subscription so
+separate callback scheduling cannot reintroduce the race before WebSocket
+delivery.
+
 ## Backend
 
 ### Runtime transition ordering
@@ -36,6 +41,14 @@ the running session indicator while Group by State still reads persisted
   not perform task-state reads or writes.
 - Keep `writeTaskInProgressForRuntime` and the executor-success callback as the
   eventual healing path.
+
+### Gateway delivery ordering
+
+- Subscribe the WebSocket task broadcaster to one NATS-style wildcard for task
+  and session state events, resolving the WebSocket action from `event.Type`.
+- Keep all other event subscriptions and routing behavior unchanged.
+- Ensure the in-memory event bus implements the same `>` wildcard semantics so
+  local development and regression tests exercise the production contract.
 
 ### Event and persistence contract
 
@@ -84,6 +97,13 @@ navigation, scroll, safe-area, pointer, or touch-target change.
   and `apps/backend/internal/task/repository/sqlite/task_state_cas_test.go`.
   **How:** run the existing guarded-CAS regression tests alongside the new
   ordering test, including `-race`.
+- **What:** gateway delivery keeps task-state notification ahead of the
+  running-session notification for a shared wildcard subscription.
+  **Files:** `apps/backend/internal/gateway/websocket/task_notifications.go`,
+  `apps/backend/internal/gateway/websocket/task_notifications_test.go`, and
+  `apps/backend/internal/events/bus/memory_test.go`.
+  **How:** assert lifecycle subjects use one wildcard, publish both events
+  through the in-memory NATS-compatible bus, and assert WebSocket action order.
 
 ## E2E Tests
 

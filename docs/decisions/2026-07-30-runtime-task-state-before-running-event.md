@@ -26,6 +26,12 @@ Archive, terminal-session, clarification, cancellation, and Office guards
 remain authoritative. The executor-success reconciliation remains as a healing
 fallback.
 
+The WebSocket gateway subscribes to both lifecycle subjects through one
+ordered NATS-style wildcard subscription and resolves the WebSocket action
+from the event type. This preserves the producer's ordering contract across a
+remote event bus, where separate subscriptions could otherwise race at the
+gateway.
+
 ## Consequences
 
 Clients can continue treating persisted task state as authoritative for State
@@ -52,6 +58,9 @@ reconciliation may heal it.
 - **Publish the session event first and rely on eventual task reconciliation.**
   Rejected because it is the observed inconsistency and makes correct UI depend
   on event latency.
+- **Keep separate gateway subscriptions for the two lifecycle subjects.**
+  Rejected because NATS delivers each subscription independently; their
+  callbacks can race and reverse the ordered events before WebSocket delivery.
 - **Remove the no-write fast path and reconcile on every stream event.**
   Rejected because long turns generate thousands of duplicate events; the fix
   can preserve deduplication by reconciling only inside the successful
