@@ -53,6 +53,11 @@ export function FileTreeEditorProvider({
   const { editors } = useEditors();
   const defaultEditorId = useAppStore((state) => state.userSettings.defaultEditorId);
   const worktrees = useSessionWorktrees(sessionId);
+  // Published by the task page from the session status; the Files panel is
+  // rendered inside the dock layout and cannot reach that state directly.
+  const embeddedVscodeSupported = useAppStore(
+    (state) => state.embeddedVscodeSupport.bySessionId[sessionId] ?? false,
+  );
   const openEditor = useOpenSessionInEditor(sessionId);
 
   // `open` is a fresh closure on every render; keep the context value stable by
@@ -62,12 +67,10 @@ export function FileTreeEditorProvider({
     openRef.current = openEditor.open;
   });
 
-  // The embedded-VS-Code capability is fetched per session by
-  // useSessionResumption and only reaches the task top bar, so the Files panel
-  // cannot tell whether this session's executor can run code-server. Offering
-  // it here unconditionally would surface an action that fails on executors
-  // without support, so the file tree lists external editors only.
-  const availableEditors = useMemo(() => getAvailableTaskTopbarEditors(editors, false), [editors]);
+  const availableEditors = useMemo(
+    () => getAvailableTaskTopbarEditors(editors, embeddedVscodeSupported),
+    [editors, embeddedVscodeSupported],
+  );
 
   const resolveTarget = useCallback(
     (node: FileTreeNode) => resolveFileTreeEditorTarget(node.path, worktrees, treeRootName),

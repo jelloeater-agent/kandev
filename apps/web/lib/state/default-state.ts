@@ -72,6 +72,7 @@ export const defaultState = {
   sessionMcpStatus: defaultSessionRuntimeState.sessionMcpStatus,
   promptUsage: defaultSessionRuntimeState.promptUsage,
   sessionPollMode: defaultSessionRuntimeState.sessionPollMode,
+  embeddedVscodeSupport: defaultSessionRuntimeState.embeddedVscodeSupport,
   githubStatus: defaultGitHubState.githubStatus,
   githubAppRegistrations: defaultGitHubState.githubAppRegistrations,
   taskPRs: defaultGitHubState.taskPRs,
@@ -302,6 +303,10 @@ export function mergeInitialState(initialState?: HydrationState): DefaultState {
     sessionMcpStatus: { ...defaultState.sessionMcpStatus, ...initialState.sessionMcpStatus },
     promptUsage: { ...defaultState.promptUsage, ...initialState.promptUsage },
     sessionPollMode: { ...defaultState.sessionPollMode, ...initialState.sessionPollMode },
+    embeddedVscodeSupport: {
+      ...defaultState.embeddedVscodeSupport,
+      ...initialState.embeddedVscodeSupport,
+    },
     ...mergeGitHubState(initialState),
     taskPRs: { ...defaultState.taskPRs, ...initialState.taskPRs },
     taskIssues: { ...defaultState.taskIssues, ...initialState.taskIssues },

@@ -160,6 +160,7 @@ export type AppState = KanbanSlice & {
   sessionMcpStatus: (typeof defaultSessionRuntimeState)["sessionMcpStatus"];
   promptUsage: (typeof defaultSessionRuntimeState)["promptUsage"];
   sessionPollMode: (typeof defaultSessionRuntimeState)["sessionPollMode"];
+  embeddedVscodeSupport: (typeof defaultSessionRuntimeState)["embeddedVscodeSupport"];
 
   // GitHub slice
   githubStatus: (typeof defaultGitHubState)["githubStatus"];
@@ -474,6 +475,7 @@ export type AppState = KanbanSlice & {
     patch: Partial<Omit<UserShellInfo, "terminalId">>,
   ) => void;
   setSessionPollMode: (sessionId: string, mode: SessionPollMode) => void;
+  setEmbeddedVscodeSupport: (sessionId: string, supported: boolean) => void;
   /* prettier-ignore */ setSidebarActiveView: UIA["setSidebarActiveView"];
   createSidebarView: UIA["createSidebarView"];
   updateSidebarDraft: UIA["updateSidebarDraft"];
