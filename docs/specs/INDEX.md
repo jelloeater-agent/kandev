@@ -69,6 +69,7 @@ Kandev's task model: documents, execution stages, labels, blocker escalation, su
 | [parent-child-message-interrupt](tasks/parent-child-message-interrupt.md) | shipped |
 | [parent-child-task-stop](tasks/parent-child-task-stop.md) | shipped |
 | [mcp-task-agent-profile-default](tasks/mcp-task-agent-profile-default/spec.md) | shipped |
+| [runtime-state-publication-order](tasks/runtime-state-publication-order.md) | draft |
 | [explicit-completion-signal](workflow/explicit-completion-signal/spec.md) | shipped |
 
 ## agents/ — agent governance
