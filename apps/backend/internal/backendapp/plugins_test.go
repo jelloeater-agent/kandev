@@ -238,9 +238,11 @@ func TestBootActivePluginsBundleURLChangesWithVersion(t *testing.T) {
 	}
 }
 
-// TestBootActivePluginsNoServiceReturnsNil covers the only remaining reason the
-// boot payload carries no plugins now that they ship unflagged: the plugin
-// service is absent because initialization failed.
+// TestBootActivePluginsNoServiceReturnsNil covers one reason the boot payload
+// carries no plugins now that they ship unflagged: the plugin service is absent
+// because initialization failed. An initialized service with nothing active
+// that declares a UI bundle yields an empty payload too — see
+// TestBootActivePluginsPopulatesFromActiveUIPlugins for that path.
 func TestBootActivePluginsNoServiceReturnsNil(t *testing.T) {
 	if got := bootActivePlugins(routeParams{services: &Services{}}); got != nil {
 		t.Fatalf("bootActivePlugins() with nil Plugins service = %v, want nil", got)
