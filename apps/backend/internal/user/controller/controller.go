@@ -85,6 +85,7 @@ func (c *Controller) UpdateUserSettings(ctx context.Context, req dto.UpdateUserS
 		TerminalFontFamily:          req.TerminalFontFamily,
 		TerminalFontSize:            req.TerminalFontSize,
 		ChangesPanelLayout:          req.ChangesPanelLayout,
+		PRPanelPlacement:            req.PRPanelPlacement,
 		SystemMetricsDisplay:        systemMetricsDisplayPatch(req.SystemMetricsDisplay),
 		AppStatusBarOrder:           req.AppStatusBarOrder,
 		VoiceMode:                   req.VoiceMode,

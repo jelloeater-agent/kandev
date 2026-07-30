@@ -11,6 +11,7 @@ import type {
   SavedLayout,
   ToolStatus,
   MCPTaskAgentProfileDefault,
+  PRPanelPlacement,
 } from "@/lib/types/http";
 import type {
   VoiceInputActivationMode,
@@ -206,6 +207,7 @@ export type UserSettingsState = {
   terminalFontFamily: string | null;
   terminalFontSize: number | null;
   changesPanelLayout: "flat" | "tree";
+  prPanelPlacement: PRPanelPlacement;
   systemMetricsDisplay: { showInTopbar: boolean; simplified: boolean };
   appStatusBarOrder: AppStatusBarOrderState;
   voiceMode: VoiceModeState;

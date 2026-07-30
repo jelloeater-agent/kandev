@@ -483,6 +483,7 @@ func marshalUserSettingsPayload(settings *models.UserSettings) ([]byte, error) {
 		"terminal_font_family":            settings.TerminalFontFamily,
 		"terminal_font_size":              settings.TerminalFontSize,
 		"changes_panel_layout":            settings.ChangesPanelLayout,
+		"pr_panel_placement":              models.NormalizePRPanelPlacement(settings.PRPanelPlacement),
 		"system_metrics_display":          settings.SystemMetricsDisplay,
 		"app_status_bar_order":            normalizeAppStatusBarOrder(settings.AppStatusBarOrder),
 		"voice_mode":                      settings.VoiceMode,
@@ -586,6 +587,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		settings.KeyboardShortcuts = map[string]interface{}{}
 		settings.TerminalLinkBehavior = "new_tab"
 		settings.ChangesPanelLayout = "tree"
+		settings.PRPanelPlacement = models.PRPanelPlacementAgent
 		settings.SidebarViews = []models.SidebarView{}
 		settings.SidebarTaskPrefs = normalizeSidebarTaskPrefs(models.SidebarTaskPrefs{})
 		settings.AppStatusBarOrder = normalizeAppStatusBarOrder(models.AppStatusBarOrder{})
@@ -634,6 +636,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		TerminalFontFamily          string                              `json:"terminal_font_family"`
 		TerminalFontSize            int                                 `json:"terminal_font_size"`
 		ChangesPanelLayout          string                              `json:"changes_panel_layout"`
+		PRPanelPlacement            string                              `json:"pr_panel_placement"`
 		SystemMetricsDisplay        models.SystemMetricsDisplaySettings `json:"system_metrics_display"`
 		AppStatusBarOrder           models.AppStatusBarOrder            `json:"app_status_bar_order"`
 		VoiceMode                   *storedVoiceMode                    `json:"voice_mode"`
@@ -737,6 +740,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 	} else {
 		settings.ChangesPanelLayout = "tree"
 	}
+	settings.PRPanelPlacement = models.NormalizePRPanelPlacement(payload.PRPanelPlacement)
 	return settings, nil
 }
 
