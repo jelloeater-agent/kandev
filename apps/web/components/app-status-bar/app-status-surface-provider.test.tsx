@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { StateProvider } from "@/components/state-provider";
+import { StateProvider, useAppStoreApi } from "@/components/state-provider";
 import type { AppState } from "@/lib/state/store";
 import { AppStatusDrawerTrigger, AppStatusSurfaceProvider } from "./app-status-surface-provider";
 
@@ -41,13 +41,33 @@ vi.mock("./app-status-drawer", () => ({
   ),
 }));
 
-function renderSurface(initialState?: Partial<AppState>) {
+function renderSurface(initialState?: Partial<AppState>, children = <AppStatusDrawerTrigger />) {
   return render(
     <StateProvider initialState={initialState}>
-      <AppStatusSurfaceProvider>
-        <AppStatusDrawerTrigger />
-      </AppStatusSurfaceProvider>
+      <AppStatusSurfaceProvider>{children}</AppStatusSurfaceProvider>
     </StateProvider>,
+  );
+}
+
+function ConnectionIssueControls() {
+  const store = useAppStoreApi();
+  return (
+    <>
+      <button
+        data-testid="recover-connection"
+        onClick={() => {
+          store.getState().setConnectionStatus("connected");
+          store.getState().setConnectionIssueSeverity("none");
+        }}
+      />
+      <button
+        data-testid="restore-connection-issue"
+        onClick={() => {
+          store.getState().setConnectionStatus("reconnecting");
+          store.getState().setConnectionIssueSeverity("unstable");
+        }}
+      />
+    </>
   );
 }
 
@@ -112,5 +132,41 @@ describe("AppStatusSurfaceProvider", () => {
     expect(screen.getByTestId(STATUS_BAR_TEST_ID)).toBeTruthy();
     expect(screen.queryByTestId(STATUS_DRAWER_TEST_ID)).toBeNull();
     expect(screen.queryByTestId(STATUS_DRAWER_TRIGGER_TEST_ID)).toBeNull();
+  });
+
+  it("keeps an active connection warning reachable at the tablet breakpoint", () => {
+    responsiveState.breakpoint = "tablet";
+    featureState.appStatusBar = false;
+    renderSurface({
+      connection: { status: "reconnecting", error: null, issueSeverity: "unstable" },
+    });
+
+    expect(screen.getByTestId(STATUS_DRAWER_TEST_ID).getAttribute("data-connection-only")).toBe(
+      "true",
+    );
+    expect(screen.getByTestId(STATUS_DRAWER_TRIGGER_TEST_ID)).toBeTruthy();
+  });
+
+  it("closes a connection-only drawer when the warning recovers", () => {
+    responsiveState.breakpoint = "mobile";
+    featureState.appStatusBar = false;
+    renderSurface(
+      { connection: { status: "reconnecting", error: null, issueSeverity: "unstable" } },
+      <>
+        <AppStatusDrawerTrigger />
+        <ConnectionIssueControls />
+      </>,
+    );
+
+    fireEvent.click(screen.getByTestId(STATUS_DRAWER_TRIGGER_TEST_ID));
+    expect(screen.getByTestId(STATUS_DRAWER_TEST_ID).textContent).toBe("true");
+
+    fireEvent.click(screen.getByTestId("recover-connection"));
+
+    expect(screen.queryByTestId(STATUS_DRAWER_TEST_ID)).toBeNull();
+
+    fireEvent.click(screen.getByTestId("restore-connection-issue"));
+
+    expect(screen.getByTestId(STATUS_DRAWER_TEST_ID).textContent).toBe("false");
   });
 });

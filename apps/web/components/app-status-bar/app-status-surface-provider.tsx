@@ -3,6 +3,7 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ComponentProps,
@@ -67,7 +68,8 @@ export function AppStatusDrawerTrigger({
       variant={buttonProps.variant ?? "ghost"}
       size={buttonProps.size ?? "icon"}
       className={cn(
-        "relative h-11 w-11 cursor-pointer sm:hidden",
+        "relative h-11 w-11 cursor-pointer",
+        drawerTriggerVisibilityClass(drawer.connectionOnly),
         issueActive && (drawer.issueSeverity === "lost" ? "text-destructive" : "text-amber-500"),
         className,
       )}
@@ -90,6 +92,10 @@ export function AppStatusDrawerTrigger({
   );
 }
 
+function drawerTriggerVisibilityClass(connectionOnly: boolean) {
+  return connectionOnly ? "md:hidden" : "sm:hidden";
+}
+
 export function AppStatusSurfaceProvider({ children }: { children: ReactNode }) {
   const [drawerOpen, setStatusDrawerOpen] = useState(false);
   const pathname = usePathname();
@@ -98,9 +104,15 @@ export function AppStatusSurfaceProvider({ children }: { children: ReactNode }) 
   const activeSessionId = useAppStore((state) => state.tasks.activeSessionId);
   const issueSeverity = useAppStore((state) => state.connection.issueSeverity);
   const appStatusBarEnabled = useFeature("appStatusBar");
-  const { isMobile, isFullDesktop } = useResponsiveBreakpoint();
+  const { isMobile, isTablet, isFullDesktop } = useResponsiveBreakpoint();
   const connectionOnly = !appStatusBarEnabled && issueSeverity !== "none";
-  const drawerEnabled = isMobile && (appStatusBarEnabled || connectionOnly);
+  const useDrawerSurface = isMobile || (isTablet && connectionOnly);
+  const drawerEnabled = useDrawerSurface && (appStatusBarEnabled || connectionOnly);
+
+  useEffect(() => {
+    if (!drawerEnabled) setStatusDrawerOpen(false);
+  }, [drawerEnabled]);
+
   const drawer = useMemo<AppStatusDrawerContextValue>(
     () => ({
       enabled: drawerEnabled,
@@ -125,8 +137,8 @@ export function AppStatusSurfaceProvider({ children }: { children: ReactNode }) 
     <AppStatusDrawerContext.Provider value={drawer}>
       <div className="flex h-dvh min-h-0 w-full flex-col overflow-hidden">
         {children}
-        {(isMobile ? drawerEnabled : appStatusBarEnabled) &&
-          (isMobile ? (
+        {(useDrawerSurface ? drawerEnabled : appStatusBarEnabled) &&
+          (useDrawerSurface ? (
             <AppStatusDrawer
               {...surfaceProps}
               open={drawerOpen}

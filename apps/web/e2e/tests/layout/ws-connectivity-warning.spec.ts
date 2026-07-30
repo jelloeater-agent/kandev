@@ -48,6 +48,26 @@ test.describe("WebSocket connectivity warning", () => {
     await setConnectionIssueSeverity(testPage, "none");
     await expect(warning).toHaveCount(0);
   });
+
+  test("keeps a connection-only warning reachable on tablet widths", async ({ testPage }) => {
+    await testPage.setViewportSize({ width: 700, height: 900 });
+    await testPage.goto("/stats");
+    await setAppStatusBarEnabled(testPage, false);
+    await setConnectionIssueSeverity(testPage, "unstable");
+
+    await expect(testPage.getByTestId("app-status-bar")).toHaveCount(0);
+    const trigger = testPage.getByTestId("app-status-drawer-trigger");
+    await expect(trigger).toBeVisible();
+    await expect(trigger).toHaveAttribute(
+      "aria-label",
+      "Connection unstable. Reconnecting to Kandev.",
+    );
+
+    await trigger.click();
+    const drawer = testPage.getByTestId("app-status-drawer");
+    await expect(drawer).toBeVisible();
+    await expect(drawer.locator("[data-status-item-id]")).toHaveCount(1);
+  });
 });
 
 type E2EStore = {
