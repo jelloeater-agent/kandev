@@ -3,9 +3,16 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useTheme } from "@/components/theme/app-theme";
 import { IconZoomIn, IconZoomOut, IconCode } from "@tabler/icons-react";
-import { getSvgDimensions, sanitizeMermaidCode, cleanupMermaidOrphans } from "./mermaid-utils";
+import {
+  getSvgDimensions,
+  sanitizeMermaidCode,
+  cleanupMermaidOrphans,
+  reportMermaidRenderFailure,
+} from "./mermaid-utils";
 import { useMermaidScale, useMermaidViewportWidth } from "./mermaid-block-hooks";
 import { useToast } from "@/components/toast-provider";
+import { useAppStore } from "@/components/state-provider";
+import { showMermaidErrorToast } from "./mermaid-error-toast";
 
 type MermaidAPI = typeof import("mermaid").default;
 
@@ -47,7 +54,12 @@ function sameSvgSize(
  * still visible). Returns the rendered svg and the last error so the caller
  * can decide what to show.
  */
-function useMermaidRender(code: string, resolvedTheme: string | undefined, toast: ToastFn) {
+function useMermaidRender(
+  code: string,
+  resolvedTheme: string | undefined,
+  toast: ToastFn,
+  taskId: string | null,
+) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Synchronous mirror of `svg` so the render closure can decide whether to
@@ -85,16 +97,13 @@ function useMermaidRender(code: string, resolvedTheme: string | undefined, toast
         .catch((err: Error) => {
           cleanupMermaidOrphans(id);
           if (cancelled) return;
+          reportMermaidRenderFailure(err, code, sanitizedCode);
           setError(err.message);
           // Suppress the toast when a previously-rendered SVG is still on
           // screen — the error banner is also suppressed in that case, so a
           // toast here would surface a failure the user never sees in the UI.
           if (svgRef.current === null) {
-            toast({
-              title: "Failed to render diagram",
-              description: err.message,
-              variant: "error",
-            });
+            showMermaidErrorToast(toast, taskId, err.message);
           }
         });
     }, RENDER_DEBOUNCE_MS);
@@ -103,7 +112,7 @@ function useMermaidRender(code: string, resolvedTheme: string | undefined, toast
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [code, resolvedTheme, toast]);
+  }, [code, resolvedTheme, taskId, toast]);
 
   return { svg, error };
 }
@@ -116,7 +125,8 @@ export function MermaidBlock({ code }: MermaidBlockProps) {
   const [showCode, setShowCode] = useState(false);
   const { resolvedTheme } = useTheme();
   const { toast } = useToast();
-  const { svg, error } = useMermaidRender(code, resolvedTheme, toast);
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const { svg, error } = useMermaidRender(code, resolvedTheme, toast, activeTaskId);
   const viewportWidth = useMermaidViewportWidth(scrollRegionElement);
   const { scale, zoomIn, zoomOut, zoomReset, resetAutoScale } = useMermaidScale(
     svgSize,
