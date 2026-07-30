@@ -42,6 +42,20 @@ function useQuickChatStore(workspaceId: string) {
 
 type QuickChatStore = ReturnType<typeof useQuickChatStore>;
 
+/**
+ * Resolves a tab's backing task. The tab carries `taskId` on every path that
+ * introduces it, but sessions restored by older clients only exist in
+ * `taskSessions`. Both the rename and the close flow must agree here: a missed
+ * task id silently downgrades a rename to device-local and skips the backend
+ * delete, leaving an orphaned ephemeral task.
+ */
+function resolveTaskId(store: QuickChatStore, sessionId: string): string | undefined {
+  return (
+    store.sessions.find((session) => session.sessionId === sessionId)?.taskId ??
+    store.taskSessions[sessionId]?.task_id
+  );
+}
+
 function useWorkspaceQuickChat(store: QuickChatStore) {
   const sessions = store.sessions;
   const activeSession = sessions.find((session) => session.sessionId === store.activeSessionId);
@@ -156,9 +170,7 @@ function useQuickChatSessionClose(store: QuickChatStore, resetPendingStarts: () 
     if (!sessionToClose) return;
     const sessionId = sessionToClose;
     setSessionToClose(null);
-    const taskId =
-      store.sessions.find((session) => session.sessionId === sessionId)?.taskId ??
-      store.taskSessions[sessionId]?.task_id;
+    const taskId = resolveTaskId(store, sessionId);
     if (!taskId) {
       store.closeQuickChatSession(sessionId);
       return;
@@ -248,8 +260,7 @@ export function useQuickChatModal(workspaceId: string, onSupersedeConfigStart = 
       // Show the new label immediately, then save it to the backing task so
       // the user's other devices pick it up over the task.updated event.
       store.renameQuickChatSession(sessionId, name);
-      const taskId = store.sessions.find((s) => s.sessionId === sessionId)?.taskId;
-      persistQuickChatRename(sessionId, taskId, name).catch(() => {
+      persistQuickChatRename(sessionId, resolveTaskId(store, sessionId), name).catch(() => {
         toast({
           title: "Rename saved on this device only",
           description: "We could not sync the new name to your other devices.",

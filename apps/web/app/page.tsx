@@ -10,6 +10,7 @@ import {
   listQuickChatSessions,
 } from "@/lib/api";
 import { listWorkspaceTaskPRs } from "@/lib/api/domains/github-api";
+import { toQuickChatSessions } from "@/lib/quick-chat/map-sessions";
 import { snapshotToState } from "@/lib/ssr/mapper";
 import { mapUserSettingsResponse } from "@/lib/ssr/user-settings";
 import { resolveDesiredWorkflowId } from "@/lib/kanban/resolve-workflow";
@@ -140,15 +141,7 @@ async function loadWorkspaceState({
     settingsWorkflowId,
     workspaceWorkflows: workflowList.workflows,
   });
-  const quickChatSessions: AppState["quickChat"]["sessions"] = quickChatResponse.sessions.map(
-    (session) => ({
-      kind: session.kind,
-      sessionId: session.session_id,
-      workspaceId: session.workspace_id,
-      name: session.name,
-      agentProfileId: session.agent_profile_id,
-    }),
-  );
+  const quickChatSessions = toQuickChatSessions(quickChatResponse.sessions);
 
   return {
     workflowId,

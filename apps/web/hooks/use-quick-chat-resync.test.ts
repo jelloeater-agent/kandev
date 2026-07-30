@@ -4,7 +4,11 @@ import { renderHook, waitFor } from "@testing-library/react";
 const mockListQuickChatSessions = vi.hoisted(() => vi.fn());
 const mockUpdateTask = vi.hoisted(() => vi.fn());
 const mockState = vi.hoisted(() => ({
-  value: {} as { connection: { status: string }; syncQuickChatSessions: unknown },
+  value: {} as {
+    connection: { status: string };
+    syncQuickChatSessions: unknown;
+    setTaskSession: unknown;
+  },
 }));
 
 vi.mock("@/components/state-provider", () => ({
@@ -23,9 +27,10 @@ import { useQuickChatResync } from "./use-quick-chat-resync";
 import { getStoredQuickChatNames, setStoredQuickChatName } from "@/lib/local-storage";
 
 const syncQuickChatSessions = vi.fn();
+const setTaskSession = vi.fn();
 
 function setConnection(status: string) {
-  mockState.value = { connection: { status }, syncQuickChatSessions };
+  mockState.value = { connection: { status }, syncQuickChatSessions, setTaskSession };
 }
 
 beforeEach(() => {
@@ -44,7 +49,7 @@ beforeEach(() => {
         agent_profile_id: "agent-1",
       },
     ],
-    task_sessions: [],
+    task_sessions: [{ id: "session-1", task_id: "task-1" }],
   });
 });
 
@@ -63,6 +68,16 @@ describe("useQuickChatResync", () => {
         agentProfileId: "agent-1",
       },
     ]);
+  });
+
+  // A tab without its session row renders but cannot subscribe or accept
+  // input, so the rows in the response must land in the store too.
+  it("stores the session rows that came with the list", async () => {
+    renderHook(() => useQuickChatResync("ws-1"));
+
+    await waitFor(() =>
+      expect(setTaskSession).toHaveBeenCalledWith({ id: "session-1", task_id: "task-1" }),
+    );
   });
 
   it("waits for the socket before trusting any list", () => {

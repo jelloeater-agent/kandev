@@ -144,10 +144,11 @@ test.describe("Quick Chat cross-device sync", () => {
       .click();
     const confirm = testPage.getByRole("alertdialog");
     await expect(confirm).toBeVisible({ timeout: 10_000 });
-    await confirm
-      .getByRole("button", { name: /delete|close|confirm/i })
-      .last()
-      .click();
+    // Target the destructive action exactly; a loose regex plus .last() would
+    // happily click Cancel if the footer order ever changed.
+    const confirmDelete = confirm.getByRole("button", { name: "Delete", exact: true });
+    await expect(confirmDelete).toHaveCount(1);
+    await confirmDelete.click();
     await expect(dialogA.getByTestId("quick-chat-tab")).toHaveCount(1, { timeout: 30_000 });
 
     // B must drop the tab too rather than keeping a ghost pointing at a task

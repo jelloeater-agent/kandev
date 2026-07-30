@@ -4,8 +4,8 @@ import { useEffect, useRef } from "react";
 import { useAppStore } from "@/components/state-provider";
 import { listQuickChatSessions } from "@/lib/api/domains/workspace-api";
 import { getStoredQuickChatNames } from "@/lib/local-storage";
+import { toQuickChatSessions } from "@/lib/quick-chat/map-sessions";
 import { migrateStoredQuickChatNames } from "@/lib/quick-chat/rename";
-import type { QuickChatSession } from "@/lib/state/slices/ui/types";
 
 /**
  * Keeps this client's quick-chat tabs in step with the server's list.
@@ -19,6 +19,7 @@ import type { QuickChatSession } from "@/lib/state/slices/ui/types";
 export function useQuickChatResync(workspaceId: string | null): void {
   const connectionStatus = useAppStore((state) => state.connection.status);
   const syncQuickChatSessions = useAppStore((state) => state.syncQuickChatSessions);
+  const setTaskSession = useAppStore((state) => state.setTaskSession);
   // Resync once per connection, not on every unrelated status re-render.
   const lastSyncedConnection = useRef<string | null>(null);
 
@@ -34,14 +35,13 @@ export function useQuickChatResync(workspaceId: string | null): void {
     listQuickChatSessions(workspaceId)
       .then((response) => {
         if (cancelled) return;
-        const sessions: QuickChatSession[] = response.sessions.map((session) => ({
-          kind: session.kind,
-          sessionId: session.session_id,
-          taskId: session.task_id,
-          workspaceId: session.workspace_id,
-          name: session.name,
-          agentProfileId: session.agent_profile_id,
-        }));
+        const sessions = toQuickChatSessions(response.sessions);
+        // Store the session rows before the tabs. A tab without its row cannot
+        // subscribe or accept input (useSession bails, requireSessionInputMode
+        // throws), so a resync-only tab would otherwise render but be dead.
+        for (const taskSession of response.task_sessions) {
+          setTaskSession(taskSession);
+        }
         syncQuickChatSessions(workspaceId, sessions);
         // Renames made before names were stored server-side live only in this
         // browser; push them up once so they reach the user's other devices.
@@ -55,5 +55,5 @@ export function useQuickChatResync(workspaceId: string | null): void {
     return () => {
       cancelled = true;
     };
-  }, [connectionStatus, workspaceId, syncQuickChatSessions]);
+  }, [connectionStatus, workspaceId, setTaskSession, syncQuickChatSessions]);
 }

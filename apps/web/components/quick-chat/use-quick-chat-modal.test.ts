@@ -399,6 +399,26 @@ describe("useQuickChatModal — renaming", () => {
     expect(mockToast).not.toHaveBeenCalled();
   });
 
+  // The close path resolves the task via taskSessions when the tab itself has
+  // no taskId; rename must agree, or it silently downgrades to a local-only
+  // rename for exactly those sessions — and without a toast, since that branch
+  // resolves rather than rejects.
+  it("falls back to taskSessions for a tab that carries no taskId", async () => {
+    mockUpdateTask.mockResolvedValue(undefined);
+    mockAppState.quickChat.sessions = [
+      { sessionId: "session-1", workspaceId: WORKSPACE_ID, kind: "chat" },
+    ];
+    mockAppState.taskSessions.items = { "session-1": { task_id: "task-legacy" } };
+    const { result } = renderHook(() => useQuickChatModal(WORKSPACE_ID));
+
+    await act(async () => {
+      result.current.handleRename("session-1", "Renamed");
+      await flushPromises();
+    });
+
+    expect(mockUpdateTask).toHaveBeenCalledWith("task-legacy", { title: "Renamed" });
+  });
+
   it("warns that the rename did not sync when the request fails", async () => {
     mockUpdateTask.mockRejectedValue(new Error("offline"));
     mockAppState.quickChat.sessions = [

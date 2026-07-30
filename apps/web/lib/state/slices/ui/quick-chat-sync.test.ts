@@ -109,6 +109,18 @@ describe("reconcileQuickChatSessions", () => {
     expect(after.isOpen).toBe(false);
   });
 
+  it("leaves a never-selected active tab unset instead of promoting one", () => {
+    // A background resync must not decide which tab is "current" for a user who
+    // has not opened quick chat at all.
+    const before = state([], { isOpen: false, activeSessionId: null });
+
+    const after = reconcileQuickChatSessions(before, WS, [chat("a"), chat("b")]);
+
+    expect(after.sessions).toHaveLength(2);
+    expect(after.activeSessionId).toBeNull();
+    expect(after.isOpen).toBe(false);
+  });
+
   it("does not disturb an active tab belonging to another workspace", () => {
     const foreign = chat("foreign", { workspaceId: OTHER_WS });
     const before = state([foreign, chat("a")], { activeSessionId: "foreign" });
@@ -163,6 +175,15 @@ describe("removeQuickChatSessionsForTask", () => {
 
     expect(after.sessions.map((s) => s.sessionId)).toEqual(["a"]);
     expect(after.activeSessionId).toBe("a");
+  });
+
+  it("keeps a null active tab null while removing others", () => {
+    const before = state([chat("a"), chat("b")], { activeSessionId: null });
+
+    const after = removeQuickChatSessionsForTask(before, "task-b");
+
+    expect(after.sessions.map((s) => s.sessionId)).toEqual(["a"]);
+    expect(after.activeSessionId).toBeNull();
   });
 
   it("returns the same state when no tab is affected", () => {

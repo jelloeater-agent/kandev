@@ -92,7 +92,10 @@ function withValidActiveSession(
   sessions: QuickChatSession[],
 ): QuickChatState {
   const active = state.activeSessionId;
-  if (active && sessions.some((session) => session.sessionId === active)) {
+  // No tab was ever selected: leave it unset rather than silently promoting one
+  // on a background resync. Same invariant `hydrateUI` guards on.
+  if (!active) return { ...state, sessions };
+  if (sessions.some((session) => session.sessionId === active)) {
     return { ...state, sessions };
   }
   const previousWorkspaceId = state.sessions.find(
