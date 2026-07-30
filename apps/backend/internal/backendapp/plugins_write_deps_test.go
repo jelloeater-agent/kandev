@@ -31,6 +31,7 @@ func TestSetWriteDepsIsWiredOutsideOfficeGate(t *testing.T) {
 	}
 
 	var callsInOfficeInit, callsElsewhere int
+	var foundOfficeInit bool
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
@@ -38,10 +39,19 @@ func TestSetWriteDepsIsWiredOutsideOfficeGate(t *testing.T) {
 		}
 		count := countSetWriteDepsCalls(fn)
 		if fn.Name.Name == "initOfficeServices" {
+			foundOfficeInit = true
 			callsInOfficeInit += count
 			continue
 		}
 		callsElsewhere += count
+	}
+
+	// Without this the test degrades silently: rename or move
+	// initOfficeServices and every assertion below still "passes" while
+	// guarding nothing. Fail loudly instead so whoever renames it has to
+	// re-point the guard at the Office-gated function.
+	if !foundOfficeInit {
+		t.Fatal("initOfficeServices not found in main.go; re-point this guard at the Office-gated function")
 	}
 
 	if callsInOfficeInit > 0 {
