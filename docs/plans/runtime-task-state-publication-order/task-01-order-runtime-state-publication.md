@@ -1,7 +1,7 @@
 ---
 id: "01-order-runtime-state-publication"
 title: "Order runtime state publication"
-status: pending
+status: completed
 wave: 1
 depends_on: []
 plan: "plan.md"

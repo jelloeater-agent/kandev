@@ -1,6 +1,6 @@
 # ADR-2026-07-30-runtime-task-state-before-running-event: Publish Task State Before Running Session State
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-07-30
 **Area:** backend, frontend, protocol, workflow
 

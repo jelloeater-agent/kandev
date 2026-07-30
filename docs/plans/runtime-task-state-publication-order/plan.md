@@ -1,7 +1,7 @@
 ---
 spec: docs/specs/tasks/runtime-state-publication-order.md
 created: 2026-07-30
-status: draft
+status: complete
 ---
 
 # Implementation Plan: Runtime Task-State Publication Order
@@ -71,8 +71,8 @@ navigation, scroll, safe-area, pointer, or touch-target change.
   `REVIEW`.
   **File:**
   `apps/backend/internal/orchestrator/event_handlers_streaming_test.go`.
-  **How:** record `tasks.state` at session-event delivery rather than relying on
-  sleeps or browser rendering.
+  **How:** record task and session state events through the real task service
+  rather than relying on sleeps or browser rendering.
 - **What:** same-state stream churn remains deduplicated.
   **File:**
   `apps/backend/internal/orchestrator/event_handlers_streaming_test.go`.

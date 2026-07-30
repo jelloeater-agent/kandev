@@ -1,5 +1,5 @@
 ---
-status: draft
+status: shipped
 created: 2026-07-30
 owner: kandev
 decision: docs/decisions/2026-07-30-runtime-task-state-before-running-event.md
