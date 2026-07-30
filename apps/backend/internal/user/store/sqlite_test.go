@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,74 @@ func TestScanUserSettingsMCPTaskAgentProfileDefault(t *testing.T) {
 	}
 }
 
+func TestScanUserSettingsShowAnchoredPromptBarDefault(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = false, want true (default)")
+	}
+
+	settings, err = scanUserSettings(settingsScanner{raw: `{"show_anchored_prompt_bar":false}`}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = true, want false (stored)")
+	}
+}
+
+func TestScanUserSettingsTranscriptNavigationDefaults(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if !settings.ShowScrollToLastPrompt || !settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (true, true)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
+
+	settings, err = scanUserSettings(
+		settingsScanner{raw: `{"show_scroll_to_last_prompt":false,"show_scroll_to_start":false}`},
+		DefaultUserID,
+	)
+	if err != nil {
+		t.Fatalf("scan stored preferences: %v", err)
+	}
+	if settings.ShowScrollToLastPrompt || settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (false, false)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
+}
+
+func TestTranscriptNavigationSettingsRoundTripThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{
+		ShowScrollToLastPrompt: false,
+		ShowScrollToStart:      false,
+	})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if settings.ShowScrollToLastPrompt || settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (false, false)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
+}
+
 func TestMarshalUserSettingsPersistsDisabledArchiveConfirmation(t *testing.T) {
 	raw, err := marshalUserSettingsPayload(&models.UserSettings{ConfirmTaskArchive: false})
 	if err != nil {
@@ -136,6 +205,53 @@ func TestMarshalUserSettingsPersistsDisabledArchiveConfirmation(t *testing.T) {
 	}
 	if got, ok := payload["confirm_task_archive"].(bool); !ok || got {
 		t.Fatalf("confirm_task_archive = %#v, want false", payload["confirm_task_archive"])
+	}
+}
+
+func TestShowAnchoredPromptBarRoundTripsThroughMarshalAndScan(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{ShowAnchoredPromptBar: true})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	settings, err := scanUserSettings(settingsScanner{raw: string(raw)}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan settings: %v", err)
+	}
+	if !settings.ShowAnchoredPromptBar {
+		t.Fatal("ShowAnchoredPromptBar = false after round trip, want true")
+	}
+}
+
+func TestMarshalUserSettingsPersistsTasksListShowDetails(t *testing.T) {
+	raw, err := marshalUserSettingsPayload(&models.UserSettings{TasksListShowDetails: true})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got, ok := payload["tasks_list_show_details"].(bool); !ok || !got {
+		t.Fatalf("tasks_list_show_details = %#v, want true", payload["tasks_list_show_details"])
+	}
+}
+
+func TestScanUserSettingsTasksListShowDetailsDefaultsAndLoads(t *testing.T) {
+	settings, err := scanUserSettings(settingsScanner{raw: "{}"}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan defaults: %v", err)
+	}
+	if settings.TasksListShowDetails {
+		t.Fatal("TasksListShowDetails = true, want false")
+	}
+
+	settings, err = scanUserSettings(settingsScanner{raw: `{"tasks_list_show_details":true}`}, DefaultUserID)
+	if err != nil {
+		t.Fatalf("scan stored settings: %v", err)
+	}
+	if !settings.TasksListShowDetails {
+		t.Fatal("TasksListShowDetails = false, want true")
 	}
 }
 
@@ -193,13 +309,27 @@ func TestScanUserSettingsSystemMetricsDisplayDefault(t *testing.T) {
 	if settings.SystemMetricsDisplay.ShowInTopbar {
 		t.Fatal("system metrics display should default to disabled")
 	}
+	encoded, err := json.Marshal(settings.SystemMetricsDisplay)
+	if err != nil {
+		t.Fatalf("marshal system metrics display: %v", err)
+	}
+	if string(encoded) != `{"show_in_topbar":false,"simplified":false}` {
+		t.Fatalf("default system metrics display = %s, want detailed preference", encoded)
+	}
 
-	settings, err = scanUserSettings(settingsScanner{raw: `{"system_metrics_display":{"show_in_topbar":true}}`}, DefaultUserID)
+	settings, err = scanUserSettings(settingsScanner{raw: `{"system_metrics_display":{"show_in_topbar":true,"simplified":true}}`}, DefaultUserID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !settings.SystemMetricsDisplay.ShowInTopbar {
 		t.Fatal("expected stored system metrics display preference")
+	}
+	encoded, err = json.Marshal(settings.SystemMetricsDisplay)
+	if err != nil {
+		t.Fatalf("marshal stored system metrics display: %v", err)
+	}
+	if string(encoded) != `{"show_in_topbar":true,"simplified":true}` {
+		t.Fatalf("stored system metrics display = %s, want simplified preference", encoded)
 	}
 }
 
@@ -220,14 +350,48 @@ func TestSQLiteRepositorySystemMetricsDisplayRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get defaults: %v", err)
 	}
-	settings.SystemMetricsDisplay = models.SystemMetricsDisplaySettings{ShowInTopbar: true}
+	settings.SystemMetricsDisplay = models.SystemMetricsDisplaySettings{ShowInTopbar: true, Simplified: true}
 	upsertUserSettingsForTest(t, repo, ctx, settings)
 	got, err := repo.GetUserSettings(ctx, DefaultUserID)
 	if err != nil {
 		t.Fatalf("get settings: %v", err)
 	}
-	if !got.SystemMetricsDisplay.ShowInTopbar {
+	if !got.SystemMetricsDisplay.ShowInTopbar || !got.SystemMetricsDisplay.Simplified {
 		t.Fatal("expected system metrics display preference to round-trip")
+	}
+}
+
+func TestSQLiteRepositoryAppStatusBarOrderDefaultAndRoundTrip(t *testing.T) {
+	conn, err := sqlx.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	conn.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = conn.Close() })
+	repo, err := newSQLiteRepositoryWithDB(conn, conn)
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+
+	ctx := context.Background()
+	settings, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if settings.AppStatusBarOrder.LeftItemIDs == nil || settings.AppStatusBarOrder.RightItemIDs == nil {
+		t.Fatalf("default AppStatusBarOrder = %#v, want non-nil empty arrays", settings.AppStatusBarOrder)
+	}
+	settings.AppStatusBarOrder = models.AppStatusBarOrder{
+		LeftItemIDs:  []string{"builtin:connection", "plugin:left"},
+		RightItemIDs: []string{"builtin:metrics", "plugin:right"},
+	}
+	upsertUserSettingsForTest(t, repo, ctx, settings)
+	got, err := repo.GetUserSettings(ctx, DefaultUserID)
+	if err != nil {
+		t.Fatalf("get settings: %v", err)
+	}
+	if !reflect.DeepEqual(got.AppStatusBarOrder, settings.AppStatusBarOrder) {
+		t.Fatalf("AppStatusBarOrder = %#v, want %#v", got.AppStatusBarOrder, settings.AppStatusBarOrder)
 	}
 }
 

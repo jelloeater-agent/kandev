@@ -15,7 +15,7 @@ Kandev does not currently provide a user-login boundary for the web application,
 | --- | --- | --- | --- |
 | Desktop | Launch or quit Kandev | `~/.kandev` by default | **Settings > System > Updates** uses the signed desktop updater when supported |
 | Interactive CLI | `kandev`, then `Ctrl-C` | `~/.kandev` by default | Upgrade the Homebrew or npm package, then restart |
-| Managed service | `kandev service {start,stop,restart,status}` | `~/.kandev` for a user service, `/var/lib/kandev` for a system service, or the install-time `--home-dir` | Upgrade the package, reinstall the unit with the same flags, and restart; the current native installer does not enable in-app apply |
+| Managed service | `kandev service {start,stop,restart,status}` | `~/.kandev` for a user service, `/var/lib/kandev` for a system service, or the install-time `--home-dir` | Use guarded in-app apply for a managed user service; otherwise upgrade the package, reinstall with the same flags, and restart |
 | Docker or Kubernetes | Container or workload manager | Mounted Kandev home plus any external database/provider state | Replace the image and recreate the container or pod |
 
 See [Desktop app](desktop-app.md), [CLI](cli.md), [Run as a service](run-as-a-service.md), [Docker](docker.md), and [Kubernetes](k8s.md) for mode-specific prerequisites and commands.
@@ -66,7 +66,7 @@ Add `--system` to both commands for a system service.
 | `repos/` | Kandev-managed source clones |
 | `sessions/`, `quick-chat/`, `agent-sessions/` | Session history, ephemeral workspaces, and isolated agent homes when used |
 | `logs/` | Service and optional ACP debug logs |
-| `service/` | Update/helper files when present; the current native service installer does not create `install.json` |
+| `service/` | Owner-only managed-service install metadata plus update intents and helper files |
 | `lsp-servers/`, `runtime/`, `workspaces/` | Installed tools and feature-specific materialized state |
 
 Database snapshots do not contain Git worktrees, clones, the master key, service metadata, or provider-side objects. Native agent and `gh` login files also normally live in the service user's home outside `~/.kandev` (for example `~/.codex` and `~/.config/gh`). The official container instead sets `HOME=/data/home`, so those CLI credentials live on its mounted volume.
@@ -77,14 +77,54 @@ The supported SQLite layout for the System database and restore pages is the der
 
 Open **Settings > System > Storage** to inspect Kandev-managed disk usage and configure cleanup.
 **Analyze** is read-only. **Run now** applies only the enabled cleanup rules and refuses to start
-while task resources are active or another maintenance run owns the cleanup gate.
+while another maintenance run owns the cleanup gate. If task resources are active, the page names
+the active work and offers **Run anyway** after an explicit disruption warning. Use that override
+only when the active task work can tolerate cleanup running alongside it.
+
+Storage analysis results are cached in the running backend for 15 minutes, so page reloads and
+policy saves reuse the displayed snapshot instead of scanning disk again. The page shows when that
+snapshot was last analyzed. Select **Analyze** to force a fresh scan; restarting the backend also
+clears the in-memory snapshot.
 
 Scheduled cleanup is disabled by default and runs only after the configured resource-idle quiet
-period. Orphaned task workspaces move into Kandev's quarantine before permanent deletion; review
-the quarantine list to restore an entry or request deletion as a background job. Host-wide Docker
-build-cache and unused-image cleanup remain disabled until you confirm that Kandev owns a dedicated
-Docker daemon.
+period. Orphaned task workspaces and rotated Go caches move into Kandev's quarantine before
+permanent deletion. Each entry shows its `delete_after` retention deadline: **Delete** and
+**Clear eligible** cannot remove it before that time. The deadline is the earliest safe deletion
+time, not an exact promise—the first successful scheduled or full manual maintenance run after the
+deadline performs the purge, subject to the idle gate and any preemption.
+
+Use **Clear eligible** to remove only entries whose deadlines have passed. It reports protected
+entries that remain. **Force clear all** requires typing `DELETE ALL NOW` and attempts to permanently
+remove every active quarantine entry, discarding restore windows for entries that are successfully
+deleted. Safety-validation or deletion failures may leave entries visible and retryable. This
+override bypasses only the retention timestamp; path, ownership, state, and filesystem safety
+checks still apply.
+If scheduled cleanup is disabled, no independent quarantine sweeper runs: use a full **Run now** or
+one of the quarantine actions when you want cleanup.
+
+Host-wide Docker build-cache and unused-image cleanup remain disabled until you confirm that Kandev
+owns a dedicated Docker daemon.
 Do not enable those rules on a daemon shared with unrelated workloads.
+
+Host-local agents inherit the Kandev service's `TMPDIR`, `TMP`, and `TEMP` values unchanged. If the
+service leaves them unset, agent tools use their normal operating-system defaults; if an operator
+sets them on the service, all host-local agents share those configured locations. This permits
+tools whose caches are derived from the temporary directory, such as Node or Playwright tooling, to
+reuse cache data across agent instances. Kandev does not create a per-instance temporary root or
+claim ownership of arbitrary files in the shared temporary directory. On Unix, keep an explicit
+service temp path short enough for local Unix-domain socket paths; an excessively long path can
+exceed the platform socket-address limit.
+
+Persistent Go build caching is separate: Go's default `GOCACHE` is not derived from `TMPDIR`, and
+Kandev injects its managed Go-cache location only when that opt-in Storage setting is enabled.
+Scratch cleanup in the inherited temporary directory belongs to the operating system or the host's
+temporary-file policy. Archive and delete stop and reap the task's host-local processes, but do not
+recursively delete shared temporary files.
+
+Older versions may have left inactive directories under `/tmp/kandev-agent/*`. Storage analysis and
+cleanup do not delete this legacy data by name or age. Remove it only through a deliberate
+host-administrator procedure after confirming that no live process references the target; stopping
+the Kandev service first provides the clearest maintenance boundary.
 
 ## Database operation
 
@@ -196,7 +236,7 @@ When reporting an incident, record timestamp/timezone, Kandev version and commit
 
 **Settings > System > Status** walks `data`, worktrees, repositories, sessions, tasks, quick chat, and backups. Results are cached for two hours; **Refresh** forces a new single-flight walk. Permission failures appear as warnings. The displayed total intentionally counts `data/backups` both inside the `data` row and again as the separate `backups` row, so use filesystem or volume metrics for quota enforcement.
 
-Archiving or deleting a task stops active sessions and starts asynchronous cleanup with a 60-second bound. Depending on executor, cleanup can delete a managed worktree and its local branch, remove a container, destroy a Sprite, or attempt to stop the remote SSH controller and remove only its per-session runtime directory. SSH process/session cleanup is best-effort when the connection is failing, and the task directory always remains for deliberate, audited cleanup; there is no automatic sweeper for it today. The task can disappear from the UI before cleanup finishes.
+Archiving or deleting a task stops active sessions and starts durable asynchronous cleanup. Depending on executor, cleanup can delete a managed worktree and its local branch, remove a container, destroy a Sprite, reap a host-local agent's process tree, or attempt to stop the remote SSH controller and remove only its per-session runtime directory. Failed cleanup remains retryable across a backend restart. Kandev does not sweep arbitrary files from the shared temporary directory during archive or delete. SSH process/session cleanup is best-effort when the connection is failing, and the task directory always remains for deliberate, audited cleanup; there is no automatic sweeper for it today. The task can disappear from the UI before cleanup finishes.
 
 **Reset Environment** uses a separate teardown path. For Sprites, the current reset request can lose the profile credential context and report success while leaving the provider sandbox behind. After a Sprites reset, inspect **Settings > Executors > Sprites.dev** and explicitly destroy the old sandbox there if it remains. See [Executors](executors.md#spritesdev) for the executor-specific lifecycle.
 
@@ -214,10 +254,12 @@ Never delete a managed task directory merely because its database row looks term
 
 The backend contacts the public GitHub Releases API once at startup and every six hours, with a 30-second HTTP timeout, and persists the last successful result. **Check now** performs a synchronous request and permits one manual check per process every 30 seconds. Offline or rate-limited installations continue to show cached state.
 
+Configure update alerts in **Settings > General > Notifications > Notification Events**. Select **Kandev update available** for each notification provider that should receive it: Local delivers the in-app update indication and can use an already-granted browser or native desktop notification; System and Apprise use their configured provider transports. There is no separate update-only channel selector. New Local and System providers include this event by default; existing Local and System providers receive it once on upgrade, while existing Apprise providers remain unchanged. Disabling the event for a provider stops that provider's delivery without disabling release checks. Each provider receives a release version at most once; a later version is a new occurrence.
+
 Before any update, finish or stop active sessions, create and export a database backup plus its master key, preserve unpushed Git work, and read release notes.
 
 - Desktop: use **Settings > System > Updates** when signed updater assets are available; otherwise install the new desktop package.
-- Managed service: the current native CLI installer neither writes `service/install.json` nor supplies the service/install metadata required by the guarded one-click updater, so its **Apply update** action is unavailable. Run `brew upgrade kandev` or `npm install -g kandev@latest`, rerun `kandev service install` with the same install flags, then `kandev service restart`. Backend support for metadata-bearing legacy services is implementation detail, not the current native installation path.
+- Managed user service: use **Settings > System > Updates > Apply update**. Kandev enables it only after verifying the managed unit or plist and `<home>/service/install.json`. If the guarded update is unavailable or fails, run `brew upgrade kandev` or `npm install -g kandev@latest`, rerun `kandev service install` with the same install flags, then `kandev service restart`. System services always use that terminal flow with the required privileges.
 - Unmanaged CLI: run `brew upgrade kandev` or `npm install -g kandev@latest`, then restart the process.
 - Transient npx: start the desired release with `npx -y kandev@latest`; this does not update a persistent package.
 - Docker/Kubernetes: replace the image and recreate the workload. Do not treat an in-container package install as a durable update.
@@ -226,9 +268,9 @@ After restart, verify `/health`, **System > About**, **System > Status**, the da
 
 ## Resource metrics
 
-Configure sampling at **Settings > General > Appearance > Resource Metrics**. Defaults are CPU, memory, and disk percentage every five seconds, backend disk path `/`, and execution-environment collection off. Valid intervals are 1–300 seconds; at least one of CPU, memory, disk, CPU temperature, or load average remains selected.
+Configure sampling at **Settings > General > Appearance > Resource Metrics**. Defaults are CPU, memory, and disk percentage every five seconds, backend disk path `/`, and execution-environment collection off. Valid intervals are 1–300 seconds; at least one of CPU, memory, disk, CPU temperature, or 1-minute system load remains selected. System load is the average number of tasks running or waiting for CPU during the last minute; compare it with the host's CPU core count. Enable **Simplified metrics** to show only each metric icon and value in the status bar or phone Status drawer, without the Host marker or percentage progress bars.
 
-Collection starts only while at least one connected client shows metrics in a kanban or task topbar. Enabling execution metrics adds active Docker, SSH, and Sprites `agentctl` sources; execution disk sampling uses `/`. A provider hook also exists for remote Docker, but creating that runtime currently returns a not-implemented error. Missing platform APIs, container permissions, an invalid disk path, a disconnected executor, macOS/Windows temperature support, or Windows load-average support produce unavailable samples rather than quotas.
+Collection starts only while at least one connected client displays metrics in the global status bar. Phone clients subscribe only while their Status drawer is open. The built-in status surface renders the Kandev host source only. Enabling execution metrics also adds active Docker, SSH, and Sprites `agentctl` sources to the metrics stream for separately owned consumers such as plugins; execution disk sampling uses `/`. A provider hook also exists for remote Docker, but creating that runtime currently returns a not-implemented error. Missing platform APIs, container permissions, an invalid disk path, a disconnected executor, macOS/Windows temperature support, or Windows load-average support produce unavailable samples rather than quotas.
 
 These metrics are lightweight UI observability. Set alerts, retention, CPU/memory limits, and disk quotas in the host, container platform, or external monitoring stack.
 
@@ -237,9 +279,16 @@ These metrics are lightweight UI observability. Set alerts, retention, CPU/memor
 **Settings > System > Feature Toggles** currently exposes:
 
 - **Office mode** — experimental, medium risk, and off in the production profile by default.
+- **App status bar** — stable, low risk, and off in the production profile by default. Enabling it adds the desktop/tablet bar and phone Status entry after restart; disabling it again does not stop connections, metrics collection requested by other clients, or plugins.
+- **Claude background prompt handoff** — experimental, high risk, and off in every profile by default. Enabling it lets Claude Code accept another prompt after its foreground yields while recognized async subagent, `run_in_background` shell, or Monitor work remains active. ACP lifecycle gaps can misclassify activity or overlap prompts; use it only for controlled testing.
 - **Debug mode** — high risk; enables diagnostic endpoints and agent-message logging that can contain sensitive content.
 
-Both require restart. A value supplied explicitly by its environment variable locks the UI control; the debug toggle is also locked by explicit legacy/debug-message environment variables. Otherwise the UI stores an override in the database. The page can request restart only when the native local supervisor is available. A normal Unix `kandev` terminal launch is supervised; Desktop, a service, a container, a directly started backend, a deploy preview, or Windows requires a manual application restart.
+Each requires restart. A value supplied explicitly by its environment variable locks the UI control; the debug toggle is also locked by explicit legacy/debug-message environment variables. Otherwise the UI stores an override in the database. The page can request restart only when the native local supervisor is available. A normal Unix `kandev` terminal launch is supervised; Desktop, a service, a container, a directly started backend, a deploy preview, or Windows requires a manual application restart.
+
+Status-bar layout is a separate per-user preference. Hold Cmd on macOS or Ctrl
+elsewhere while mouse-dragging an item to move it across the desktop/tablet bar.
+The backend preserves the layout across reloads and restarts; the phone Status
+drawer mirrors it as the saved left sequence followed by the saved right sequence.
 
 ## Troubleshooting
 
@@ -252,9 +301,10 @@ Both require restart. A value supplied explicitly by its environment variable lo
 | Restored data looks stale | Whether the backend was restarted immediately | Quit/restart; do not keep using the old open database connections |
 | Logs page has no downloadable files | `logging.outputPath` and service/container logs | `stdout` is the default; use in-memory tail or configure a file sink |
 | Update check returns HTTP 429 | Time since last **Check now** | Wait at least 30 seconds; background checks retry every six hours |
-| **Apply update** is absent | Install method shown on the Updates page | Expected for current native services; upgrade the package, reinstall the service with the same flags, and restart |
+| **Apply update** is absent | Install mode/method and `<home>/service/install.json` | Expected for system, unmanaged, local-checkout, or invalid-metadata installs. A managed npm, npx, or Homebrew user service should offer Apply; reinstall it with the same flags to refresh its identity and metadata, or use the manual package-manager flow. |
 | Metrics show unavailable | OS support, disk path, executor connectivity | Select supported metrics and verify permissions/network; the collector reports errors per sample |
 | Disk total exceeds filesystem expectation | Separate `data` and `backups` rows | Backups are counted twice in the UI total; use volume metrics for capacity decisions |
+| Legacy `/tmp/kandev-agent/*` uses disk | Process inventory and open-file references for the exact directory | This is data from older Kandev versions, not a current Storage resource. Stop Kandev, confirm no live process references the target, then remove only the confirmed-inactive legacy directory through host administration. |
 | Archived task's remote resource remains | Backend, Docker/SSH/Sprites, and provider logs | Cleanup is asynchronous and bounded. SSH task directories are retained by design; for other leftovers, verify work is preserved, then remove the exact resource manually |
 | Sprites reset removed the environment but not the sandbox | **Settings > Executors > Sprites.dev** | Current reset can omit the provider credential during destroy; find the old Kandev-named sandbox and destroy it explicitly |
 

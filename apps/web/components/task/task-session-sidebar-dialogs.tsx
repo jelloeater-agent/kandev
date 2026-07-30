@@ -4,9 +4,11 @@ import { TaskRenameDialog } from "./task-rename-dialog";
 import { TaskArchiveConfirmDialog } from "./task-archive-confirm-dialog";
 import { TaskDeleteConfirmDialog } from "./task-delete-confirm-dialog";
 import { TaskDetachTargetConfirmDialog } from "./task-detach-confirm-dialog";
+import { NewSubtaskDialog } from "./new-subtask-dialog";
 import { TaskExternalLinkDialog } from "./task-external-link-dialog";
 import { TaskGitHubIssueDialog } from "./task-github-issue-dialog";
 import { TaskGitHubPRDialog } from "./task-github-pr-dialog";
+import { TaskMRLinkDialog } from "@/components/gitlab/task-mr-link-dialog";
 import type { Repository } from "@/lib/types/http";
 import type {
   SidebarExternalLinkTarget,
@@ -25,6 +27,9 @@ export type SidebarDialogsActions = {
   renamingTask: Target;
   setRenamingTask: (next: Target) => void;
   handleRenameSubmit: (newTitle: string) => Promise<void> | void;
+  creatingSubtask: Target;
+  setCreatingSubtask: (next: Target) => void;
+  handleCreateSubtask: (taskId: string, taskTitle: string) => void;
   archivingTask: Target;
   setArchivingTask: (next: Target) => void;
   archivingTaskId: string | null;
@@ -42,9 +47,30 @@ export type SidebarDialogsActions = {
   setLinkingPullRequestTask: (next: LinkTarget) => void;
   linkingIssueTask: LinkTarget;
   setLinkingIssueTask: (next: LinkTarget) => void;
+  linkingMergeRequestTask: LinkTarget;
+  setLinkingMergeRequestTask: (next: LinkTarget) => void;
   linkingExternalIssueTask: SidebarExternalLinkTarget | null;
   setLinkingExternalIssueTask: (next: SidebarExternalLinkTarget | null) => void;
 };
+
+function SidebarSubtaskDialog({
+  target,
+  onTargetChange,
+}: {
+  target: Target;
+  onTargetChange: (next: Target) => void;
+}) {
+  return (
+    <NewSubtaskDialog
+      open={target !== null}
+      onOpenChange={(open) => {
+        if (!open) onTargetChange(null);
+      }}
+      parentTaskId={target?.id ?? ""}
+      parentTaskTitle={target?.title ?? ""}
+    />
+  );
+}
 
 export function SidebarDialogs({
   actions,
@@ -59,6 +85,8 @@ export function SidebarDialogs({
     renamingTask,
     setRenamingTask,
     handleRenameSubmit,
+    creatingSubtask,
+    setCreatingSubtask,
     archivingTask,
     setArchivingTask,
     archivingTaskId,
@@ -83,6 +111,7 @@ export function SidebarDialogs({
         currentTitle={renamingTask?.title ?? ""}
         onSubmit={handleRenameSubmit}
       />
+      <SidebarSubtaskDialog target={creatingSubtask} onTargetChange={setCreatingSubtask} />
       <TaskArchiveConfirmDialog
         open={archivingTask !== null}
         onOpenChange={(open) => {
@@ -127,6 +156,8 @@ export function SidebarLinkDialogs({
     | "setLinkingPullRequestTask"
     | "linkingIssueTask"
     | "setLinkingIssueTask"
+    | "linkingMergeRequestTask"
+    | "setLinkingMergeRequestTask"
     | "linkingExternalIssueTask"
     | "setLinkingExternalIssueTask"
   >;
@@ -138,6 +169,8 @@ export function SidebarLinkDialogs({
     setLinkingPullRequestTask,
     linkingIssueTask,
     setLinkingIssueTask,
+    linkingMergeRequestTask,
+    setLinkingMergeRequestTask,
     linkingExternalIssueTask,
     setLinkingExternalIssueTask,
   } = actions;
@@ -145,6 +178,7 @@ export function SidebarLinkDialogs({
     <>
       {linkingPullRequestTask && (
         <TaskGitHubPRDialog
+          workspaceId={workspaceId}
           open={true}
           onOpenChange={(open) => {
             if (!open) setLinkingPullRequestTask(null);
@@ -160,6 +194,18 @@ export function SidebarLinkDialogs({
             if (!open) setLinkingIssueTask(null);
           }}
           task={linkingIssueTask}
+          repositories={repositories}
+        />
+      )}
+      {linkingMergeRequestTask && workspaceId && (
+        <TaskMRLinkDialog
+          open={true}
+          onOpenChange={(open) => {
+            if (!open) setLinkingMergeRequestTask(null);
+          }}
+          taskId={linkingMergeRequestTask.id}
+          workspaceId={workspaceId}
+          taskRepositories={linkingMergeRequestTask.repositories ?? []}
           repositories={repositories}
         />
       )}

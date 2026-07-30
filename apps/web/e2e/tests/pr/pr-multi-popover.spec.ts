@@ -23,6 +23,17 @@ async function mutedBackgroundColor(page: import("@playwright/test").Page): Prom
   });
 }
 
+async function foregroundColor(page: import("@playwright/test").Page): Promise<string> {
+  return page.evaluate(() => {
+    const sample = document.createElement("div");
+    sample.className = "text-foreground";
+    document.body.append(sample);
+    const color = getComputedStyle(sample).color;
+    sample.remove();
+    return color;
+  });
+}
+
 async function computedStyle(
   locator: import("@playwright/test").Locator,
   property: "backgroundColor" | "color",
@@ -254,6 +265,7 @@ test.describe("Multi-PR CI popover", () => {
     await associateTwoPRs(apiClient, seed.taskId);
     const session = await openTaskAndWait(testPage, apiClient, seed, title);
     const expectedMuted = await mutedBackgroundColor(testPage);
+    const expectedForeground = await foregroundColor(testPage);
 
     await session.hoverPRTopbar();
     const inactiveChip = session.prMultiPopoverTab(OWNER, "api", 77);
@@ -266,9 +278,11 @@ test.describe("Multi-PR CI popover", () => {
     await session.prTopbarButton().click();
     const dropdownRow = testPage.getByTestId(`pr-topbar-menu-item-${OWNER}-web-42`);
     const dropdownIcon = dropdownRow.locator("svg").first();
+    const dropdownSecondaryCopy = dropdownRow.getByText("Failing web PR");
     const dropdownIconColor = await computedStyle(dropdownIcon, "color");
     await dropdownRow.focus();
     await expect.poll(() => computedStyle(dropdownRow, "backgroundColor")).toBe(expectedMuted);
+    await expect.poll(() => computedStyle(dropdownSecondaryCopy, "color")).toBe(expectedForeground);
     expect(await computedStyle(dropdownIcon, "color")).toBe(dropdownIconColor);
   });
 

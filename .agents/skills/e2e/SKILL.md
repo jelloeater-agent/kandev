@@ -7,17 +7,16 @@ description: Write and run web E2E tests (Playwright) using TDD — locations, p
 
 ## Execution Context
 
-The user-started primary session delegates this
-procedure to an `implementer` or `test-engineer` worker and does not write or run
-E2E tests directly. An explicitly assigned worker continues below and does not
-spawn other workers.
+Write and run E2E coverage directly in the primary conversation. For a
+cost-controlled feature workflow, the user switches that conversation to the
+lower-cost implementation/test model before this phase.
 
 Write E2E tests using TDD (Red-Green-Refactor). Always run the tests you create and watch them fail before implementing.
 
-## Available skills and subagents
+## Related skills
 
 - **`/tdd`** — Follow the Red-Green-Refactor cycle when writing tests.
-- **`/verify`** — The planner launches this separately after targeted E2E tests pass.
+- **`/pr-fixup`** — Use after the PR opens only for CI or reviewer findings.
 - **`/playwright-cli`** — Interactive browser automation. Use to validate features against the dev server before writing tests, and to debug failing tests with `--debug=cli`.
 
 ## Location
@@ -137,6 +136,14 @@ Without this, tests run against stale code and failures are misleading. `make bu
 3. Use `data-testid` attributes for selectors — add them to components as needed
 4. Use page objects for common interactions; create new ones for new pages
 5. For GitHub features, use `apiClient.mockGitHub*()` methods to seed mock data
+
+### Input-modality behavior
+
+For a touch-specific interaction, use Playwright `.tap()` rather than `.click()`
+so the app receives a touch `pointerType`. Run focused mobile specs with
+`-- --project=mobile-chrome`; otherwise Playwright can report no matching tests.
+After the interaction settles, assert the resulting state and exercise a later
+mouse or pen entry when the UI maintains hybrid-device pointer state.
 
 ### Visual alignment regressions
 
@@ -396,5 +403,5 @@ Follow `/tdd` when writing E2E tests:
 1. **RED** — Write the spec, run it, watch it fail (missing `data-testid`, feature not implemented, etc.)
 2. **GREEN** — Implement the feature/fix, add `data-testid` attributes, run the test until green
 3. **REFACTOR** — Extract page objects, clean up selectors, keep tests green
-4. Run the targeted E2E spec when done and report that full verification is
-   required as a separate planner assignment
+4. Run the targeted E2E spec when done and report that final change-aware
+   verification is required as a separate planner assignment

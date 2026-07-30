@@ -10,6 +10,7 @@ import {
   IconChevronRight,
   IconEyeCode,
   IconInfoCircle,
+  IconStar,
 } from "@tabler/icons-react";
 import { cn } from "@/lib/utils";
 import { formatRelativeTime } from "@/lib/utils";
@@ -22,6 +23,15 @@ import {
 } from "@/components/task/chat/messages/message-debug-metadata";
 import { formatMessageSessionConfig } from "@/components/task/chat/messages/message-session-config";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@kandev/ui/dialog";
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+  DrawerTrigger,
+} from "@kandev/ui/drawer";
+import { useTouchDrawer } from "@/hooks/use-compact-task-chrome";
 
 const ACTION_BUTTON_SIZE = "h-5 w-5 p-1";
 const ACTION_BUTTON_HOVER = "hover:bg-muted rounded";
@@ -41,7 +51,31 @@ type MessageActionsProps = {
   onNavigateNext?: () => void;
   hasPrev?: boolean;
   hasNext?: boolean;
+  isFavorite?: boolean;
+  onToggleFavorite?: () => void;
 };
+
+/** Renders the accessible favorite toggle in a message action row. */
+function FavoriteButton({ isFavorite, onToggle }: { isFavorite: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={isFavorite}
+      className={cn(
+        "flex min-h-11 min-w-11 items-center justify-center sm:min-h-0 sm:min-w-0 sm:h-5 sm:w-5 sm:p-1",
+        ACTION_BUTTON_HOVER,
+        ACTION_BUTTON_TRANSITION,
+        "cursor-pointer",
+        isFavorite && "text-yellow-500",
+      )}
+      title={isFavorite ? "Remove from favorites" : "Mark as favorite"}
+      aria-label={isFavorite ? "Remove message from favorites" : "Mark message as favorite"}
+    >
+      <IconStar className={cn("h-5 w-5", isFavorite && "fill-yellow-500")} />
+    </button>
+  );
+}
 
 function CopyButton({ copied, onCopy }: { copied: boolean; onCopy: () => void }) {
   return (
@@ -187,6 +221,73 @@ function MessageDebugDialog({
   );
 }
 
+function MessageTimestamp({ createdAt }: { createdAt: string }) {
+  const usesTouchDrawer = useTouchDrawer();
+  const [open, setOpen] = useState(false);
+  const absoluteTime = new Date(createdAt).toLocaleString();
+  const timeEl = (
+    <time
+      dateTime={createdAt}
+      title={absoluteTime}
+      className="text-[10px] text-muted-foreground/60 font-mono"
+    >
+      {formatRelativeTime(createdAt)}
+    </time>
+  );
+
+  if (!usesTouchDrawer) return timeEl;
+
+  // Native `title` tooltips never fire on touch (no hover event), so coarse
+  // pointers get a tap-to-open Drawer surfacing the same absolute time.
+  return (
+    <Drawer open={open} onOpenChange={setOpen}>
+      <DrawerTrigger asChild>
+        <button
+          type="button"
+          data-testid="message-timestamp-trigger"
+          className="cursor-pointer border-0 bg-transparent p-0 text-left"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-label={`Show full timestamp: ${absoluteTime}`}
+        >
+          {timeEl}
+        </button>
+      </DrawerTrigger>
+      <DrawerContent data-testid="message-timestamp-drawer">
+        <DrawerHeader>
+          <DrawerTitle>Message time</DrawerTitle>
+          <DrawerDescription>{absoluteTime}</DrawerDescription>
+        </DrawerHeader>
+      </DrawerContent>
+    </Drawer>
+  );
+}
+
+/** Selects the message turn and its model-specific usage multiplier. */
+function useMessageTurnAndUsage(message: Message): {
+  turn: Turn | null;
+  usageMultiplier: string | null;
+} {
+  return useAppStore(
+    useShallow((state) => {
+      const turnId = message.turn_id;
+      const turn =
+        turnId && message.session_id
+          ? (state.turns.bySession[message.session_id]?.find((item) => item.id === turnId) ?? null)
+          : null;
+      if (!message.session_id) return { turn, usageMultiplier: null };
+      const sessionModels = state.sessionModels.bySessionId[message.session_id];
+      const metadataModel = (message.metadata?.model ?? turn?.metadata?.model) as
+        | string
+        | undefined;
+      const modelId = metadataModel ?? sessionModels?.currentModelId;
+      const usageMultiplier =
+        sessionModels?.models.find((model) => model.modelId === modelId)?.usageMultiplier ?? null;
+      return { turn, usageMultiplier };
+    }),
+  );
+}
+
 function MessageMetaInfo({
   showModel,
   sessionConfigText,
@@ -205,49 +306,73 @@ function MessageMetaInfo({
           {sessionConfigText}
         </span>
       )}
-      {showTimestamp && (
-        <span className="text-[10px] text-muted-foreground/60 font-mono">
-          {formatRelativeTime(createdAt)}
-        </span>
-      )}
+      {showTimestamp && <MessageTimestamp createdAt={createdAt} />}
     </>
   );
 }
 
-export function MessageActions({
-  message,
-  showCopy = true,
-  showTimestamp = true,
-  showRawToggle = true,
-  hasHiddenPrompts = false,
-  showNavigation = false,
-  showModel = false,
-  isRawView = false,
-  onToggleRaw,
-  onNavigatePrev,
-  onNavigateNext,
-  hasPrev = false,
-  hasNext = false,
-}: MessageActionsProps) {
+type ResolvedMessageActionsProps = {
+  message: Message;
+  showCopy: boolean;
+  showTimestamp: boolean;
+  showRawToggle: boolean;
+  hasHiddenPrompts: boolean;
+  showNavigation: boolean;
+  showModel: boolean;
+  isRawView: boolean;
+  onToggleRaw?: () => void;
+  onNavigatePrev?: () => void;
+  onNavigateNext?: () => void;
+  hasPrev: boolean;
+  hasNext: boolean;
+  isFavorite: boolean;
+  onToggleFavorite?: () => void;
+};
+
+/**
+ * Resolves optional action props before rendering to keep JSX complexity low.
+ */
+function resolveMessageActionsProps(props: MessageActionsProps): ResolvedMessageActionsProps {
+  return {
+    message: props.message,
+    showCopy: props.showCopy ?? true,
+    showTimestamp: props.showTimestamp ?? true,
+    showRawToggle: props.showRawToggle ?? true,
+    hasHiddenPrompts: props.hasHiddenPrompts ?? false,
+    showNavigation: props.showNavigation ?? false,
+    showModel: props.showModel ?? false,
+    isRawView: props.isRawView ?? false,
+    onToggleRaw: props.onToggleRaw,
+    onNavigatePrev: props.onNavigatePrev,
+    onNavigateNext: props.onNavigateNext,
+    hasPrev: props.hasPrev ?? false,
+    hasNext: props.hasNext ?? false,
+    isFavorite: props.isFavorite ?? false,
+    onToggleFavorite: props.onToggleFavorite,
+  };
+}
+
+/** Renders available actions and metadata for a chat message. */
+export function MessageActions(props: MessageActionsProps) {
+  const {
+    message,
+    showCopy,
+    showTimestamp,
+    showRawToggle,
+    hasHiddenPrompts,
+    showNavigation,
+    showModel,
+    isRawView,
+    onToggleRaw,
+    onNavigatePrev,
+    onNavigateNext,
+    hasPrev,
+    hasNext,
+    isFavorite,
+    onToggleFavorite,
+  } = resolveMessageActionsProps(props);
   const { copied, copy } = useCopyToClipboard();
-  const { turn, usageMultiplier } = useAppStore(
-    useShallow((state) => {
-      const turnId = message.turn_id;
-      const turn =
-        turnId && message.session_id
-          ? (state.turns.bySession[message.session_id]?.find((item) => item.id === turnId) ?? null)
-          : null;
-      if (!message.session_id) return { turn, usageMultiplier: null };
-      const sessionModels = state.sessionModels.bySessionId[message.session_id];
-      const metadataModel = (message.metadata?.model ?? turn?.metadata?.model) as
-        | string
-        | undefined;
-      const modelId = metadataModel ?? sessionModels?.currentModelId;
-      const usageMultiplier =
-        sessionModels?.models.find((model) => model.modelId === modelId)?.usageMultiplier ?? null;
-      return { turn, usageMultiplier };
-    }),
-  );
+  const { turn, usageMultiplier } = useMessageTurnAndUsage(message);
   const sessionConfigText = formatMessageSessionConfig(message.metadata, turn?.metadata);
   const handleCopy = async () => {
     await copy(message.content);
@@ -272,6 +397,7 @@ export function MessageActions({
         />
       )}
       <MessageDebugDialog message={message} turn={turn} usageMultiplier={usageMultiplier} />
+      {onToggleFavorite && <FavoriteButton isFavorite={isFavorite} onToggle={onToggleFavorite} />}
       <MessageMetaInfo
         showModel={showModel}
         sessionConfigText={sessionConfigText}

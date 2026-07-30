@@ -2,12 +2,14 @@ import type { ReactNode } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { StateProvider } from "@/components/state-provider";
+import { ApiError } from "@/lib/api/client";
 import type { StorageMaintenanceSettings, StorageOverviewResponse } from "@/lib/types/system";
 
 const mocks = vi.hoisted(() => ({
   adopt: vi.fn(),
   analyze: vi.fn(),
   deleteEntry: vi.fn(),
+  purge: vi.fn(),
   fetchJob: vi.fn(),
   fetchOverview: vi.fn(),
   fetchQuarantine: vi.fn(),
@@ -26,6 +28,7 @@ vi.mock("@/lib/api/domains/system-api", () => ({
   adoptStorageGoCache: mocks.adopt,
   analyzeStorage: mocks.analyze,
   deleteStorageQuarantine: mocks.deleteEntry,
+  purgeStorageQuarantine: mocks.purge,
   fetchSystemJob: mocks.fetchJob,
   fetchStorageOverview: mocks.fetchOverview,
   fetchStorageQuarantine: mocks.fetchQuarantine,
@@ -80,15 +83,27 @@ const overview: StorageOverviewResponse = {
       managed_container_bytes: 60,
     },
   },
+  analyzed_at: "2026-07-23T12:00:00Z",
   last_run: null,
 };
 
+const cleanupJobId = "cleanup-job";
 const cleanupJob = {
-  id: "cleanup-job",
+  id: cleanupJobId,
   kind: "storage-cleanup",
   state: "running",
   started_at: "2026-07-15T00:00:00Z",
 };
+const STORAGE_BUSY_ERROR_MESSAGE = "storage cleanup is blocked by active Kandev work";
+const TEST_COMMAND_BUSY_LABEL = "A test command is running";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 function wrapper({ children }: { children: ReactNode }) {
   return <StateProvider>{children}</StateProvider>;
@@ -102,7 +117,8 @@ beforeEach(() => {
   mocks.fetchJob.mockResolvedValue(cleanupJob);
   mocks.save.mockResolvedValue({ settings });
   // Keep cleanup jobs deterministic for controller action tests.
-  mocks.run.mockResolvedValue({ job_id: "cleanup-job" });
+  mocks.run.mockResolvedValue({ job_id: cleanupJobId });
+  mocks.purge.mockResolvedValue({ job_id: "purge-job" });
 });
 
 describe("useStorageMaintenance", () => {
@@ -125,6 +141,19 @@ describe("useStorageMaintenance", () => {
       title: "Storage policy saved",
       variant: "success",
     });
+  });
+
+  it("starts eligible and forced quarantine bulk jobs", async () => {
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    await act(async () => {
+      await result.current.clearEligible();
+      await result.current.forceClearAll();
+    });
+
+    expect(mocks.purge).toHaveBeenNthCalledWith(1, "eligible");
+    expect(mocks.purge).toHaveBeenNthCalledWith(2, "all");
   });
 
   it("rejects failed saves so the settings coordinator can keep the draft dirty", async () => {
@@ -161,7 +190,7 @@ describe("useStorageMaintenance", () => {
     await act(async () => {
       await result.current.runNow();
     });
-    await waitFor(() => expect(result.current.cleanupJob?.id).toBe("cleanup-job"));
+    await waitFor(() => expect(result.current.cleanupJob?.id).toBe(cleanupJobId));
 
     mocks.run.mockRejectedValueOnce(new Error("storage maintenance is busy"));
     await act(async () => {
@@ -170,6 +199,144 @@ describe("useStorageMaintenance", () => {
 
     expect(result.current.cleanupJob).toBeUndefined();
     expect(result.current.error).toBe("storage maintenance is busy");
+  });
+});
+
+describe("useStorageMaintenance busy feedback", () => {
+  it("retains labeled busy feedback and reruns the same resources with force", async () => {
+    mocks.run.mockRejectedValueOnce(
+      new ApiError(STORAGE_BUSY_ERROR_MESSAGE, 409, {
+        busy_resources: [{ kind: "test_command", label: TEST_COMMAND_BUSY_LABEL }],
+        force_available: true,
+      }),
+    );
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    await act(async () => {
+      await result.current.runNow(["go_cache"]);
+    });
+    expect(result.current.busy).toEqual({
+      resources: [{ kind: "test_command", label: TEST_COMMAND_BUSY_LABEL }],
+      forceAvailable: true,
+      resourceSelection: ["go_cache"],
+    });
+
+    await act(async () => {
+      await result.current.runAnyway();
+    });
+    expect(mocks.run).toHaveBeenNthCalledWith(2, ["go_cache"], true);
+  });
+
+  it("restores busy feedback when the forced retry is rejected", async () => {
+    const initialBusyError = new ApiError(STORAGE_BUSY_ERROR_MESSAGE, 409, {
+      busy_resources: [{ kind: "test_command", label: TEST_COMMAND_BUSY_LABEL }],
+      force_available: true,
+    });
+    const forcedBusyError = new ApiError(STORAGE_BUSY_ERROR_MESSAGE, 409, {
+      busy_resources: [{ kind: "maintenance_running", label: "Storage maintenance is running" }],
+      force_available: false,
+    });
+    mocks.run.mockRejectedValueOnce(initialBusyError).mockRejectedValueOnce(forcedBusyError);
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    await act(async () => {
+      await result.current.runNow(["go_cache"]);
+    });
+    await act(async () => {
+      await result.current.runAnyway();
+    });
+
+    expect(result.current.busy).toEqual({
+      resources: [{ kind: "maintenance_running", label: "Storage maintenance is running" }],
+      forceAvailable: false,
+      resourceSelection: ["go_cache"],
+    });
+    expect(mocks.toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Storage action failed" }),
+    );
+  });
+
+  it("clears stale busy feedback when another storage action starts", async () => {
+    mocks.run.mockRejectedValueOnce(
+      new ApiError(STORAGE_BUSY_ERROR_MESSAGE, 409, {
+        busy_resources: [{ kind: "test_command", label: TEST_COMMAND_BUSY_LABEL }],
+        force_available: true,
+      }),
+    );
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    await act(async () => {
+      await result.current.runNow();
+    });
+    expect(result.current.busy).not.toBeNull();
+
+    await act(async () => {
+      await result.current.save(settings);
+    });
+    expect(result.current.busy).toBeNull();
+  });
+});
+
+describe("useStorageMaintenance pending action tracking", () => {
+  it("returns to a pending resource action after an overlapping save finishes", async () => {
+    const pendingRun = deferred<{ job_id: string }>();
+    const pendingSave = deferred<{ settings: StorageMaintenanceSettings }>();
+    mocks.run.mockReturnValueOnce(pendingRun.promise);
+    mocks.save.mockReturnValueOnce(pendingSave.promise);
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    let runPromise!: Promise<void>;
+    let savePromise!: Promise<void>;
+    await act(async () => {
+      runPromise = result.current.runNow();
+      savePromise = result.current.save(settings);
+    });
+    await waitFor(() => expect(result.current.pendingAction).toBe("save"));
+
+    await act(async () => {
+      pendingSave.resolve({ settings });
+      await savePromise;
+    });
+    expect(result.current.pendingAction).toBe("run");
+
+    await act(async () => {
+      pendingRun.resolve({ job_id: cleanupJobId });
+      await runPromise;
+    });
+    expect(result.current.pendingAction).toBeNull();
+  });
+
+  it("keeps an overlapping save pending when the resource request finishes first", async () => {
+    const pendingRun = deferred<{ job_id: string }>();
+    const pendingSave = deferred<{ settings: StorageMaintenanceSettings }>();
+    mocks.run.mockReturnValueOnce(pendingRun.promise);
+    mocks.save.mockReturnValueOnce(pendingSave.promise);
+    const { result } = renderHook(() => useStorageMaintenance(), { wrapper });
+    await waitFor(() => expect(result.current.overview).toEqual(overview));
+
+    let runPromise!: Promise<void>;
+    let savePromise!: Promise<void>;
+    await act(async () => {
+      runPromise = result.current.runNow();
+      savePromise = result.current.save(settings);
+    });
+    await waitFor(() => expect(result.current.pendingAction).toBe("save"));
+
+    await act(async () => {
+      pendingRun.resolve({ job_id: cleanupJobId });
+      await runPromise;
+    });
+    expect(result.current.pendingAction).toBe("save");
+
+    await act(async () => {
+      pendingSave.resolve({ settings });
+      await savePromise;
+    });
+    expect(result.current.pendingAction).toBeNull();
   });
 });
 

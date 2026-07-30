@@ -22,11 +22,12 @@ import {
 } from "@/components/kanban-card-menu-items";
 import { useAppStore, useAppStoreApi } from "@/components/state-provider";
 import { RemoteCloudTooltip } from "@/components/task/remote-cloud-tooltip";
-import { useTaskPendingClarification } from "@/hooks/use-task-pending-clarification";
+import { useTaskPendingInput } from "@/hooks/use-task-pending-input";
 import { createDebugLogger, isDebug } from "@/lib/debug/log";
 import {
   getTaskStateIcon,
   shouldShowTaskRunningSpinner,
+  shouldUsePermissionTaskIcon,
   shouldUseQuestionTaskIcon,
 } from "@/lib/ui/state-icons";
 import { cn } from "@/lib/utils";
@@ -161,31 +162,48 @@ export function KanbanCardBody({
           {task.description}
         </p>
       )}
+      <KanbanCardRelationship task={task} />
       <KanbanCardBadges task={task} />
     </>
   );
 }
 
-function KanbanCardBadges({ task }: { task: Task }) {
+function KanbanCardRelationship({ task }: { task: Task }) {
   const parentTitle = useAppStore((s) => {
     if (!task.parentTaskId) return null;
     return s.kanban.tasks.find((t) => t.id === task.parentTaskId)?.title ?? null;
   });
 
-  const showRow =
-    (task.sessionCount && task.sessionCount > 1) ||
-    task.reviewStatus === "changes_requested" ||
-    task.reviewStatus === "pending" ||
-    task.parentTaskId;
+  if (!task.parentTaskId) return null;
+  const relationshipTitle = parentTitle ?? "Subtask";
+
+  return (
+    <div
+      data-testid="task-parent-relationship"
+      title={relationshipTitle}
+      className="mt-1 flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground"
+    >
+      <IconSubtask className="h-3 w-3 shrink-0" />
+      <span className="shrink-0 font-medium">Subtask of</span>
+      <span className="min-w-0 truncate">{relationshipTitle}</span>
+    </div>
+  );
+}
+
+function KanbanCardBadges({ task }: { task: Task }) {
+  const showRow = hasCardBadges(task);
 
   if (!showRow) return null;
 
   return (
     <div className="flex flex-wrap items-center justify-end gap-2 mt-1 min-w-0">
-      {task.parentTaskId && (
-        <Badge variant="outline" className="text-xs h-5 gap-1 max-w-[160px] min-w-0">
-          <IconSubtask className="h-3 w-3 shrink-0" />
-          <span className="truncate">{parentTitle ?? "Subtask"}</span>
+      {task.queuedForStepId && (
+        <Badge
+          variant="secondary"
+          className="text-xs h-5"
+          title={`Queued for ${task.queuedForStepTitle ?? `workflow step ${task.queuedForStepId}`}`}
+        >
+          Queued for {task.queuedForStepTitle ?? "next capacity"}
         </Badge>
       )}
       {task.sessionCount && task.sessionCount > 1 && (
@@ -211,6 +229,54 @@ function KanbanCardBadges({ task }: { task: Task }) {
   );
 }
 
+function hasCardBadges(task: Task): boolean {
+  return Boolean(
+    (task.sessionCount && task.sessionCount > 1) ||
+    task.reviewStatus === "changes_requested" ||
+    task.reviewStatus === "pending" ||
+    task.queuedForStepId,
+  );
+}
+
+// renderTaskStatusIcon resolves the card status icon, or null when the actions
+// cluster shows none (a resting done/todo task). The backend task-level
+// MOST-ACTIVE-WINS aggregate takes precedence: a
+// background-running task shows the distinct background affordance — even when its
+// primary session has finished and only a secondary session is still working, so
+// it reads as working, not done — while any generating session keeps the spinner.
+// When the aggregate is absent it falls back to the primary-session-driven spinner
+// (covers STARTING/SCHEDULING before a session reads RUNNING) or the pending-input
+// question icon.
+export function renderTaskStatusIcon(
+  task: Task,
+  showRunningSpinner: boolean,
+  hasPendingClarification: boolean,
+  hasPendingPermission: boolean,
+) {
+  const showQuestionIcon = shouldUseQuestionTaskIcon(task.state, hasPendingClarification);
+  const showPermissionIcon = shouldUsePermissionTaskIcon(hasPendingPermission);
+  const needsMe = showQuestionIcon || showPermissionIcon;
+  const hasActivity =
+    task.foregroundActivity === "generating" || task.foregroundActivity === "background";
+  if (!showRunningSpinner && !needsMe && !hasActivity) {
+    return null;
+  }
+  // A "needs me" prompt (pending clarification / permission) must not be masked
+  // by the launch-spinner short-circuit — a mid-turn prompt can coincide with a
+  // coarse running state. Live foreground activity still wins, handled inside
+  // getTaskStateIcon.
+  if (showRunningSpinner && !needsMe && task.foregroundActivity !== "background") {
+    return <IconLoader2 className="h-4 w-4 text-blue-500 animate-spin" />;
+  }
+  return getTaskStateIcon(
+    task.state,
+    "h-4 w-4",
+    hasPendingClarification,
+    task.foregroundActivity,
+    hasPendingPermission,
+  );
+}
+
 function KanbanCardActions({
   task,
   showMaximizeButton,
@@ -224,11 +290,12 @@ function KanbanCardActions({
   const storeApi = useAppStoreApi();
   const debugEnabled = isDebug();
   const effectiveMenuOpen = menuOpen || Boolean(isDeleting) || Boolean(isArchiving);
-  const hasPendingClarificationRequest = useTaskPendingClarification(task.primarySessionId, {
+  const pendingInput = useTaskPendingInput(task.primarySessionId, {
+    taskId: task.id,
+    taskPendingAction: task.taskPendingAction,
     primarySessionState: task.primarySessionState,
     primarySessionPendingAction: task.primarySessionPendingAction,
   });
-  const showQuestionIcon = shouldUseQuestionTaskIcon(task.state, hasPendingClarificationRequest);
   const showRunningSpinner = shouldShowTaskRunningSpinner(task.state, task.primarySessionState);
   const storeWouldShowRunningSpinner =
     storePrimarySessionState === null
@@ -238,10 +305,11 @@ function KanbanCardActions({
     showRunningSpinner &&
     storeWouldShowRunningSpinner === false &&
     task.primarySessionState !== storePrimarySessionState;
-  const statusIcon = showRunningSpinner ? (
-    <IconLoader2 className="h-4 w-4 text-blue-500 animate-spin" />
-  ) : (
-    getTaskStateIcon(task.state, "h-4 w-4", hasPendingClarificationRequest)
+  const statusIcon = renderTaskStatusIcon(
+    task,
+    showRunningSpinner,
+    pendingInput.clarification,
+    pendingInput.permission,
   );
   const hasKnownSession =
     Boolean(task.primarySessionId) || Boolean(task.sessionCount && task.sessionCount > 0);
@@ -287,7 +355,7 @@ function KanbanCardActions({
 
   return (
     <div className="flex items-center gap-2">
-      {(showRunningSpinner || showQuestionIcon) && statusIcon}
+      {statusIcon}
       {showMaximizeButton && onOpenFullPage && hasKnownSession && (
         <button
           type="button"

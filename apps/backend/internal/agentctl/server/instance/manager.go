@@ -81,6 +81,10 @@ func (m *Manager) SetServerFactory(factory ServerFactory) {
 func (m *Manager) CreateInstance(ctx context.Context, req *CreateRequest) (*CreateResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	agentEnv, err := config.CollectAgentEnvWithError(req.Env)
+	if err != nil {
+		return nil, fmt.Errorf("prepare agent environment: %w", err)
+	}
 
 	id := req.ID
 	if id == "" {
@@ -109,7 +113,7 @@ func (m *Manager) CreateInstance(ctx context.Context, req *CreateRequest) (*Crea
 		AgentCommand:           agentCmd,
 		WorkDir:                req.WorkspacePath,
 		AutoStart:              &autoStart,
-		Env:                    config.CollectAgentEnv(req.Env),
+		Env:                    agentEnv,
 		AutoApprovePermissions: req.AutoApprovePermissions,
 		AgentType:              req.AgentType,
 		McpServers:             mcpServers,
@@ -122,6 +126,7 @@ func (m *Manager) CreateInstance(ctx context.Context, req *CreateRequest) (*Crea
 		RequiresProcessKill:    req.RequiresProcessKill,
 		StripEnv:               req.StripEnv,
 		BaseBranches:           req.BaseBranches,
+		WorkspaceSourceRoots:   req.WorkspaceSourceRoots,
 	}
 
 	m.logger.Info("CreateInstance: applying overrides",
@@ -366,7 +371,7 @@ func (m *Manager) StopInstance(ctx context.Context, id string) error {
 	}
 
 	stopErr := errors.Join(httpStopErr, processStopErr)
-	if httpStopErr != nil || (processStopErr != nil && !canReleaseInstanceResources(processStopErr)) {
+	if httpStopErr != nil || processStopErr != nil {
 		return stopErr
 	}
 
@@ -388,15 +393,6 @@ func (m *Manager) StopInstance(ctx context.Context, id string) error {
 		zap.Int("port", inst.Port))
 
 	return stopErr
-}
-
-type instanceResourceReleaseError interface {
-	CanReleaseInstanceResources() bool
-}
-
-func canReleaseInstanceResources(err error) bool {
-	var classified instanceResourceReleaseError
-	return errors.As(err, &classified) && classified.CanReleaseInstanceResources()
 }
 
 type instanceHTTPServer interface {

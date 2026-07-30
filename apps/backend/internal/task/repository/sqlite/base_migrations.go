@@ -44,6 +44,9 @@ func (r *Repository) migrateSessionsAddCostColumns() {
 
 // runMigrations applies idempotent ALTER TABLE migrations for schema evolution.
 func (r *Repository) runMigrations() error {
+	if err := r.ensureTaskWorkspaceFoldersSchema(); err != nil {
+		return err
+	}
 	r.migrate.Apply("task_sessions.execution_profile_id", `ALTER TABLE task_sessions ADD COLUMN execution_profile_id TEXT NOT NULL DEFAULT ''`)
 	r.migrate.Apply("executors_running.execution_profile_id", `ALTER TABLE executors_running ADD COLUMN execution_profile_id TEXT NOT NULL DEFAULT ''`)
 	r.migrate.Apply("executors_running.last_message_uuid", `ALTER TABLE executors_running ADD COLUMN last_message_uuid TEXT DEFAULT ''`)
@@ -61,6 +64,9 @@ func (r *Repository) runMigrations() error {
 	if err := r.migrateTaskRepositoriesAllowMultiBranch(); err != nil {
 		return err
 	}
+	r.migrate.Apply("tasks.wip_admitted", `ALTER TABLE tasks ADD COLUMN wip_admitted INTEGER NOT NULL DEFAULT 1`)
+	r.migrate.Apply("tasks.queued_for_step_id", `ALTER TABLE tasks ADD COLUMN queued_for_step_id TEXT NOT NULL DEFAULT ''`)
+	r.migrate.Apply("tasks.queued_at", `ALTER TABLE tasks ADD COLUMN queued_at TIMESTAMP`)
 	r.migrate.Apply("task_sessions.base_commit_sha", `ALTER TABLE task_sessions ADD COLUMN base_commit_sha TEXT DEFAULT ''`)
 	r.migrate.Apply("workspaces.default_config_agent_profile_id", `ALTER TABLE workspaces ADD COLUMN default_config_agent_profile_id TEXT DEFAULT ''`)
 	r.migrate.Apply("task_sessions.task_environment_id", `ALTER TABLE task_sessions ADD COLUMN task_environment_id TEXT DEFAULT ''`)
@@ -70,6 +76,7 @@ func (r *Repository) runMigrations() error {
 	if err := r.migrateTasksRemoveWorkflowFK(); err != nil {
 		return err
 	}
+	r.migrate.Apply("idx_tasks_queued_for_step", `CREATE INDEX IF NOT EXISTS idx_tasks_queued_for_step ON tasks(queued_for_step_id, queued_at)`)
 	// Remove deprecated workflow_step_id column from task_sessions
 	if err := r.migrateSessionsRemoveWorkflowStepID(); err != nil {
 		return err
@@ -168,6 +175,17 @@ func (r *Repository) runMigrations() error {
 	// file path it was synced from.
 	r.migrate.Apply("workflows.source", `ALTER TABLE workflows ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`)
 	r.migrate.Apply("workflows.source_path", `ALTER TABLE workflows ADD COLUMN source_path TEXT NOT NULL DEFAULT ''`)
+	if err := r.ensureImproveKandevWorkflowTemplateUniqueness(); err != nil {
+		return err
+	}
+
+	// Native code review — indexes for the task_review_* tables. Declared here
+	// rather than in initTaskReviewSchema because schema init is a no-op on an
+	// existing DB (see AGENTS.md "Schema & migrations").
+	r.migrate.Apply("idx_task_review_runs_task", `CREATE INDEX IF NOT EXISTS idx_task_review_runs_task ON task_review_runs(task_id, created_at)`)
+	r.migrate.Apply("idx_task_review_findings_run", `CREATE INDEX IF NOT EXISTS idx_task_review_findings_run ON task_review_findings(run_id)`)
+	r.migrate.Apply("idx_task_review_findings_task_status", `CREATE INDEX IF NOT EXISTS idx_task_review_findings_task_status ON task_review_findings(task_id, status)`)
+	r.migrate.Apply("idx_task_review_findings_anchor", `CREATE INDEX IF NOT EXISTS idx_task_review_findings_anchor ON task_review_findings(task_id, repository_name, file_path)`)
 
 	// ADR 0005 Wave F — ensure the runner-projection tables exist so
 	// task SELECTs that reference them via correlated subquery don't
@@ -175,6 +193,80 @@ func (r *Repository) runMigrations() error {
 	// repo hasn't run yet.
 	r.ensureRunnerProjectionTables()
 
+	return nil
+}
+
+// ensureImproveKandevWorkflowTemplateUniqueness removes the broad index from
+// the initial implementation, reconciles legacy bootstrap duplicates, then
+// enforces uniqueness only for the two hidden workflows created by this flow.
+func (r *Repository) ensureImproveKandevWorkflowTemplateUniqueness() error {
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("begin improve kandev workflow migration: %w", err)
+	}
+	// Keep this template list synchronized with every hidden Improve Kandev
+	// workflow bootstrapped by internal/improvekandev. Add new IDs to both this
+	// reconciliation query and the partial-index predicate below.
+	if _, err := tx.Exec(`
+		UPDATE workflows
+		SET workflow_template_id = ''
+		WHERE id IN (
+			SELECT duplicate.id
+			FROM workflows AS duplicate
+			WHERE duplicate.workflow_template_id IN ('improve-kandev', 'report-kandev-issue')
+				AND EXISTS (
+					SELECT 1
+					FROM workflows AS canonical
+					WHERE canonical.workspace_id = duplicate.workspace_id
+						AND canonical.workflow_template_id = duplicate.workflow_template_id
+						AND canonical.hidden = duplicate.hidden
+						AND (
+							canonical.created_at < duplicate.created_at
+							OR (canonical.created_at = duplicate.created_at AND canonical.id < duplicate.id)
+						)
+				)
+		)`); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("reconcile improve kandev workflow duplicates: %w", err)
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS uniq_workflows_workspace_template_hidden`); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("drop broad workflow template index: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_improve_kandev_workflows
+		ON workflows(workspace_id, workflow_template_id, hidden)
+		WHERE workflow_template_id IN ('improve-kandev', 'report-kandev-issue')`); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("create improve kandev workflow index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit improve kandev workflow migration: %w", err)
+	}
+	return nil
+}
+
+// ensureTaskWorkspaceFoldersSchema upgrades databases created before durable
+// folder attachments existed. CREATE TABLE/INDEX IF NOT EXISTS is replay-safe
+// on SQLite and Postgres.
+func (r *Repository) ensureTaskWorkspaceFoldersSchema() error {
+	if _, err := r.db.Exec(`
+		CREATE TABLE IF NOT EXISTS task_workspace_folders (
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL,
+			local_path TEXT NOT NULL,
+			display_name TEXT NOT NULL,
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+			UNIQUE(task_id, local_path),
+			UNIQUE(task_id, display_name)
+		);
+		CREATE INDEX IF NOT EXISTS idx_task_workspace_folders_task_position
+			ON task_workspace_folders(task_id, position);
+	`); err != nil {
+		return fmt.Errorf("create task workspace folders schema: %w", err)
+	}
 	return nil
 }
 
@@ -252,6 +344,9 @@ func (r *Repository) migrateTasksRemoveWorkflowFK() error {
 			state TEXT DEFAULT 'TODO',
 			priority INTEGER DEFAULT 0,
 			position INTEGER DEFAULT 0,
+			wip_admitted INTEGER NOT NULL DEFAULT 1,
+			queued_for_step_id TEXT NOT NULL DEFAULT '',
+			queued_at TIMESTAMP,
 			metadata TEXT DEFAULT '{}',
 			is_ephemeral INTEGER NOT NULL DEFAULT 0,
 			parent_id TEXT DEFAULT '',
@@ -261,7 +356,7 @@ func (r *Repository) migrateTasksRemoveWorkflowFK() error {
 		)`,
 		`INSERT INTO tasks_new SELECT
 			id, workspace_id, workflow_id, workflow_step_id, title, description,
-			state, priority, position, metadata, is_ephemeral, parent_id, archived_at, created_at, updated_at
+			state, priority, position, wip_admitted, queued_for_step_id, queued_at, metadata, is_ephemeral, parent_id, archived_at, created_at, updated_at
 		FROM tasks`,
 		`DROP TABLE tasks`,
 		`ALTER TABLE tasks_new RENAME TO tasks`,

@@ -52,9 +52,10 @@ func TestResumeSession_RejectsArchivedTask(t *testing.T) {
 func setupLiveResumeTestFixture(repo *mockRepository) {
 	now := time.Now().UTC()
 	repo.tasks["task-1"] = &models.Task{
-		ID:        "task-1",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          "task-1",
+		WorkspaceID: "workspace-1",
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	repo.sessions["sess-1"] = &models.TaskSession{
 		ID:             "sess-1",
@@ -70,21 +71,136 @@ func setupLiveResumeTestFixture(repo *mockRepository) {
 	}
 }
 
+func TestResumeSession_PersistsStartingBeforeLaunch(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+	repo.sessions["sess-1"].State = models.TaskSessionStateFailed
+
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(ctx context.Context, req *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			if !req.StartAgent {
+				return nil, errors.New("resume launch did not retain startup ownership")
+			}
+			current, err := repo.GetTaskSession(ctx, "sess-1")
+			if err != nil {
+				return nil, err
+			}
+			if current.State != models.TaskSessionStateStarting {
+				return nil, fmt.Errorf("session state at launch = %s, want %s", current.State, models.TaskSessionStateStarting)
+			}
+			return &LaunchAgentResponse{AgentExecutionID: "exec-new", Status: v1.AgentStatusStarting}, nil
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	if _, err := exec.ResumeSession(context.Background(), repo.sessions["sess-1"], true); err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+}
+
+func TestResumeSession_RollsBackStartingWhenLaunchFails(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+	repo.sessions["sess-1"].State = models.TaskSessionStateFailed
+
+	launchErr := errors.New("credential broker rejected launch")
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(ctx context.Context, _ *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			current, err := repo.GetTaskSession(ctx, "sess-1")
+			if err != nil {
+				return nil, err
+			}
+			if current.State != models.TaskSessionStateStarting {
+				return nil, fmt.Errorf("session state at launch = %s, want %s", current.State, models.TaskSessionStateStarting)
+			}
+			return nil, launchErr
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	if _, err := exec.ResumeSession(context.Background(), repo.sessions["sess-1"], true); !errors.Is(err, launchErr) {
+		t.Fatalf("ResumeSession error = %v, want %v", err, launchErr)
+	}
+	current := repo.sessions["sess-1"]
+	if current.State != models.TaskSessionStateFailed {
+		t.Fatalf("session state after failed launch = %s, want %s", current.State, models.TaskSessionStateFailed)
+	}
+	if !strings.Contains(current.ErrorMessage, launchErr.Error()) {
+		t.Fatalf("session error = %q, want launch error", current.ErrorMessage)
+	}
+}
+
+func TestRollbackResumeStateAfterLaunchFailure_SkipsTransitionAfterConcurrentStateChange(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+	repo.sessions["sess-1"].State = models.TaskSessionStateCancelled
+
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	exec.SetOnSessionStateTransition(func(
+		context.Context,
+		string,
+		string,
+		models.TaskSessionState,
+		string,
+		func(),
+	) (bool, models.TaskSessionState, error) {
+		t.Fatal("state transition must not run after a concurrent state change")
+		return false, models.TaskSessionStateCancelled, nil
+	})
+
+	exec.rollbackResumeStateAfterLaunchFailure(
+		context.Background(),
+		"task-1",
+		"sess-1",
+		models.TaskSessionStateFailed,
+		errors.New("launch failed"),
+	)
+	if got := repo.sessions["sess-1"].State; got != models.TaskSessionStateCancelled {
+		t.Fatalf("session state = %s, want %s", got, models.TaskSessionStateCancelled)
+	}
+}
+
+func TestResumeSession_RollsBackStartingOnLiveAlreadyRunningRace(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+	var runningChecks int
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, req *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			return nil, fmt.Errorf("%w: session %q", lifecycle.ErrAgentAlreadyRunning, req.SessionID)
+		},
+		isAgentRunningForSessionFunc: func(_ context.Context, _ string) bool {
+			runningChecks++
+			return runningChecks > 1
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	_, err := exec.ResumeSession(context.Background(), repo.sessions["sess-1"], true)
+	if !errors.Is(err, ErrExecutionAlreadyRunning) {
+		t.Fatalf("ResumeSession error = %v, want ErrExecutionAlreadyRunning", err)
+	}
+	if repo.sessions["sess-1"].State != models.TaskSessionStateWaitingForInput {
+		t.Fatalf("session state after live race = %s, want %s", repo.sessions["sess-1"].State, models.TaskSessionStateWaitingForInput)
+	}
+}
+
 func TestResumeSession_PassesResolvedTaskSessionMCPModeToAgentManager(t *testing.T) {
 	tests := []struct {
-		name           string
-		officeAssignee string
-		metadata       map[string]interface{}
-		wantMode       string
+		name         string
+		isFromOffice bool
+		assignee     string
+		metadata     map[string]interface{}
+		wantMode     string
 	}{
 		{name: "regular task", wantMode: ""},
-		{name: "Office task", officeAssignee: "office-agent", wantMode: McpModeOffice},
+		{name: "unassigned Office task", isFromOffice: true, wantMode: McpModeOffice},
+		{name: "assigned Kanban task", assignee: "assigned-agent", wantMode: ""},
 		{name: "Config session", metadata: map[string]interface{}{"config_mode": true}, wantMode: McpModeConfig},
 		{
-			name:           "Config session takes precedence for Office task",
-			officeAssignee: "office-agent",
-			metadata:       map[string]interface{}{"config_mode": true},
-			wantMode:       McpModeConfig,
+			name:         "Config session takes precedence for Office task",
+			isFromOffice: true,
+			metadata:     map[string]interface{}{"config_mode": true},
+			wantMode:     McpModeConfig,
 		},
 	}
 
@@ -92,7 +208,8 @@ func TestResumeSession_PassesResolvedTaskSessionMCPModeToAgentManager(t *testing
 		t.Run(tt.name, func(t *testing.T) {
 			repo := newMockRepository()
 			setupLiveResumeTestFixture(repo)
-			repo.tasks["task-1"].AssigneeAgentProfileID = tt.officeAssignee
+			repo.tasks["task-1"].IsFromOffice = tt.isFromOffice
+			repo.tasks["task-1"].AssigneeAgentProfileID = tt.assignee
 			repo.sessions["sess-1"].Metadata = tt.metadata
 
 			var capturedReq *LaunchAgentRequest
@@ -114,6 +231,21 @@ func TestResumeSession_PassesResolvedTaskSessionMCPModeToAgentManager(t *testing
 				t.Fatalf("McpMode = %q, want %q", capturedReq.McpMode, tt.wantMode)
 			}
 		})
+	}
+}
+
+func TestWriteTaskInProgressForRuntime_KanbanRunnerUpdatesTaskState(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+	repo.tasks["task-1"].AssigneeAgentProfileID = "copilot-runner"
+	repo.sessions["sess-1"].State = models.TaskSessionStateRunning
+
+	exec := newTestExecutor(t, &mockAgentManager{}, repo)
+	if err := exec.writeTaskInProgressForRuntime(context.Background(), "task-1", "sess-1"); err != nil {
+		t.Fatalf("writeTaskInProgressForRuntime: %v", err)
+	}
+	if len(repo.updateTaskStateIfNotArchivedCalls) != 1 {
+		t.Fatalf("runtime state writes = %d, want 1", len(repo.updateTaskStateIfNotArchivedCalls))
 	}
 }
 
@@ -280,7 +412,8 @@ func TestResumeSession_CancelledStateForceCleansUpStaleState(t *testing.T) {
 	}
 	exec := newTestExecutor(t, agentMgr, repo)
 
-	if _, err := exec.ResumeSession(context.Background(), repo.sessions["sess-1"], true); err != nil {
+	callerSession := *repo.sessions["sess-1"]
+	if _, err := exec.ResumeSession(context.Background(), &callerSession, true); err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
 	if agentMgr.cleanupStaleExecutionCallCount != 1 {
@@ -289,6 +422,156 @@ func TestResumeSession_CancelledStateForceCleansUpStaleState(t *testing.T) {
 	if len(agentMgr.isAgentRunningForSessionCallArgs) != 0 {
 		t.Errorf("expected IsAgentRunningForSession NOT called for CANCELLED resume, got %v",
 			agentMgr.isAgentRunningForSessionCallArgs)
+	}
+}
+
+// TestResumeSession_ArchiveCancelledWithoutRunningRow_ClearsTaskDescription
+// covers the shape Service.ArchiveTask / HandoffService's cascade leaves
+// behind: the executors_running row is torn down entirely, so there is no
+// resume token to trigger applyRunningRecordToResumeRequest's normal
+// TaskDescription-clearing branches. GetTaskSessionStatus still marks such
+// sessions auto-resumable (resumeReasonArchiveCancelledResumable) once the
+// task is unarchived, so simply opening the task must not replay
+// task.Description as a fresh prompt and restart the original work.
+func TestResumeSession_ArchiveCancelledWithoutRunningRow_ClearsTaskDescription(t *testing.T) {
+	repo := newMockRepository()
+	now := time.Now().UTC()
+	repo.tasks["task-1"] = &models.Task{
+		ID:          "task-1",
+		WorkspaceID: "workspace-1",
+		Description: "do the original thing",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	repo.sessions["sess-1"] = &models.TaskSession{
+		ID:             "sess-1",
+		TaskID:         "task-1",
+		AgentProfileID: "profile-1",
+		State:          models.TaskSessionStateCancelled,
+		ErrorMessage:   models.SessionArchiveCancelReason,
+	}
+	// Deliberately no repo.executorsRunning["sess-1"] entry — the archive
+	// cleanup already deleted it.
+
+	var capturedReq *LaunchAgentRequest
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, req *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			capturedReq = req
+			return &LaunchAgentResponse{AgentExecutionID: "exec-new", Status: v1.AgentStatusStarting}, nil
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	callerSession := *repo.sessions["sess-1"]
+	if _, err := exec.ResumeSession(context.Background(), &callerSession, true); err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if capturedReq == nil {
+		t.Fatal("LaunchAgent was not called")
+	}
+	if capturedReq.TaskDescription != "" {
+		t.Errorf("TaskDescription = %q, want empty — auto-resuming an archive-cancelled "+
+			"session without a running row must not replay the original prompt", capturedReq.TaskDescription)
+	}
+}
+
+// TestResumeSession_UserCancelledWithoutRunningRow_KeepsTaskDescription is
+// the scoping counterpart to the archive-cancelled test above: a session the
+// user explicitly stopped (not an archive side effect) must not have its
+// TaskDescription cleared by this fix — that behavior is unrelated to the
+// auto-replay bug and out of scope here.
+func TestResumeSession_UserCancelledWithoutRunningRow_KeepsTaskDescription(t *testing.T) {
+	repo := newMockRepository()
+	now := time.Now().UTC()
+	repo.tasks["task-1"] = &models.Task{
+		ID:          "task-1",
+		WorkspaceID: "workspace-1",
+		Description: "do the original thing",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	repo.sessions["sess-1"] = &models.TaskSession{
+		ID:             "sess-1",
+		TaskID:         "task-1",
+		AgentProfileID: "profile-1",
+		State:          models.TaskSessionStateCancelled,
+		ErrorMessage:   "stopped via API",
+	}
+	// No repo.executorsRunning["sess-1"] entry, same as the archive-cancelled
+	// case, but ErrorMessage is not an archive reason.
+
+	var capturedReq *LaunchAgentRequest
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, req *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			capturedReq = req
+			return &LaunchAgentResponse{AgentExecutionID: "exec-new", Status: v1.AgentStatusStarting}, nil
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	callerSession := *repo.sessions["sess-1"]
+	if _, err := exec.ResumeSession(context.Background(), &callerSession, true); err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if capturedReq == nil {
+		t.Fatal("LaunchAgent was not called")
+	}
+	if capturedReq.TaskDescription != "do the original thing" {
+		t.Errorf("TaskDescription = %q, want %q — a plain user-cancel resume is unaffected by the archive-cancel fix",
+			capturedReq.TaskDescription, "do the original thing")
+	}
+}
+
+// TestResumeSession_ArchiveCancelledWithSurvivingRunningRow_ClearsTaskDescription
+// covers the other shape the same GetTaskSessionStatus branch can observe: the
+// executors_running row survived cleanup but carries no resume token. The
+// original applyRunningRecordToResumeRequest only cleared TaskDescription for
+// WaitingForInput fresh-starts, never for this CANCELLED case, so this locks
+// in the extended else-if condition alongside the running==nil branch above.
+func TestResumeSession_ArchiveCancelledWithSurvivingRunningRow_ClearsTaskDescription(t *testing.T) {
+	repo := newMockRepository()
+	now := time.Now().UTC()
+	repo.tasks["task-1"] = &models.Task{
+		ID:          "task-1",
+		WorkspaceID: "workspace-1",
+		Description: "do the original thing",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	repo.sessions["sess-1"] = &models.TaskSession{
+		ID:             "sess-1",
+		TaskID:         "task-1",
+		AgentProfileID: "profile-1",
+		State:          models.TaskSessionStateCancelled,
+		ErrorMessage:   models.SessionArchiveTreeCancelReason,
+	}
+	repo.executorsRunning["sess-1"] = &models.ExecutorRunning{
+		ID:        "sess-1",
+		SessionID: "sess-1",
+		TaskID:    "task-1",
+		// No ResumeToken: the running row survived, but resume must still fall
+		// through to a fresh, promptless start.
+	}
+
+	var capturedReq *LaunchAgentRequest
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, req *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			capturedReq = req
+			return &LaunchAgentResponse{AgentExecutionID: "exec-new", Status: v1.AgentStatusStarting}, nil
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	callerSession := *repo.sessions["sess-1"]
+	if _, err := exec.ResumeSession(context.Background(), &callerSession, true); err != nil {
+		t.Fatalf("ResumeSession: %v", err)
+	}
+	if capturedReq == nil {
+		t.Fatal("LaunchAgent was not called")
+	}
+	if capturedReq.TaskDescription != "" {
+		t.Errorf("TaskDescription = %q, want empty — a surviving-but-tokenless running row "+
+			"must not replay the original prompt either", capturedReq.TaskDescription)
 	}
 }
 
@@ -372,6 +655,9 @@ func TestResumeSession_PropagatesTaskEnvironmentID(t *testing.T) {
 	if capturedReq.TaskEnvironmentID != "env-1" {
 		t.Errorf("TaskEnvironmentID = %q, want %q — without this the lifecycle execution is indexed under empty env_id and GetByTaskEnvironmentID never finds it",
 			capturedReq.TaskEnvironmentID, "env-1")
+	}
+	if capturedReq.WorkspaceID != "workspace-1" {
+		t.Errorf("WorkspaceID = %q, want workspace-1 for resumed credential resolution", capturedReq.WorkspaceID)
 	}
 }
 
@@ -461,6 +747,41 @@ func TestResumeSession_ConcurrentResumeReReadsFreshState(t *testing.T) {
 	if agentMgr.cleanupStaleExecutionCallCount != 0 {
 		t.Errorf("cleanup must NOT be called when a live execution is detected, got %d",
 			agentMgr.cleanupStaleExecutionCallCount)
+	}
+}
+
+// TestResumeSession_CancellationBeforeResumeLockWins exercises the stop/resume
+// race before validateAndLockResume acquires the per-session lock. The resume
+// request observed WAITING_FOR_INPUT, then stop committed CANCELLED before the
+// in-lock re-read. That cancellation must abort the resume before any runtime
+// cleanup or replacement agent launch.
+func TestResumeSession_CancellationBeforeResumeLockWins(t *testing.T) {
+	repo := newMockRepository()
+	setupLiveResumeTestFixture(repo)
+
+	callerSession := *repo.sessions["sess-1"]
+	repo.sessions["sess-1"].State = models.TaskSessionStateCancelled
+	repo.sessions["sess-1"].ErrorMessage = "stopped via API"
+
+	agentMgr := &mockAgentManager{
+		launchAgentFunc: func(_ context.Context, _ *LaunchAgentRequest) (*LaunchAgentResponse, error) {
+			t.Fatal("LaunchAgent must not be called after a concurrent cancellation")
+			return nil, nil
+		},
+	}
+	exec := newTestExecutor(t, agentMgr, repo)
+
+	_, err := exec.ResumeSession(context.Background(), &callerSession, true)
+	if !errors.Is(err, ErrSessionStateSuperseded) {
+		t.Fatalf("expected ErrSessionStateSuperseded, got: %v", err)
+	}
+	if agentMgr.cleanupStaleExecutionCallCount != 0 {
+		t.Errorf("cleanup must not run after cancellation, got %d calls",
+			agentMgr.cleanupStaleExecutionCallCount)
+	}
+	if agentMgr.launchAgentCallCount != 0 {
+		t.Errorf("LaunchAgent must not run after cancellation, got %d calls",
+			agentMgr.launchAgentCallCount)
 	}
 }
 

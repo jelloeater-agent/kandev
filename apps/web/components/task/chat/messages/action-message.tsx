@@ -10,6 +10,7 @@ import {
   IconSparkles,
   IconGitCommit,
   IconX,
+  IconChevronDown,
 } from "@tabler/icons-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@kandev/ui/button";
@@ -37,10 +38,14 @@ const ICON_MAP: Record<string, React.ElementType> = {
 
 type ActionMeta = {
   actions?: MessageAction[];
+  action_visibility?: "running";
   variant?: string;
+  recovery_actions?: boolean;
   is_auth_error?: boolean;
   auth_methods?: RecoveryAuthMethod[];
   error_output?: string;
+  failure_kind?: string;
+  missing_branch?: string;
 };
 
 function isSessionActive(state?: TaskSessionState) {
@@ -51,22 +56,66 @@ export const ActionMessage = memo(function ActionMessage({ comment }: { comment:
   // Read session state from the store instead of receiving it as a prop, so a
   // state transition doesn't re-render every message in the list (only the
   // rare action messages that actually depend on it).
-  const sessionState = useAppStore((state) =>
-    comment.session_id
-      ? (state.taskSessions.items[comment.session_id]?.state ?? undefined)
-      : undefined,
-  );
+  const { sessionState, sessionError, activeTurnId } = useActionMessageSession(comment.session_id);
   const metadata = comment.metadata as ActionMeta | undefined;
-  const isWarning = metadata?.variant === "warning";
   const message = comment.content || "An error occurred";
 
-  // Hide once session is active again (recovery succeeded)
-  if (isSessionActive(sessionState)) return null;
+  if (metadata?.action_visibility === "running") {
+    if (sessionState !== "RUNNING" || !comment.turn_id || activeTurnId !== comment.turn_id) {
+      return null;
+    }
+    return (
+      <RunningActionNotice actions={metadata.actions} message={message} taskId={comment.task_id} />
+    );
+  }
 
-  const iconClass = isWarning ? "text-amber-500" : "text-red-500";
-  const textClass = isWarning
-    ? "text-amber-600 dark:text-amber-400"
-    : "text-red-600 dark:text-red-400";
+  return (
+    <SettledActionMessage
+      metadata={metadata}
+      message={message}
+      sessionError={sessionError}
+      sessionState={sessionState}
+      taskId={comment.task_id}
+    />
+  );
+});
+
+function SettledActionMessage({
+  metadata,
+  message,
+  sessionError,
+  sessionState,
+  taskId,
+}: {
+  metadata: ActionMeta | undefined;
+  message: string;
+  sessionError?: string;
+  sessionState?: TaskSessionState;
+  taskId?: string;
+}) {
+  const [recoveryRequested, setRecoveryRequested] = useState(false);
+
+  // A waiting session can still need recovery, so only hide this persisted
+  // card after its own Resume request is acknowledged (or the session starts).
+  if (isSessionActive(sessionState) || (metadata?.recovery_actions && recoveryRequested))
+    return null;
+
+  if (metadata?.failure_kind === "missing_pr_branch") {
+    return (
+      <MissingBranchRecovery
+        metadata={metadata}
+        taskId={taskId}
+        fallbackMessage={message}
+        technicalDetails={sessionError}
+      />
+    );
+  }
+
+  const iconClass = metadata?.variant === "warning" ? "text-amber-500" : "text-red-500";
+  const textClass =
+    metadata?.variant === "warning"
+      ? "text-amber-600 dark:text-amber-400"
+      : "text-red-600 dark:text-red-400";
 
   return (
     <div className="w-full">
@@ -75,18 +124,125 @@ export const ActionMessage = memo(function ActionMessage({ comment }: { comment:
           <IconAlertTriangle className={cn("h-4 w-4", iconClass)} />
         </div>
         <div className="flex-1 min-w-0 pt-0.5">
-          <div className={cn("text-xs font-mono", textClass)}>{message}</div>
+          <div className={cn("text-xs break-words", textClass)}>{message}</div>
           <ActionMessageDetails metadata={metadata} />
           {metadata?.actions && metadata.actions.length > 0 && (
-            <ActionButtons actions={metadata.actions} taskId={comment.task_id} />
+            <ActionButtons
+              actions={metadata.actions}
+              taskId={taskId}
+              onRecoveryRequested={
+                metadata.recovery_actions ? () => setRecoveryRequested(true) : undefined
+              }
+            />
           )}
         </div>
       </div>
     </div>
   );
-});
+}
 
-function ActionMessageDetails({ metadata }: { metadata: ActionMeta | undefined }) {
+function useActionMessageSession(sessionId: Message["session_id"]) {
+  const sessionState = useAppStore((state) =>
+    sessionId ? (state.taskSessions.items[sessionId]?.state ?? undefined) : undefined,
+  );
+  const sessionError = useAppStore((state) =>
+    sessionId
+      ? (state.taskSessions.items[sessionId]?.error_message as string | undefined)
+      : undefined,
+  );
+  const activeTurnId = useAppStore((state) =>
+    sessionId ? (state.turns.activeBySession[sessionId] ?? undefined) : undefined,
+  );
+  return { sessionState, sessionError, activeTurnId };
+}
+
+function RunningActionNotice({
+  actions,
+  message,
+  taskId,
+}: {
+  actions?: MessageAction[];
+  message: string;
+  taskId?: string;
+}) {
+  return (
+    <div
+      data-testid="running-action-notice"
+      className="flex min-w-0 items-center gap-2 py-1 text-muted-foreground"
+    >
+      <span className="min-w-0 flex-1 truncate text-xs">{message}</span>
+      {actions && actions.length > 0 && <ActionButtons actions={actions} taskId={taskId} compact />}
+    </div>
+  );
+}
+
+function MissingBranchRecovery({
+  metadata,
+  taskId,
+  fallbackMessage,
+  technicalDetails,
+}: {
+  metadata: ActionMeta;
+  taskId?: string;
+  fallbackMessage: string;
+  technicalDetails?: string;
+}) {
+  const branch = metadata.missing_branch?.trim();
+  return (
+    <section
+      data-testid="missing-branch-recovery"
+      role="alert"
+      className="w-full min-w-0 rounded-md border border-amber-500/25 bg-amber-500/[0.06] p-3 sm:p-4"
+    >
+      <div className="flex min-w-0 items-start gap-3">
+        <IconAlertTriangle
+          className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-500"
+          aria-hidden="true"
+        />
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-medium text-foreground">Branch is no longer available</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {branch ? (
+              <>
+                This task points to <code className="break-all text-foreground">{branch}</code>, but
+                that branch could not be found on the remote repository. It may have been merged or
+                deleted.
+              </>
+            ) : (
+              fallbackMessage
+            )}
+          </p>
+          <ActionMessageDetails metadata={metadata} technicalDetails={technicalDetails} />
+          {metadata.actions && metadata.actions.length > 0 && (
+            <ActionButtons actions={metadata.actions} taskId={taskId} />
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function TechnicalDetails({ children }: { children: string }) {
+  return (
+    <details className="mt-2 min-w-0 text-xs text-muted-foreground">
+      <summary className="flex min-h-11 cursor-pointer list-none items-center gap-1.5 sm:min-h-8">
+        <IconChevronDown className="h-3.5 w-3.5" />
+        Technical details
+      </summary>
+      <pre className="max-h-[300px] max-w-full overflow-y-auto whitespace-pre-wrap break-words rounded bg-muted/50 p-2 font-mono text-[11px]">
+        {children}
+      </pre>
+    </details>
+  );
+}
+
+function ActionMessageDetails({
+  metadata,
+  technicalDetails,
+}: {
+  metadata: ActionMeta | undefined;
+  technicalDetails?: string;
+}) {
   const [hostShellOpen, setHostShellOpen] = useState(false);
   const [hostShellCommand, setHostShellCommand] = useState<string | undefined>(undefined);
 
@@ -106,13 +262,10 @@ function ActionMessageDetails({ metadata }: { metadata: ActionMeta | undefined }
   }, []);
 
   if (!metadata) return null;
+  const errorOutput = metadata.error_output || technicalDetails;
   return (
     <>
-      {metadata.error_output && (
-        <pre className="mt-1.5 text-[11px] font-mono text-muted-foreground bg-muted/50 rounded p-2 overflow-auto max-h-[300px] whitespace-pre-wrap break-words">
-          {metadata.error_output}
-        </pre>
-      )}
+      {errorOutput && <TechnicalDetails>{errorOutput}</TechnicalDetails>}
       {metadata.is_auth_error && metadata.auth_methods && metadata.auth_methods.length > 0 && (
         <AuthMethodsPanel
           methods={metadata.auth_methods}
@@ -131,11 +284,33 @@ function ActionMessageDetails({ metadata }: { metadata: ActionMeta | undefined }
   );
 }
 
-function ActionButtons({ actions, taskId }: { actions: MessageAction[]; taskId?: string }) {
+function ActionButtons({
+  actions,
+  taskId,
+  onRecoveryRequested,
+  compact = false,
+}: {
+  actions: MessageAction[];
+  taskId?: string;
+  onRecoveryRequested?: () => void;
+  compact?: boolean;
+}) {
   return (
-    <div className="mt-2 flex items-center gap-2">
+    <div
+      className={cn(
+        compact
+          ? "flex shrink-0 items-center"
+          : "mt-2 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center",
+      )}
+    >
       {actions.map((action, i) => (
-        <ActionButton key={action.test_id ?? i} action={action} messageTaskId={taskId} />
+        <ActionButton
+          key={action.test_id ?? i}
+          action={action}
+          messageTaskId={taskId}
+          onCompleted={onRecoveryRequested}
+          compact={compact}
+        />
       ))}
     </div>
   );
@@ -144,9 +319,13 @@ function ActionButtons({ actions, taskId }: { actions: MessageAction[]; taskId?:
 function ActionButton({
   action,
   messageTaskId,
+  onCompleted,
+  compact = false,
 }: {
   action: MessageAction;
   messageTaskId?: string;
+  onCompleted?: () => void;
+  compact?: boolean;
 }): ReactElement | null {
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
   const activeTaskId = useAppStore((s) => s.tasks.activeTaskId);
@@ -180,11 +359,13 @@ function ActionButton({
           const params = action.params as
             | { method: string; payload: Record<string, unknown> }
             | undefined;
-          if (client && params) await client.request(params.method, params.payload);
+          if (!client || !params) throw new Error("WebSocket recovery request is unavailable");
+          await client.request(params.method, params.payload);
           break;
         }
       }
       setState("done");
+      if (action.type === "ws_request") onCompleted?.();
     } catch {
       setState("error");
       setTimeout(() => setState("idle"), 3000);
@@ -203,10 +384,12 @@ function ActionButton({
 
   const button = (
     <Button
-      variant="outline"
+      variant={compact ? "ghost" : "outline"}
       size="sm"
       className={cn(
-        "h-7 text-xs cursor-pointer gap-1.5",
+        compact
+          ? "h-auto min-h-11 shrink-0 px-2 text-xs cursor-pointer sm:min-h-8"
+          : "h-auto min-h-11 w-full gap-1.5 text-xs cursor-pointer sm:min-h-8 sm:w-auto",
         isDestructive && "text-destructive hover:text-destructive",
       )}
       disabled={disabled}

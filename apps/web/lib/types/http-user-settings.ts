@@ -40,6 +40,11 @@ export type TaskCreateLastUsedApi = {
   executor_profile_id?: string;
 };
 
+export type AppStatusBarOrderApi = {
+  left_item_ids?: string[];
+  right_item_ids?: string[];
+};
+
 export type UserSettings = {
   user_id: string;
   workspace_id: WorkspaceId;
@@ -48,11 +53,15 @@ export type UserSettings = {
   repository_ids: string[];
   tasks_list_sort?: string;
   tasks_list_group?: string;
+  tasks_list_show_details?: boolean;
   initial_setup_complete?: boolean;
   preferred_shell?: string;
   default_editor_id?: string;
   enable_preview_on_click?: boolean;
   chat_submit_key?: "enter" | "cmd_enter";
+  show_anchored_prompt_bar?: boolean;
+  show_scroll_to_last_prompt?: boolean;
+  show_scroll_to_start?: boolean;
   review_auto_mark_on_scroll?: boolean;
   confirm_task_archive?: boolean;
   mcp_task_agent_profile_default?: MCPTaskAgentProfileDefault;
@@ -79,7 +88,8 @@ export type UserSettings = {
   terminal_font_family?: string;
   terminal_font_size?: number;
   changes_panel_layout?: "flat" | "tree";
-  system_metrics_display?: { show_in_topbar?: boolean };
+  system_metrics_display?: { show_in_topbar?: boolean; simplified?: boolean };
+  app_status_bar_order?: AppStatusBarOrderApi;
   voice_mode?: VoiceModeSettings;
   updated_at: string;
 };
@@ -96,10 +106,14 @@ export type UserSettingsUpdatePayload = {
   repository_ids?: string[];
   tasks_list_sort?: string;
   tasks_list_group?: string;
+  tasks_list_show_details?: boolean;
   preferred_shell?: string;
   default_editor_id?: string;
   enable_preview_on_click?: boolean;
   chat_submit_key?: "enter" | "cmd_enter";
+  show_anchored_prompt_bar?: boolean;
+  show_scroll_to_last_prompt?: boolean;
+  show_scroll_to_start?: boolean;
   review_auto_mark_on_scroll?: boolean;
   confirm_task_archive?: boolean;
   mcp_task_agent_profile_default?: MCPTaskAgentProfileDefault;
@@ -126,6 +140,7 @@ export type UserSettingsUpdatePayload = {
   terminal_font_family?: string;
   terminal_font_size?: number;
   changes_panel_layout?: "flat" | "tree";
-  system_metrics_display?: { show_in_topbar?: boolean };
+  system_metrics_display?: { show_in_topbar?: boolean; simplified?: boolean };
+  app_status_bar_order?: AppStatusBarOrderApi;
   voice_mode?: VoiceModeSettings;
 };

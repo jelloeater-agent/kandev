@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StateProvider } from "@/components/state-provider";
 import { ToastProvider } from "@/components/toast-provider";
 import { TaskSwitcher, type TaskSwitcherItem } from "./task-switcher";
@@ -16,8 +16,12 @@ function Providers({ children }: { children: React.ReactNode }) {
   );
 }
 
-function item(id: string, parentTaskId?: string): TaskSwitcherItem {
-  return { id, title: id, state: "IN_PROGRESS", parentTaskId };
+function item(
+  id: string,
+  parentTaskId?: string,
+  overrides: Partial<TaskSwitcherItem> = {},
+): TaskSwitcherItem {
+  return { id, title: id, state: "IN_PROGRESS", parentTaskId, ...overrides };
 }
 
 // root → child → grandchild (depth 2)
@@ -140,6 +144,68 @@ describe("TaskSwitcher — nested subtasks beyond depth 1", () => {
   });
 });
 
+describe("TaskSwitcher — workflow completion icons", () => {
+  it("derives workflow completion from the final ordered step for each task", () => {
+    const finalStepId = "step-final";
+    const groupedTasks = [
+      item("Turn finished", undefined, {
+        state: "REVIEW",
+        sessionState: "COMPLETED",
+        workflowId: "workflow-1",
+        workflowStepId: "step-middle",
+      }),
+      item("Workflow complete", undefined, {
+        state: "REVIEW",
+        sessionState: "COMPLETED",
+        workflowId: "workflow-1",
+        workflowStepId: finalStepId,
+      }),
+      item("Missing workflow metadata", undefined, {
+        state: "REVIEW",
+        sessionState: "COMPLETED",
+      }),
+    ];
+
+    render(
+      <Providers>
+        <TaskSwitcher
+          grouped={{
+            groups: [{ key: "__all__", label: "All", tasks: groupedTasks }],
+            subTasksByParentId: new Map(),
+          }}
+          stepsByWorkflowId={{
+            "workflow-1": [
+              { id: "step-start", title: "Start" },
+              { id: "step-middle", title: "Middle" },
+              { id: finalStepId, title: "Done" },
+            ],
+          }}
+          activeTaskId={null}
+          selectedTaskId={null}
+          onSelectTask={vi.fn()}
+        />
+      </Providers>,
+    );
+
+    const turnFinishedRow = screen
+      .getByText("Turn finished")
+      .closest<HTMLElement>("[data-testid='sidebar-task-item']");
+    const workflowCompleteRow = screen
+      .getByText("Workflow complete")
+      .closest<HTMLElement>("[data-testid='sidebar-task-item']");
+    const missingMetadataRow = screen
+      .getByText("Missing workflow metadata")
+      .closest<HTMLElement>("[data-testid='sidebar-task-item']");
+
+    expect(within(turnFinishedRow!).getByTestId("task-state-turn-finished")).toBeTruthy();
+    expect(within(turnFinishedRow!).queryByTestId("task-state-workflow-complete")).toBeNull();
+    expect(within(workflowCompleteRow!).getByTestId("task-state-workflow-complete")).toBeTruthy();
+    expect(within(workflowCompleteRow!).queryByTestId("task-state-turn-finished")).toBeNull();
+    expect(within(missingMetadataRow!).getByTestId("task-state-turn-finished")).toBeTruthy();
+    expect(within(missingMetadataRow!).queryByTestId("task-state-workflow-complete")).toBeNull();
+  });
+});
+
 describe("TaskSwitcher — bulk pin menu", () => {
   it("offers bulk unpin when every selected root task is pinned", () => {
     render(
@@ -219,8 +285,31 @@ describe("TaskSwitcher — detach menu", () => {
   });
 });
 
+describe("TaskSwitcher — create subtask menu", () => {
+  it("passes the right-clicked task to the create-subtask action", () => {
+    const onCreateSubtask = vi.fn();
+    render(
+      <Providers>
+        <TaskSwitcher
+          grouped={grouped()}
+          activeTaskId={null}
+          selectedTaskId={null}
+          onSelectTask={vi.fn()}
+          onCreateSubtask={onCreateSubtask}
+        />
+      </Providers>,
+    );
+
+    fireEvent.contextMenu(screen.getByText(CHILD.title));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create Subtask" }));
+
+    expect(onCreateSubtask).toHaveBeenCalledWith(CHILD.id, CHILD.title);
+  });
+});
+
 describe("TaskSwitcher — external issue link menu", () => {
   it("offers configured external issue providers from the task context menu", async () => {
+    const onLinkMergeRequest = vi.fn();
     render(
       <Providers>
         <TaskSwitcher
@@ -233,11 +322,10 @@ describe("TaskSwitcher — external issue link menu", () => {
           onSelectTask={vi.fn()}
           onLinkPullRequest={vi.fn()}
           onLinkIssue={vi.fn()}
-          {...({
-            onLinkJiraTicket: vi.fn(),
-            onLinkLinearIssue: vi.fn(),
-            onLinkSentryIssue: vi.fn(),
-          } as Partial<Parameters<typeof TaskSwitcher>[0]>)}
+          onLinkMergeRequest={onLinkMergeRequest}
+          onLinkJiraTicket={vi.fn()}
+          onLinkLinearIssue={vi.fn()}
+          onLinkSentryIssue={vi.fn()}
         />
       </Providers>,
     );
@@ -251,21 +339,22 @@ describe("TaskSwitcher — external issue link menu", () => {
       expect(screen.getByText("Jira Ticket")).toBeTruthy();
       expect(screen.getByText("Linear Issue")).toBeTruthy();
       expect(screen.getByText("Sentry Issue")).toBeTruthy();
+      expect(screen.getByText("GitLab Merge Request")).toBeTruthy();
     });
   });
 
-  it("passes the visible task title to external issue link handlers", () => {
+  it("targets the selected task when linking a GitLab merge request", () => {
     const archivedTask: TaskSwitcherItem = {
       id: "archived-task",
       title: "Archived task title",
       isArchived: true,
     };
     const closeMenu = vi.fn();
-    const onLinkJiraTicket = vi.fn();
+    const onLinkMergeRequest = vi.fn();
 
-    createTaskLinkSelectAction(archivedTask, onLinkJiraTicket, closeMenu)?.();
+    createTaskLinkSelectAction(archivedTask, onLinkMergeRequest, closeMenu)?.();
 
-    expect(onLinkJiraTicket).toHaveBeenCalledWith(archivedTask.id, archivedTask.title);
+    expect(onLinkMergeRequest).toHaveBeenCalledWith(archivedTask.id, archivedTask.title);
     expect(closeMenu).toHaveBeenCalledOnce();
   });
 });

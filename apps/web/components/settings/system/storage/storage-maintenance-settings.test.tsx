@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   useSystemJob: vi.fn(),
 }));
 const IDLE_PERIOD_TEST_ID = "storage-idle-period";
+const SAVE_BUTTON_NAME = "Save changes";
 
 vi.mock("@/hooks/domains/system/use-storage-maintenance", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/domains/system/use-storage-maintenance")>()),
@@ -60,6 +61,7 @@ const overview = {
       managed_container_bytes: 0,
     },
   },
+  analyzed_at: "2026-07-23T12:00:00Z",
   last_run: null,
 } satisfies StorageOverviewResponse;
 
@@ -91,6 +93,7 @@ function Providers({ children }: { children: ReactNode }) {
   );
 }
 
+// eslint-disable-next-line max-lines-per-function
 describe("StorageMaintenanceSettings", () => {
   afterEach(cleanup);
 
@@ -139,6 +142,60 @@ describe("StorageMaintenanceSettings", () => {
     expect(analyzeButton.disabled).toBe(true);
   });
 
+  it.each(["analyze", "run", "restore", "delete"] as const)(
+    "keeps policy editing and shared Save available while %s is pending",
+    async (pendingAction) => {
+      const editableOverview = { ...overview, settings: { ...overview.settings, enabled: true } };
+      const currentController = { ...controller(editableOverview), pendingAction };
+      mocks.useStorageMaintenance.mockReturnValue(currentController);
+      render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+      const idlePeriod = screen.getByTestId(IDLE_PERIOD_TEST_ID) as HTMLInputElement;
+      expect(idlePeriod.disabled).toBe(false);
+      fireEvent.change(idlePeriod, { target: { value: "31" } });
+
+      const save = screen.getByRole("button", { name: SAVE_BUTTON_NAME }) as HTMLButtonElement;
+      expect(save.disabled).toBe(false);
+      fireEvent.click(save);
+      await waitFor(() =>
+        expect(currentController.save).toHaveBeenCalledWith(
+          { ...editableOverview.settings, idle_for_minutes: 31 },
+          undefined,
+        ),
+      );
+    },
+  );
+
+  it("blocks a pending adoption with its specific save reason", () => {
+    mocks.useStorageMaintenance.mockReturnValue({
+      ...controller(overview),
+      pendingAction: "adopt",
+    });
+    render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+    fireEvent.change(screen.getByTestId(IDLE_PERIOD_TEST_ID), { target: { value: "31" } });
+
+    expect(
+      (screen.getByRole("button", { name: SAVE_BUTTON_NAME }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(screen.getByText("Wait for Go cache adoption to finish.")).toBeTruthy();
+  });
+
+  it("keeps the contributor valid while its own save is pending", () => {
+    const editableOverview = { ...overview, settings: { ...overview.settings, enabled: true } };
+    mocks.useStorageMaintenance.mockReturnValue({
+      ...controller(editableOverview),
+      pendingAction: "save",
+    });
+    render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+    fireEvent.change(screen.getByTestId(IDLE_PERIOD_TEST_ID), { target: { value: "31" } });
+
+    expect(
+      (screen.getByRole("button", { name: SAVE_BUTTON_NAME }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
   it("preserves a dirty policy draft when refreshed overview data arrives", () => {
     const { rerender } = render(<StorageMaintenanceSettings />, { wrapper: Providers });
     const idlePeriod = screen.getByTestId(IDLE_PERIOD_TEST_ID) as HTMLInputElement;
@@ -153,6 +210,96 @@ describe("StorageMaintenanceSettings", () => {
     rerender(<StorageMaintenanceSettings />);
 
     expect((screen.getByTestId(IDLE_PERIOD_TEST_ID) as HTMLInputElement).value).toBe("31");
+  });
+});
+
+describe("StorageMaintenanceSettings busy feedback", () => {
+  afterEach(cleanup);
+
+  beforeEach(() => {
+    mocks.useSystemJob.mockReturnValue(undefined);
+  });
+
+  it("explains busy activity and exposes the direct Run anyway action", () => {
+    const runAnyway = vi.fn();
+    mocks.useStorageMaintenance.mockReturnValue({
+      ...controller(overview),
+      busy: {
+        resources: [
+          { kind: "execution_running", label: "An agent execution is running" },
+          { kind: "test_command", label: "A test command is running" },
+        ],
+        forceAvailable: true,
+      },
+      runAnyway,
+    });
+
+    render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+    expect(screen.getByText("An agent execution is running")).toBeTruthy();
+    expect(screen.getByText("A test command is running")).toBeTruthy();
+    expect(screen.getByText(/may disrupt this active work/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Run anyway" }));
+    expect(runAnyway).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("StorageMaintenanceSettings pending policy", () => {
+  afterEach(cleanup);
+
+  it("rebases an adopted Go cache path into a dirty policy draft before shared save", async () => {
+    const currentController = controller(overview);
+    mocks.useStorageMaintenance.mockReturnValue(currentController);
+    const { rerender } = render(<StorageMaintenanceSettings />, { wrapper: Providers });
+    fireEvent.change(screen.getByTestId(IDLE_PERIOD_TEST_ID), { target: { value: "31" } });
+
+    const adoptedPath = "/mnt/shared/go-build";
+    currentController.overview = {
+      ...overview,
+      settings: {
+        ...overview.settings,
+        go_cache: { ...overview.settings.go_cache, adopted_path: adoptedPath },
+      },
+    };
+    rerender(<StorageMaintenanceSettings />);
+
+    fireEvent.click(screen.getByRole("button", { name: SAVE_BUTTON_NAME }));
+    await waitFor(() =>
+      expect(currentController.save).toHaveBeenCalledWith(
+        {
+          ...overview.settings,
+          idle_for_minutes: 31,
+          go_cache: { ...overview.settings.go_cache, adopted_path: adoptedPath },
+        },
+        undefined,
+      ),
+    );
+  });
+
+  it.each(["analyze", "run", "restore", "delete"] as const)(
+    "disables storage action controls while %s is pending without disabling shared Save",
+    (pendingAction) => {
+      const currentController = { ...controller(overview), pendingAction };
+      mocks.useStorageMaintenance.mockReturnValue(currentController);
+      render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+      expect((screen.getByTestId("storage-analyze") as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByTestId("storage-run-now") as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.change(screen.getByTestId(IDLE_PERIOD_TEST_ID), { target: { value: "31" } });
+      expect(
+        (screen.getByRole("button", { name: SAVE_BUTTON_NAME }) as HTMLButtonElement).disabled,
+      ).toBe(false);
+    },
+  );
+
+  it("blocks Go cache adoption while a save is pending", () => {
+    mocks.useStorageMaintenance.mockReturnValue({
+      ...controller(overview),
+      pendingAction: "save",
+    });
+    render(<StorageMaintenanceSettings />, { wrapper: Providers });
+
+    expect((screen.getByTestId("storage-go-cache-adopt") as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -178,7 +325,7 @@ describe("StorageMaintenanceSettings coordinated save", () => {
       screen.getByTestId("storage-policy-section-schedule").getAttribute("data-settings-dirty"),
     ).toBe("true");
 
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    fireEvent.click(screen.getByRole("button", { name: SAVE_BUTTON_NAME }));
     await waitFor(() =>
       expect(currentController.save).toHaveBeenCalledWith(
         { ...overview.settings, idle_for_minutes: 31 },
@@ -202,7 +349,7 @@ describe("StorageMaintenanceSettings coordinated save", () => {
     expect(screen.getByTestId("storage-docker-dedicated").getAttribute("data-settings-dirty")).toBe(
       "true",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    fireEvent.click(screen.getByRole("button", { name: SAVE_BUTTON_NAME }));
 
     await waitFor(() =>
       expect(currentController.save).toHaveBeenCalledWith(

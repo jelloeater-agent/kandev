@@ -1,5 +1,6 @@
 import type { ConnectionStatus } from "@/lib/types/connection";
 import type { HealthCheckSummary, HealthIssue, SystemHealthResponse } from "@/lib/types/health";
+import type { StateSnapshot } from "react-virtuoso";
 import type {
   FilterClause,
   GroupKey,
@@ -53,6 +54,21 @@ export type ChatInputState = {
   planModeBySessionId: Record<string, boolean>;
 };
 
+export type TranscriptAutoScrollState = {
+  /** Per-session auto-scroll preference. Absent = enabled (the default). */
+  enabledBySessionId: Record<string, boolean>;
+  /** Last known scrollTop for the native renderer, captured continuously so
+   *  a disabled session's position survives a dockview panel remount. */
+  scrollTopBySessionId: Record<string, number>;
+  /** Last captured Virtuoso state snapshot (scroll offset + measured item
+   *  sizes) for the virtuoso renderer, captured on disable/unmount. */
+  virtuosoStateBySessionId: Record<string, StateSnapshot>;
+};
+
+export type ReviewPRSelectionState = {
+  selectedKeyByTaskId: Record<string, string>;
+};
+
 export type ActiveDocument =
   | { type: "plan"; taskId: string }
   | { type: "file"; path: string; name: string };
@@ -100,6 +116,14 @@ export type TaskDeletedNotification = {
   reason?: string;
 };
 
+export type UpdateAvailableNotification = {
+  version: string;
+  url?: string;
+  title: string;
+  body: string;
+  occurrence_id: string;
+};
+
 export type BottomTerminalState = {
   isOpen: boolean;
   pendingCommand: string | null;
@@ -143,12 +167,16 @@ export type UISliceState = {
   mobileKanban: MobileKanbanState;
   mobileSession: MobileSessionState;
   chatInput: ChatInputState;
+  transcriptAutoScroll: TranscriptAutoScrollState;
+  reviewPRSelection: ReviewPRSelectionState;
   documentPanel: DocumentPanelState;
   systemHealth: SystemHealthState;
   quickChat: QuickChatState;
   sessionFailureNotification: SessionFailureNotification | null;
   /** Set when the focused task is deleted live, so a toast can explain why. */
   taskDeletedNotification: TaskDeletedNotification | null;
+  /** Set when the background updates poller reports a newly detected release. */
+  updateAvailableNotification: UpdateAvailableNotification | null;
   bottomTerminal: BottomTerminalState;
   sidebarViews: SidebarSliceState;
   /** Parent task IDs whose subtasks are collapsed in the sidebar. Tab-scoped (sessionStorage). */
@@ -190,6 +218,10 @@ export type UISliceActions = {
   setMobileSessionReview: (sessionId: string, mrKey: string | null) => void;
   setMobileSessionTaskSwitcherOpen: (open: boolean) => void;
   setPlanMode: (sessionId: string, enabled: boolean) => void;
+  setTranscriptAutoScrollEnabled: (sessionId: string, enabled: boolean) => void;
+  setTranscriptScrollTop: (sessionId: string, scrollTop: number) => void;
+  setTranscriptVirtuosoState: (sessionId: string, state: StateSnapshot) => void;
+  setReviewPRSelection: (taskId: string, selectedKey: string) => void;
   setActiveDocument: (sessionId: string, doc: ActiveDocument | null) => void;
   setSystemHealth: (response: SystemHealthResponse) => void;
   setSystemHealthLoading: (loading: boolean) => void;
@@ -213,6 +245,7 @@ export type UISliceActions = {
   setQuickChatInitialPrompt: (sessionId: string, prompt?: string) => void;
   setSessionFailureNotification: (n: SessionFailureNotification | null) => void;
   setTaskDeletedNotification: (n: TaskDeletedNotification | null) => void;
+  setUpdateAvailableNotification: (n: UpdateAvailableNotification | null) => void;
   toggleBottomTerminal: () => void;
   openBottomTerminalWithCommand: (command: string) => void;
   clearBottomTerminalCommand: () => void;

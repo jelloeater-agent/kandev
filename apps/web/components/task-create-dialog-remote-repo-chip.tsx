@@ -5,6 +5,7 @@ import Link from "@/components/routing/app-link";
 import {
   IconBrandGithub,
   IconBrandGitlab,
+  IconCheck,
   IconGitBranch,
   IconLink,
   IconX,
@@ -12,6 +13,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { Branch } from "@/lib/types/http";
 import { Badge } from "@kandev/ui/badge";
+import { Button } from "@kandev/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@kandev/ui/popover";
 import { Spinner } from "@kandev/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
@@ -35,46 +37,25 @@ import {
   RemoteRepositoryProviderIcon,
   RemoteRepoProviderTabs,
 } from "@/components/task-create-dialog-remote-repo-provider-tabs";
+import { remoteRepositoryMatchesSelection } from "./task-create-dialog-remote-repo-identity";
+
+export { selectedRemoteRepositoryIdentity } from "./task-create-dialog-remote-repo-identity";
+import {
+  looksLikeSupportedRemoteURL,
+  looksLikeURL,
+} from "@/components/workspace-source-picker/remote-url";
 
 const TRUNCATE_THRESHOLD = 30;
 
-/**
- * Props for the per-row remote-repo chip used in the Remote tab of the
- * task-create dialog. The chip itself is presentational — branches and the
- * loading flag are passed in by the parent row (which keys them off the
- * row's URL via `branchesByUrl`), and writes happen through the supplied
- * callbacks.
- *
- * `onURLChange` receives the new URL plus how it was produced. The "picker"
- * arm also carries the canonical `owner/name`, provider, and the repo's
- * `default_branch` so the parent can pre-fill the row's branch without
- * waiting for the branch list to load; the "paste" arm leaves metadata
- * undefined so the row drops any stale picker data and the user picks
- * their own branch.
- */
 export type RemoteRepoChipProps = {
   row: TaskRemoteRepoRow;
   branches: Branch[];
   branchesLoading: boolean;
-  /**
-   * PR info for the row's URL (when the URL is a PR URL and the info has
-   * loaded). Drives the per-row PR-head auto-select effect: if the row's
-   * branch is empty, the chip writes the PR head branch into it. The
-   * dialog separately reads the first row's `suggestedTitle` to autofill
-   * the task title.
-   */
   prInfo?: PRInfo;
-  /**
-   * Shared `useAccessibleRepos` result hoisted up to the chips-row level so
-   * one backend request serves every chip in the row (previously each open
-   * popover fired its own request). Each chip still keeps its own local
-   * search-text state — the hoisted hook only owns the in-flight fetch and
-   * the cache. When two popovers happen to be open at once with different
-   * search texts, both see the same `repos` (the last `search(q)` wins);
-   * that's acceptable because in practice only one popover is open at a
-   * time.
-   */
+  resolutionError?: Error;
   accessibleRepos: UseRemoteRepositoriesResult;
+  /** Identities selected by other rows. Matching entries remain selectable. */
+  selectedRepositoryIdentities?: string[];
   onURLChange: (
     url: string,
     source: "picker" | "paste",
@@ -88,6 +69,7 @@ export type RemoteRepoChipProps = {
     },
   ) => void;
   onBranchChange: (branch: string) => void;
+  onRetry?: () => void;
   onRemove: () => void;
 };
 
@@ -106,27 +88,63 @@ export function RemoteRepoChip({
   branches,
   branchesLoading,
   prInfo,
+  resolutionError,
   accessibleRepos,
+  selectedRepositoryIdentities = [],
   onURLChange,
   onBranchChange,
+  onRetry,
   onRemove,
 }: RemoteRepoChipProps) {
   useRowBranchAutoSelect({ row, branches, prInfo, onBranchChange });
   return (
-    <span
-      className="inline-flex items-center rounded-md border border-input bg-input/20 dark:bg-input/30 pr-0.5"
-      data-testid="remote-repo-chip"
-      data-remote-url={row.url}
+    <div
+      className="flex max-w-full flex-col items-start gap-1"
+      data-testid="remote-repo-chip-wrapper"
     >
-      <RemoteRepoPill row={row} accessibleRepos={accessibleRepos} onURLChange={onURLChange} />
-      <RemoteBranchPill
-        url={row.url}
-        branch={row.branch}
-        branches={branches}
-        branchesLoading={branchesLoading}
-        onBranchChange={onBranchChange}
-      />
-      <RemoveButton onRemove={onRemove} />
+      <span
+        className="inline-flex max-w-full items-center rounded-md border border-input bg-input/20 dark:bg-input/30 pr-0.5"
+        data-testid="remote-repo-chip"
+        data-remote-url={row.url}
+      >
+        <RemoteRepoPill
+          row={row}
+          accessibleRepos={accessibleRepos}
+          selectedRepositoryIdentities={selectedRepositoryIdentities}
+          onURLChange={onURLChange}
+        />
+        <RemoteBranchPill
+          url={row.url}
+          branch={row.branch}
+          branches={branches}
+          branchesLoading={branchesLoading}
+          onBranchChange={onBranchChange}
+        />
+        <RemoveButton onRemove={onRemove} />
+      </span>
+      {resolutionError && onRetry ? (
+        <RemoteResolutionError error={resolutionError} onRetry={onRetry} />
+      ) : null}
+    </div>
+  );
+}
+
+function RemoteResolutionError({ error, onRetry }: { error: Error; onRetry: () => void }) {
+  return (
+    <span className="flex max-w-full items-center gap-2 text-xs text-destructive" role="alert">
+      <span className="min-w-0 break-words">
+        Could not resolve remote repository: {error.message}
+      </span>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-11 sm:h-9 cursor-pointer"
+        aria-label="Retry remote repository resolution"
+        onClick={onRetry}
+      >
+        Retry
+      </Button>
     </span>
   );
 }
@@ -209,10 +227,12 @@ function computeAutoSelectedBranch(prInfo: PRInfo | undefined, branches: Branch[
 function RemoteRepoPill({
   row,
   accessibleRepos,
+  selectedRepositoryIdentities,
   onURLChange,
 }: {
   row: TaskRemoteRepoRow;
   accessibleRepos: UseRemoteRepositoriesResult;
+  selectedRepositoryIdentities: string[];
   onURLChange: RemoteRepoChipProps["onURLChange"];
 }) {
   const [open, setOpen] = useState(false);
@@ -243,6 +263,7 @@ function RemoteRepoPill({
       >
         <RemoteRepoPopoverContent
           accessible={accessibleRepos}
+          selectedRepositoryIdentities={selectedRepositoryIdentities}
           onPick={(repo) => {
             onURLChange(repo.url, "picker", {
               provider: repo.provider,
@@ -297,10 +318,12 @@ function truncateMiddle(value: string, max: number): string {
 
 function RemoteRepoPopoverContent({
   accessible,
+  selectedRepositoryIdentities,
   onPick,
   onPaste,
 }: {
   accessible: UseRemoteRepositoriesResult;
+  selectedRepositoryIdentities: string[];
   onPick: (repo: RemoteRepository) => void;
   onPaste: (value: string) => void;
 }) {
@@ -311,10 +334,9 @@ function RemoteRepoPopoverContent({
   useEffect(() => {
     triggerSearch(value);
   }, [value, triggerSearch]);
-
   const commitURL = (candidate: string) => {
     const trimmed = candidate.trim();
-    if (!parseGitHubAnyUrl(trimmed) && !looksLikeSupportedRemoteURL(trimmed)) {
+    if (!isSupportedRemoteURL(trimmed)) {
       if (looksLikeURL(trimmed)) {
         setUrlError("Enter a GitHub, GitLab, or Azure DevOps repository URL.");
       }
@@ -325,49 +347,38 @@ function RemoteRepoPopoverContent({
     return true;
   };
   const visibleUrlError = accessible.unavailable ? null : urlError;
-  const showProviderTabs = accessible.availableProviders.length > 1;
-  const selectedProvider =
-    activeProvider && accessible.availableProviders.includes(activeProvider)
-      ? activeProvider
-      : accessible.availableProviders[0];
-  const visibleRepos = showProviderTabs
-    ? accessible.repos.filter((repo) => repo.provider === selectedProvider)
-    : accessible.repos;
-
+  const hasStagedURL = isSupportedRemoteURL(value.trim());
+  const { showProviderTabs, selectedProvider, visibleRepos } = visibleProviderRepositories(
+    accessible,
+    activeProvider,
+  );
   return (
     <div className="flex flex-col">
       <input
         autoFocus
-        type="text"
         value={value}
         onChange={(event) => {
           setValue(event.target.value);
           setUrlError(null);
         }}
-        onBlur={(event) => {
-          const popoverContent = event.currentTarget.closest('[data-slot="popover-content"]');
-          if (
-            popoverContent &&
-            event.relatedTarget instanceof Node &&
-            popoverContent.contains(event.relatedTarget)
-          ) {
-            return;
-          }
-          commitURL(value);
-        }}
         onPaste={(event) => {
           const pasted = event.clipboardData.getData("text");
-          const isURL = looksLikeURL(pasted.trim());
-          if (!commitURL(pasted) && !isURL) return;
           event.preventDefault();
-          setValue(pasted.trim());
+          setValue(pasted);
         }}
         onKeyDown={(event) => {
-          if (event.key === "Tab") {
-            commitURL(value);
+          if (
+            event.key !== "Enter" ||
+            event.defaultPrevented ||
+            event.repeat ||
+            event.altKey ||
+            event.ctrlKey ||
+            event.metaKey ||
+            event.shiftKey ||
+            event.nativeEvent.isComposing ||
+            event.keyCode === 229
+          )
             return;
-          }
-          if (event.key !== "Enter") return;
           const isURL = looksLikeURL(value.trim());
           if (commitURL(value) || isURL) event.preventDefault();
         }}
@@ -382,8 +393,15 @@ function RemoteRepoPopoverContent({
           visibleUrlError && "border-destructive focus:border-destructive",
         )}
       />
+      {hasStagedURL ? (
+        <div className="px-2 pt-1 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">Remote URL</span> — press Enter to submit
+          it.
+        </div>
+      ) : null}
       <PickerList
         accessible={{ ...accessible, repos: visibleRepos }}
+        selectedRepositoryIdentities={selectedRepositoryIdentities}
         onPick={onPick}
         urlError={visibleUrlError}
       />
@@ -398,35 +416,31 @@ function RemoteRepoPopoverContent({
   );
 }
 
-function looksLikeURL(value: string): boolean {
-  if (!value) return false;
-  const withScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`;
-  try {
-    const parsed = new URL(withScheme);
-    return parsed.hostname.includes(".") && value.includes("/");
-  } catch {
-    return false;
-  }
+function visibleProviderRepositories(
+  accessible: UseRemoteRepositoriesResult,
+  activeProvider: RemoteRepositoryProvider | null,
+) {
+  const showProviderTabs = accessible.availableProviders.length > 1;
+  const selectedProvider =
+    activeProvider && accessible.availableProviders.includes(activeProvider)
+      ? activeProvider
+      : accessible.availableProviders[0];
+  const visibleRepos = showProviderTabs
+    ? accessible.repos.filter((repo) => repo.provider === selectedProvider)
+    : accessible.repos;
+  return { showProviderTabs, selectedProvider, visibleRepos };
 }
-
-function looksLikeSupportedRemoteURL(value: string): boolean {
-  if (/^git@(github\.com|gitlab\.com|ssh\.dev\.azure\.com):\S+$/i.test(value)) return true;
-  if (!looksLikeURL(value)) return false;
-  const candidate = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`;
-  try {
-    const host = new URL(candidate).hostname.toLowerCase();
-    return host === "github.com" || host === "gitlab.com" || host === "dev.azure.com";
-  } catch {
-    return false;
-  }
+function isSupportedRemoteURL(value: string): boolean {
+  return !!parseGitHubAnyUrl(value) || looksLikeSupportedRemoteURL(value);
 }
-
 function PickerList({
   accessible,
+  selectedRepositoryIdentities,
   onPick,
   urlError,
 }: {
   accessible: UseRemoteRepositoriesResult;
+  selectedRepositoryIdentities: string[];
   onPick: (repo: RemoteRepository) => void;
   urlError: string | null;
 }) {
@@ -457,7 +471,14 @@ function PickerList({
         </div>
       ) : null}
       {repos.map((repo) => (
-        <RepoOption key={`${repo.provider}:${repo.id}`} repo={repo} onPick={onPick} />
+        <RepoOption
+          key={`${repo.provider}:${repo.id}`}
+          repo={repo}
+          alreadyAdded={selectedRepositoryIdentities.some((identity) =>
+            remoteRepositoryMatchesSelection(repo, identity),
+          )}
+          onPick={onPick}
+        />
       ))}
     </div>
   );
@@ -465,9 +486,11 @@ function PickerList({
 
 function RepoOption({
   repo,
+  alreadyAdded,
   onPick,
 }: {
   repo: RemoteRepository;
+  alreadyAdded: boolean;
   onPick: (repo: RemoteRepository) => void;
 }) {
   return (
@@ -484,12 +507,28 @@ function RepoOption({
         <RemoteRepositoryProviderIcon provider={repo.provider} />
         <span className="truncate">{repo.fullName}</span>
       </span>
-      {repo.private ? (
-        <Badge variant="outline" className="text-[10px] text-muted-foreground shrink-0">
-          private
-        </Badge>
-      ) : null}
+      <span className="flex shrink-0 items-center gap-1">
+        {alreadyAdded ? <AlreadyAddedMarker /> : null}
+        {repo.private ? (
+          <Badge variant="outline" className="text-[10px] text-muted-foreground">
+            private
+          </Badge>
+        ) : null}
+      </span>
     </button>
+  );
+}
+
+function AlreadyAddedMarker() {
+  return (
+    <span
+      role="img"
+      aria-label="Already added"
+      data-testid="already-added-repository-marker"
+      className="text-primary"
+    >
+      <IconCheck aria-hidden="true" className="h-4 w-4" />
+    </span>
   );
 }
 

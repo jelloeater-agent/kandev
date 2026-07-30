@@ -1,6 +1,8 @@
+import { createRef } from "react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, fireEvent } from "@testing-library/react";
 import { ClarificationCustomInput } from "./clarification-overlay-parts";
+import { routePanelMouseDown } from "./route-panel-mouse-down";
 
 // Mutable pointer state so individual tests can flip to a touch device without
 // touching matchMedia internals.
@@ -15,6 +17,7 @@ afterEach(() => {
 });
 
 const INPUT_TESTID = "clarification-input";
+const ROW_TESTID = "clarification-custom-input";
 const TOUCH_SUBMIT_TESTID = "clarification-custom-submit";
 const MULTILINE = "line one\nline two";
 
@@ -35,6 +38,71 @@ function makeProps(overrides: Partial<Parameters<typeof ClarificationCustomInput
 function pressEnter(el: HTMLElement, init: Partial<KeyboardEventInit> = {}): boolean {
   return fireEvent.keyDown(el, { key: "Enter", ...init });
 }
+
+function renderInPanel(overrides: Partial<Parameters<typeof ClarificationCustomInput>[0]> = {}) {
+  const panelRef = createRef<HTMLDivElement>();
+  return render(
+    <div
+      data-testid="panel"
+      tabIndex={-1}
+      ref={panelRef}
+      onMouseDown={(event) => routePanelMouseDown(event, panelRef)}
+    >
+      <ClarificationCustomInput {...makeProps(overrides)} />
+    </div>,
+  );
+}
+
+describe("ClarificationCustomInput row focus", () => {
+  it("renders the editor as one flush, transparent input surface", () => {
+    const { getByTestId } = renderInPanel();
+    const row = getByTestId(ROW_TESTID);
+    const input = getByTestId(INPUT_TESTID);
+
+    expect(input.className).toContain("dark:bg-transparent");
+    expect(row.textContent).not.toContain("↳");
+  });
+
+  it("centers every direct row control without manual top offsets", () => {
+    const { getByTestId } = renderInPanel({ active: true });
+    const row = getByTestId(ROW_TESTID);
+
+    expect(row.className).toContain("items-center");
+    expect(row.className).not.toContain("items-start");
+    expect(Array.from(row.children).every((child) => !child.className.includes("mt-0.5"))).toBe(
+      true,
+    );
+  });
+
+  it("focuses the textarea when the non-interactive row surface is pressed", () => {
+    const { getByTestId } = renderInPanel();
+
+    const notDefaulted = fireEvent.mouseDown(getByTestId(ROW_TESTID));
+
+    expect(notDefaulted).toBe(false);
+    expect(document.activeElement).toBe(getByTestId(INPUT_TESTID));
+  });
+
+  it("does not focus the disabled textarea from the row surface", () => {
+    const { getByTestId } = renderInPanel({ isSubmitting: true });
+
+    fireEvent.mouseDown(getByTestId(ROW_TESTID));
+
+    expect(document.activeElement).not.toBe(getByTestId(INPUT_TESTID));
+  });
+
+  it("does not route a touch Send press through the textarea", () => {
+    pointer.isFinePointer = false;
+    const onSubmit = vi.fn();
+    const { getByTestId } = renderInPanel({ draft: "answer", onSubmit });
+
+    fireEvent.mouseDown(getByTestId(TOUCH_SUBMIT_TESTID));
+    fireEvent.click(getByTestId(TOUCH_SUBMIT_TESTID));
+
+    expect(document.activeElement).not.toBe(getByTestId(INPUT_TESTID));
+    expect(onSubmit).toHaveBeenCalledOnce();
+  });
+});
 
 describe("ClarificationCustomInput multiline", () => {
   it("renders a textarea so answers can span multiple lines", () => {

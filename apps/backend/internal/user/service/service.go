@@ -41,6 +41,7 @@ type UpdateUserSettingsRequest struct {
 	RepositoryIDs               *[]string
 	TasksListSort               *string
 	TasksListGroup              *string
+	TasksListShowDetails        *bool
 	InitialSetupComplete        *bool
 	PreferredShell              *string
 	DefaultEditorID             *string
@@ -49,6 +50,9 @@ type UpdateUserSettingsRequest struct {
 	ReviewAutoMarkOnScroll      *bool
 	ConfirmTaskArchive          *bool
 	MCPTaskAgentProfileDefault  *string
+	ShowAnchoredPromptBar       *bool
+	ShowScrollToLastPrompt      *bool
+	ShowScrollToStart           *bool
 	ShowReleaseNotification     *bool
 	ReleaseNotesLastSeenVersion *string
 	LspAutoStartLanguages       *[]string
@@ -72,8 +76,14 @@ type UpdateUserSettingsRequest struct {
 	TerminalFontFamily          *string
 	TerminalFontSize            *int
 	ChangesPanelLayout          *string
-	SystemMetricsDisplay        *models.SystemMetricsDisplaySettings
+	SystemMetricsDisplay        *SystemMetricsDisplaySettingsPatch
+	AppStatusBarOrder           *models.AppStatusBarOrder
 	VoiceMode                   *models.VoiceModeSettings
+}
+
+type SystemMetricsDisplaySettingsPatch struct {
+	ShowInTopbar *bool
+	Simplified   *bool
 }
 
 func NewService(repo store.Repository, eventBus bus.EventBus, log *logger.Logger) *Service {
@@ -185,6 +195,33 @@ func taskCreateLastUsedPatchEmpty(patch models.TaskCreateLastUsed) bool {
 
 // applyBasicSettings copies simple (non-validated) fields from req to settings.
 func applyBasicSettings(settings *models.UserSettings, req *UpdateUserSettingsRequest) error {
+	if err := applyWorkspaceAndTaskListPreferences(settings, req); err != nil {
+		return err
+	}
+	if err := applyTaskActionPreferences(settings, req); err != nil {
+		return err
+	}
+	applyUtilityPreferences(settings, req)
+	if err := applyKeyboardShortcuts(settings, req.KeyboardShortcuts); err != nil {
+		return err
+	}
+	if err := applyTerminalLinkBehavior(settings, req.TerminalLinkBehavior); err != nil {
+		return err
+	}
+	if err := applyChangesPanelLayout(settings, req.ChangesPanelLayout); err != nil {
+		return err
+	}
+	applySystemMetricsDisplay(settings, req.SystemMetricsDisplay)
+	if req.AppStatusBarOrder != nil {
+		settings.AppStatusBarOrder = *req.AppStatusBarOrder
+	}
+	if err := applyTerminalFontPreferences(settings, req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyWorkspaceAndTaskListPreferences(settings *models.UserSettings, req *UpdateUserSettingsRequest) error {
 	if req.WorkspaceID != nil {
 		settings.WorkspaceID = *req.WorkspaceID
 	}
@@ -200,6 +237,9 @@ func applyBasicSettings(settings *models.UserSettings, req *UpdateUserSettingsRe
 	if err := applyTasksListPreferences(settings, req.TasksListSort, req.TasksListGroup); err != nil {
 		return err
 	}
+	if req.TasksListShowDetails != nil {
+		settings.TasksListShowDetails = *req.TasksListShowDetails
+	}
 	if req.InitialSetupComplete != nil {
 		settings.InitialSetupComplete = *req.InitialSetupComplete
 	}
@@ -212,6 +252,10 @@ func applyBasicSettings(settings *models.UserSettings, req *UpdateUserSettingsRe
 	if req.EnablePreviewOnClick != nil {
 		settings.EnablePreviewOnClick = *req.EnablePreviewOnClick
 	}
+	return nil
+}
+
+func applyTaskActionPreferences(settings *models.UserSettings, req *UpdateUserSettingsRequest) error {
 	if req.ReviewAutoMarkOnScroll != nil {
 		settings.ReviewAutoMarkOnScroll = *req.ReviewAutoMarkOnScroll
 	}
@@ -221,9 +265,22 @@ func applyBasicSettings(settings *models.UserSettings, req *UpdateUserSettingsRe
 	if err := applyMCPTaskAgentProfileDefault(settings, req.MCPTaskAgentProfileDefault); err != nil {
 		return err
 	}
+	if req.ShowAnchoredPromptBar != nil {
+		settings.ShowAnchoredPromptBar = *req.ShowAnchoredPromptBar
+	}
+	if req.ShowScrollToLastPrompt != nil {
+		settings.ShowScrollToLastPrompt = *req.ShowScrollToLastPrompt
+	}
+	if req.ShowScrollToStart != nil {
+		settings.ShowScrollToStart = *req.ShowScrollToStart
+	}
 	if req.ShowReleaseNotification != nil {
 		settings.ShowReleaseNotification = *req.ShowReleaseNotification
 	}
+	return nil
+}
+
+func applyUtilityPreferences(settings *models.UserSettings, req *UpdateUserSettingsRequest) {
 	if req.ReleaseNotesLastSeenVersion != nil {
 		settings.ReleaseNotesLastSeenVersion = *req.ReleaseNotesLastSeenVersion
 	}
@@ -233,31 +290,43 @@ func applyBasicSettings(settings *models.UserSettings, req *UpdateUserSettingsRe
 	if req.DefaultUtilityModel != nil {
 		settings.DefaultUtilityModel = strings.TrimSpace(*req.DefaultUtilityModel)
 	}
-	if req.KeyboardShortcuts != nil {
-		if err := validateKeyboardShortcuts(*req.KeyboardShortcuts); err != nil {
-			return err
-		}
-		settings.KeyboardShortcuts = *req.KeyboardShortcuts
+}
+
+func applyKeyboardShortcuts(settings *models.UserSettings, value *map[string]interface{}) error {
+	if value == nil {
+		return nil
 	}
-	if err := applyTerminalLinkBehavior(settings, req.TerminalLinkBehavior); err != nil {
+	if err := validateKeyboardShortcuts(*value); err != nil {
 		return err
 	}
-	if err := applyChangesPanelLayout(settings, req.ChangesPanelLayout); err != nil {
-		return err
+	settings.KeyboardShortcuts = *value
+	return nil
+}
+
+func applySystemMetricsDisplay(settings *models.UserSettings, value *SystemMetricsDisplaySettingsPatch) {
+	if value == nil {
+		return
 	}
-	if req.SystemMetricsDisplay != nil {
-		settings.SystemMetricsDisplay = *req.SystemMetricsDisplay
+	if value.ShowInTopbar != nil {
+		settings.SystemMetricsDisplay.ShowInTopbar = *value.ShowInTopbar
 	}
+	if value.Simplified != nil {
+		settings.SystemMetricsDisplay.Simplified = *value.Simplified
+	}
+}
+
+func applyTerminalFontPreferences(settings *models.UserSettings, req *UpdateUserSettingsRequest) error {
 	if req.TerminalFontFamily != nil {
 		settings.TerminalFontFamily = strings.TrimSpace(*req.TerminalFontFamily)
 	}
-	if req.TerminalFontSize != nil {
-		v := *req.TerminalFontSize
-		if v != 0 && (v < 8 || v > 24) {
-			return errors.New("terminal_font_size must be 0 (default) or between 8 and 24")
-		}
-		settings.TerminalFontSize = v
+	if req.TerminalFontSize == nil {
+		return nil
 	}
+	v := *req.TerminalFontSize
+	if v != 0 && (v < 8 || v > 24) {
+		return errors.New("terminal_font_size must be 0 (default) or between 8 and 24")
+	}
+	settings.TerminalFontSize = v
 	return nil
 }
 
@@ -575,6 +644,7 @@ func (s *Service) publishUserSettingsEvent(ctx context.Context, settings *models
 		"repository_ids":                  settings.RepositoryIDs,
 		"tasks_list_sort":                 settings.TasksListSort,
 		"tasks_list_group":                settings.TasksListGroup,
+		"tasks_list_show_details":         settings.TasksListShowDetails,
 		"initial_setup_complete":          settings.InitialSetupComplete,
 		"preferred_shell":                 settings.PreferredShell,
 		"default_editor_id":               settings.DefaultEditorID,
@@ -583,6 +653,9 @@ func (s *Service) publishUserSettingsEvent(ctx context.Context, settings *models
 		"review_auto_mark_on_scroll":      settings.ReviewAutoMarkOnScroll,
 		"confirm_task_archive":            settings.ConfirmTaskArchive,
 		"mcp_task_agent_profile_default":  models.NormalizeMCPTaskAgentProfileDefault(settings.MCPTaskAgentProfileDefault),
+		"show_anchored_prompt_bar":        settings.ShowAnchoredPromptBar,
+		"show_scroll_to_last_prompt":      settings.ShowScrollToLastPrompt,
+		"show_scroll_to_start":            settings.ShowScrollToStart,
 		"show_release_notification":       settings.ShowReleaseNotification,
 		"release_notes_last_seen_version": settings.ReleaseNotesLastSeenVersion,
 		"lsp_auto_start_languages":        settings.LspAutoStartLanguages,
@@ -607,6 +680,7 @@ func (s *Service) publishUserSettingsEvent(ctx context.Context, settings *models
 		"terminal_font_size":              settings.TerminalFontSize,
 		"changes_panel_layout":            settings.ChangesPanelLayout,
 		"system_metrics_display":          settings.SystemMetricsDisplay,
+		"app_status_bar_order":            settings.AppStatusBarOrder,
 		"voice_mode":                      settings.VoiceMode,
 		"updated_at":                      settings.UpdatedAt.Format(time.RFC3339),
 	}

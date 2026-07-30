@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 
 	agentdto "github.com/kandev/kandev/internal/agent/dto"
 	"github.com/kandev/kandev/internal/agentctl/tracing"
@@ -369,6 +370,98 @@ func (r *Repository) GetTaskSession(ctx context.Context, id string) (*models.Tas
 		`SELECT `+taskSessionSelectCols+` `+taskSessionFromClause+` WHERE ts.id = ?`,
 	), id)
 	return r.scanTaskSession(ctx, row, fmt.Sprintf("agent session not found: %s", id))
+}
+
+// ClaimPromptableTaskSessionIfActive atomically claims a ready session for a
+// prompt while its task is still active. It intentionally performs no agent
+// I/O; callers dispatch only after this bounded database claim commits.
+func (r *Repository) ClaimPromptableTaskSessionIfActive(ctx context.Context, id string) (models.PromptableTaskSessionClaim, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var state models.TaskSessionState
+	var active bool
+	err = tx.QueryRowxContext(ctx, r.db.Rebind(`
+		SELECT ts.state, t.archived_at IS NULL
+		FROM task_sessions ts JOIN tasks t ON t.id = ts.task_id
+		WHERE ts.id = ?
+	`), id).Scan(&state, &active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	if err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	if !active {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	if !isPromptableSessionState(state) {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionBusy}, nil
+	}
+
+	result, err := tx.ExecContext(ctx, r.db.Rebind(`
+		UPDATE task_sessions SET state = ?, completed_at = NULL, updated_at = ?
+		WHERE id = ? AND state = ?
+		  AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = task_sessions.task_id AND tasks.archived_at IS NULL)
+	`), models.TaskSessionStateRunning, time.Now().UTC(), id, state)
+	if err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	if changed == 0 {
+		claim, err := r.classifyPromptableTaskSessionClaim(ctx, tx, id)
+		if err != nil {
+			return models.PromptableTaskSessionClaim{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return models.PromptableTaskSessionClaim{}, err
+		}
+		return claim, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	return models.PromptableTaskSessionClaim{
+		Status: models.PromptableTaskSessionClaimed, PreviousState: state,
+	}, nil
+}
+
+// classifyPromptableTaskSessionClaim distinguishes a concurrent session-state
+// transition from task/session removal after a guarded claim updates no rows.
+// It must run in the claim transaction so the result describes the same
+// ownership window as the failed UPDATE.
+func (r *Repository) classifyPromptableTaskSessionClaim(
+	ctx context.Context, tx *sqlx.Tx, id string,
+) (models.PromptableTaskSessionClaim, error) {
+	var state models.TaskSessionState
+	var active bool
+	err := tx.QueryRowxContext(ctx, r.db.Rebind(`
+		SELECT ts.state, t.archived_at IS NULL
+		FROM task_sessions ts JOIN tasks t ON t.id = ts.task_id
+		WHERE ts.id = ?
+	`), id).Scan(&state, &active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	if err != nil {
+		return models.PromptableTaskSessionClaim{}, err
+	}
+	if !active {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionBusy}, nil
+}
+
+func isPromptableSessionState(state models.TaskSessionState) bool {
+	return state == models.TaskSessionStateWaitingForInput ||
+		state == models.TaskSessionStateIdle ||
+		state == models.TaskSessionStateCompleted
 }
 
 // GetTaskSessionByTaskID retrieves the most recent agent session for a task
@@ -754,22 +847,112 @@ func completedAtForTaskSessionState(status models.TaskSessionState, now time.Tim
 
 // CancelActiveTaskSessionsByTaskID transitions every active session of a task
 // (CREATED/STARTING/RUNNING/WAITING_FOR_INPUT) to CANCELLED, returning the
-// number of rows changed. The transition is a pure DB state change and does not
-// require a live agent execution, making it the authoritative way to finalize a
-// task's sessions independent of agent-process teardown.
-func (r *Repository) CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) (int64, error) {
+// full row of each session actually transitioned. The transition is a pure
+// DB state change and does not require a live agent execution, making it
+// the authoritative way to finalize a task's sessions independent of
+// agent-process teardown.
+//
+// The UPDATE and the row selection happen in a single atomic statement via
+// RETURNING, so the returned rows are exactly what this call changed — a
+// session created or transitioned to active state concurrently, after this
+// statement starts, is simply outside its snapshot; the task_id + state
+// predicate is evaluated once per row as it commits, so no session matching
+// it at commit time is missed by a separate pre-update snapshot. Callers use
+// the returned sessions to publish a matching session.state_changed event
+// per session — without this, clients that cache session state
+// independently of the task (e.g. an Office task list's "is running"
+// indicator) never learn the session left its active state and spin
+// forever after the owning task is archived.
+//
+// The RETURNING clause carries every field publishSessionsCancelled needs
+// to build its event payload directly, so callers never fall back to a
+// separate post-commit read (e.g. GetTaskSession) to assemble the event —
+// closing the read-after-write gap where a session could commit CANCELLED
+// but its event never gets published because that follow-up read failed or
+// timed out. Returned sessions therefore carry only the fields the
+// RETURNING clause selects (ID, TaskID, AgentProfileID,
+// AgentProfileSnapshot, IsPassthrough, Name, ReviewStatus, Metadata,
+// TaskEnvironmentID, State, UpdatedAt) — every other models.TaskSession
+// field is left at its zero value, and callers must not rely on fields
+// outside this list being populated.
+func (r *Repository) CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) ([]*models.TaskSession, error) {
 	now := time.Now().UTC()
-	writeCtx := context.WithoutCancel(ctx)
-	result, err := r.db.ExecContext(writeCtx, r.db.Rebind(`
+	// Detach from ctx via WithoutCancel: this write must survive a client
+	// disconnect (see the doc comment above) so the CANCELLED transition and
+	// its returned rows are never lost to a caller that hung up mid-request.
+	// Bound it with a timeout so a locked SQLite UPDATE can't block forever
+	// on a request-independent DB stall just because the deadline was
+	// dropped.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	rows, err := r.db.QueryContext(writeCtx, r.db.Rebind(`
 		UPDATE task_sessions
 		SET state = ?, error_message = ?, completed_at = ?, updated_at = ?
 		WHERE task_id = ?
 			AND state IN ('CREATED', 'STARTING', 'RUNNING', 'WAITING_FOR_INPUT')
+		RETURNING id, agent_profile_id, agent_profile_snapshot, is_passthrough, name,
+			review_status, metadata, task_environment_id, state, updated_at
 	`), string(models.TaskSessionStateCancelled), reason, now, now, taskID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected()
+	defer func() { _ = rows.Close() }()
+
+	var sessions []*models.TaskSession
+	for rows.Next() {
+		session, err := scanCancelledTaskSessionRow(rows, taskID)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, session)
+	}
+	return sessions, rows.Err()
+}
+
+// scanCancelledTaskSessionRow scans one row produced by
+// CancelActiveTaskSessionsByTaskID's UPDATE ... RETURNING into a
+// *models.TaskSession, mirroring scanTaskSessionRow's JSON-unmarshal and
+// int-to-bool/nullable-string conventions but for the narrower RETURNING
+// column set (id, agent_profile_id, agent_profile_snapshot, is_passthrough,
+// name, review_status, metadata, task_environment_id, state, updated_at).
+// taskID backfills TaskID, which RETURNING cannot supply since it's a query
+// parameter, not a returned column.
+func scanCancelledTaskSessionRow(rows *sql.Rows, taskID string) (*models.TaskSession, error) {
+	session := &models.TaskSession{TaskID: taskID}
+	var state string
+	var metadataJSON string
+	var agentProfileSnapshotJSON string
+	var isPassthrough int
+	var reviewStatus sql.NullString
+	var agentProfileID sql.NullString
+	var name sql.NullString
+
+	if err := rows.Scan(
+		&session.ID, &agentProfileID, &agentProfileSnapshotJSON, &isPassthrough, &name,
+		&reviewStatus, &metadataJSON, &session.TaskEnvironmentID, &state, &session.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+
+	session.State = models.TaskSessionState(state)
+	session.IsPassthrough = isPassthrough == 1
+	if reviewStatus.Valid {
+		session.ReviewStatus = models.ReviewStatus(reviewStatus.String)
+	}
+	if agentProfileID.Valid {
+		session.AgentProfileID = agentProfileID.String
+	}
+	if name.Valid {
+		session.Name = name.String
+	}
+	if err := unmarshalSessionJSON(metadataJSON, &session.Metadata, "agent session metadata"); err != nil {
+		return nil, err
+	}
+	if err := unmarshalSessionJSON(agentProfileSnapshotJSON, &session.AgentProfileSnapshot, "agent profile snapshot"); err != nil {
+		return nil, err
+	}
+
+	return session, nil
 }
 
 // UpdateSessionMetadata updates only the metadata column of a session,
@@ -862,6 +1045,56 @@ func (r *Repository) SetSessionMetadataKeyIfAbsent(
 	return rows > 0, nil
 }
 
+// SetSessionMetadataKeyIfAbsentIfState atomically claims a metadata key only
+// while the session remains in expectedState. It is used when a terminal
+// transition owns a one-time side effect that must not be emitted by a stale
+// launch callback.
+func (r *Repository) SetSessionMetadataKeyIfAbsentIfState(
+	ctx context.Context,
+	sessionID, key string,
+	value interface{},
+	expectedState models.TaskSessionState,
+) (bool, error) {
+	valueJSON, err := json.Marshal(value)
+	if err != nil {
+		return false, fmt.Errorf("failed to serialize metadata value: %w", err)
+	}
+	now := time.Now().UTC()
+	driver := r.db.DriverName()
+	path := key
+	if !dialect.IsPostgres(driver) {
+		path = "$." + key
+	}
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(setSessionMetadataKeyIfAbsentIfStateQuery(driver)), path, string(valueJSON), now, sessionID, path, expectedState)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
+// RemoveSessionMetadataKeyIfState removes a claimed metadata key only while
+// the session remains in expectedState. It releases one-time side-effect
+// claims when their downstream write fails, allowing a later retry.
+func (r *Repository) RemoveSessionMetadataKeyIfState(
+	ctx context.Context,
+	sessionID, key string,
+	expectedState models.TaskSessionState,
+) (bool, error) {
+	now := time.Now().UTC()
+	driver := r.db.DriverName()
+	path := key
+	if !dialect.IsPostgres(driver) {
+		path = "$." + key
+	}
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(removeSessionMetadataKeyIfStateQuery(driver)), path, now, sessionID, path, expectedState)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
 func setSessionMetadataKeyIfAbsentQuery(driver string) string {
 	if dialect.IsPostgres(driver) {
 		return `
@@ -886,6 +1119,37 @@ func setSessionMetadataKeyIfAbsentQuery(driver string) string {
 			updated_at = ?
 		WHERE id = ?
 			AND json_type(CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}' ELSE metadata END, ?) IS NULL
+	`
+}
+
+func setSessionMetadataKeyIfAbsentIfStateQuery(driver string) string {
+	return setSessionMetadataKeyIfAbsentQuery(driver) + " AND state = ?"
+}
+
+func removeSessionMetadataKeyIfStateQuery(driver string) string {
+	if dialect.IsPostgres(driver) {
+		return `
+			UPDATE task_sessions
+			SET metadata = (
+				CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}'::jsonb ELSE metadata::jsonb END
+				#- ARRAY[?]::text[]
+			)::text,
+				updated_at = ?
+			WHERE id = ?
+				AND jsonb_extract_path(
+					CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}'::jsonb ELSE metadata::jsonb END,
+					?
+				) IS NOT NULL
+				AND state = ?
+		`
+	}
+	return `
+		UPDATE task_sessions
+		SET metadata = json_remove(CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}' ELSE metadata END, ?),
+			updated_at = ?
+		WHERE id = ?
+			AND json_type(CASE WHEN metadata IS NULL OR metadata = 'null' OR metadata = '' THEN '{}' ELSE metadata END, ?) IS NOT NULL
+			AND state = ?
 	`
 }
 
@@ -1743,13 +2007,32 @@ func (r *Repository) GetPrimarySessionInfoByTaskIDs(ctx context.Context, taskIDs
 	return result, rows.Err()
 }
 
-// SetSessionPrimary marks a session as primary and clears primary flag on other sessions for the same task
+// SetSessionPrimary marks a session as primary and clears the primary flag
+// on every other session for the same task, atomically. Both writes go
+// through a single transaction so a concurrent caller can't observe (or
+// write) a half-applied state — e.g. two sessions racing on is_primary=1,
+// or a reader seeing zero primary sessions mid-swap.
+//
+// On SQLite the writer pool is a single connection (see
+// internal/db.NewSQLiteDB), so only one transaction can hold it at a time —
+// the transaction alone fully serializes concurrent callers. On Postgres,
+// separate connections could otherwise run two of these transactions truly
+// concurrently, each seeing zero primary sessions and both promoting; to
+// close that window we take an exclusive row lock on the owning task
+// (`SELECT ... FOR UPDATE`) before touching its sessions, so a second
+// concurrent promotion for the same task blocks until the first commits.
 func (r *Repository) SetSessionPrimary(ctx context.Context, sessionID string) error {
 	now := time.Now().UTC()
 
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// First, get the task_id for this session
 	var taskID string
-	err := r.db.QueryRowContext(ctx, r.db.Rebind(`SELECT task_id FROM task_sessions WHERE id = ?`), sessionID).Scan(&taskID)
+	err = tx.QueryRowContext(ctx, r.db.Rebind(`SELECT task_id FROM task_sessions WHERE id = ?`), sessionID).Scan(&taskID)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
@@ -1757,8 +2040,19 @@ func (r *Repository) SetSessionPrimary(ctx context.Context, sessionID string) er
 		return err
 	}
 
+	// Serialize concurrent promotions for the same task across Postgres
+	// connections. SQLite has no FOR UPDATE / row-level locking and doesn't
+	// need it — the single-connection writer pool already serializes here.
+	if dialect.IsPostgres(r.db.DriverName()) {
+		var lockedTaskID string
+		err := tx.QueryRowContext(ctx, r.db.Rebind(`SELECT id FROM tasks WHERE id = ? FOR UPDATE`), taskID).Scan(&lockedTaskID)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+	}
+
 	// Clear primary flag on all sessions for this task
-	_, err = r.db.ExecContext(ctx, r.db.Rebind(`
+	_, err = tx.ExecContext(ctx, r.db.Rebind(`
 		UPDATE task_sessions SET is_primary = 0, updated_at = ? WHERE task_id = ?
 	`), now, taskID)
 	if err != nil {
@@ -1766,7 +2060,7 @@ func (r *Repository) SetSessionPrimary(ctx context.Context, sessionID string) er
 	}
 
 	// Set primary flag on the specified session
-	result, err := r.db.ExecContext(ctx, r.db.Rebind(`
+	result, err := tx.ExecContext(ctx, r.db.Rebind(`
 		UPDATE task_sessions SET is_primary = 1, updated_at = ? WHERE id = ?
 	`), now, sessionID)
 	if err != nil {
@@ -1777,5 +2071,5 @@ func (r *Repository) SetSessionPrimary(ctx context.Context, sessionID string) er
 	if rows == 0 {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	return nil
+	return tx.Commit()
 }

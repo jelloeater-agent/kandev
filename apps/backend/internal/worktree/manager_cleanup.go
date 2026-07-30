@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -47,7 +48,7 @@ func (m *Manager) pruneQuarantinedWorktree(ctx context.Context, wt *Worktree) er
 		m.releaseRepoLock(wt.RepositoryPath)
 	}()
 
-	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", "--force", wt.Path)
+	cmd := newGitCommand(ctx, "worktree", "remove", "--force", wt.Path)
 	cmd.Dir = wt.RepositoryPath
 	if _, err := runGitCmdCombinedOutput(ctx, cmd); err != nil {
 		present, inspectErr := worktreeRegistrationExists(ctx, wt.RepositoryPath, wt.Path)
@@ -62,7 +63,7 @@ func (m *Manager) pruneQuarantinedWorktree(ctx context.Context, wt *Worktree) er
 }
 
 func worktreeRegistrationExists(ctx context.Context, repoPath, worktreePath string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain", "-z")
+	cmd := newGitCommand(ctx, "worktree", "list", "--porcelain", "-z")
 	cmd.Dir = repoPath
 	output, err := runGitCmdCombinedOutput(ctx, cmd)
 	if err != nil {
@@ -75,6 +76,90 @@ func worktreeRegistrationExists(ctx context.Context, repoPath, worktreePath stri
 		}
 	}
 	return false, nil
+}
+
+type worktreeRegistrationOwnership uint8
+
+const (
+	worktreeRegistrationAbsent worktreeRegistrationOwnership = iota
+	worktreeRegistrationOwned
+	worktreeRegistrationCompeting
+)
+
+type worktreeRegistration struct {
+	path   string
+	head   string
+	branch string
+}
+
+func inspectWorktreeRegistrationOwnership(
+	ctx context.Context, repoPath, worktreePath, branchRef, headOID string,
+) (worktreeRegistrationOwnership, error) {
+	cmd := newGitCommand(ctx, "worktree", "list", "--porcelain", "-z")
+	cmd.Dir = repoPath
+	output, err := runGitCmdCombinedOutput(ctx, cmd)
+	if err != nil {
+		return worktreeRegistrationAbsent, err
+	}
+	wantPath, err := normalizedWorktreeTargetPath(worktreePath)
+	if err != nil {
+		return worktreeRegistrationAbsent, err
+	}
+	return classifyWorktreeRegistrationOwnership(
+		parseWorktreeRegistrations(string(output)), wantPath, branchRef, headOID,
+	)
+}
+
+func parseWorktreeRegistrations(output string) []worktreeRegistration {
+	var registrations []worktreeRegistration
+	current := -1
+	for _, field := range strings.Split(output, "\x00") {
+		switch {
+		case strings.HasPrefix(field, "worktree "):
+			registrations = append(registrations, worktreeRegistration{
+				path: strings.TrimPrefix(field, "worktree "),
+			})
+			current = len(registrations) - 1
+		case current >= 0 && strings.HasPrefix(field, "HEAD "):
+			registrations[current].head = strings.TrimPrefix(field, "HEAD ")
+		case current >= 0 && strings.HasPrefix(field, "branch "):
+			registrations[current].branch = strings.TrimPrefix(field, "branch ")
+		}
+	}
+	return registrations
+}
+
+func classifyWorktreeRegistrationOwnership(
+	registrations []worktreeRegistration, wantPath, branchRef, headOID string,
+) (worktreeRegistrationOwnership, error) {
+	var exactTarget, branchElsewhere, targetClaimed bool
+	for _, registration := range registrations {
+		if registration.path == "" {
+			continue
+		}
+		currentPath, err := normalizedWorktreeTargetPath(registration.path)
+		if err != nil {
+			return worktreeRegistrationAbsent, err
+		}
+		if currentPath != wantPath {
+			if registration.branch == branchRef {
+				branchElsewhere = true
+			}
+			continue
+		}
+		if registration.branch == branchRef && registration.head == headOID {
+			exactTarget = true
+			continue
+		}
+		targetClaimed = true
+	}
+	if exactTarget && !branchElsewhere && !targetClaimed {
+		return worktreeRegistrationOwned, nil
+	}
+	if branchElsewhere || targetClaimed {
+		return worktreeRegistrationCompeting, nil
+	}
+	return worktreeRegistrationAbsent, nil
 }
 
 // RemoveByID removes a specific worktree by its ID and optionally its branch.
@@ -126,7 +211,7 @@ func (m *Manager) removeWorktree(ctx context.Context, wt *Worktree, removeBranch
 			zap.String("branch", wt.Branch),
 			zap.String("repository_path", wt.RepositoryPath))
 
-		cmd := exec.CommandContext(ctx, "git", "branch", "-D", wt.Branch)
+		cmd := newGitCommand(ctx, "branch", "-D", wt.Branch)
 		cmd.Dir = wt.RepositoryPath
 		if output, err := runGitCmdCombinedOutput(ctx, cmd); err != nil {
 			m.logger.Warn("failed to delete branch from main repository",
@@ -193,7 +278,7 @@ func (m *Manager) ReleaseWorktreeReference(ctx context.Context, wt *Worktree) er
 // and the failure is recorded on wt as a warning (surfaced by the env preparer)
 // so the agent can still launch. This mirrors the task-level setup script
 // behavior in runSetupScriptStep — a broken setup script must not block the task.
-func (m *Manager) runWorktreeSetupScript(ctx context.Context, wt *Worktree) {
+func (m *Manager) runWorktreeSetupScript(ctx context.Context, wt *Worktree, profileEnv map[string]string) {
 	if m.scriptMsgHandler == nil || m.repoProvider == nil {
 		return
 	}
@@ -222,7 +307,7 @@ func (m *Manager) runWorktreeSetupScript(ctx context.Context, wt *Worktree) {
 		Script:       repo.SetupScript,
 		WorkingDir:   wt.Path,
 		ScriptType:   "setup",
-		Env:          m.managedScriptEnvironment(ctx),
+		Env:          mergeScriptEnv(profileEnv, m.managedScriptEnvironment(ctx)),
 	}
 	if err := m.scriptMsgHandler.ExecuteSetupScript(ctx, scriptReq); err != nil {
 		// Non-fatal: keep the worktree and surface a warning. The detailed
@@ -273,6 +358,25 @@ func (m *Manager) runWorktreeCleanupScript(ctx context.Context, wt *Worktree) {
 		m.logger.Info("cleanup script completed successfully",
 			zap.String("worktree_id", wt.ID))
 	}
+}
+
+// mergeScriptEnv combines resolved executor-profile env vars with the
+// install-managed script environment. Managed values (e.g. GOCACHE) take
+// precedence so the managed build cache is never clobbered by a profile entry.
+// Returns nil when both inputs are empty so callers preserve the "inherit the
+// full process environment" behavior of scriptProcessEnvironment(nil).
+func mergeScriptEnv(profileEnv, managed map[string]string) map[string]string {
+	if len(profileEnv) == 0 && len(managed) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(profileEnv))
+	for k, v := range profileEnv {
+		merged[k] = v
+	}
+	for k, v := range managed {
+		merged[k] = v
+	}
+	return merged
 }
 
 func (m *Manager) managedScriptEnvironment(ctx context.Context) map[string]string {
@@ -343,10 +447,10 @@ func (m *Manager) OnTaskDeleted(ctx context.Context, taskID string) error {
 // still has siblings or contains workspace-scoped content.
 func (m *Manager) removeWorktreeDir(ctx context.Context, worktreePath, repoPath string) error {
 	// First try git worktree remove
-	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", "--force", worktreePath)
+	cmd := newGitCommand(ctx, "worktree", "remove", "--force", worktreePath)
 	cmd.Dir = repoPath
 	if output, err := runGitCmdCombinedOutput(ctx, cmd); err != nil {
-		m.logger.Debug("git worktree remove failed, falling back to rm",
+		m.logger.Debug("git worktree remove failed, falling back to filesystem removal",
 			zap.String("output", string(output)),
 			zap.Error(err))
 
@@ -355,7 +459,7 @@ func (m *Manager) removeWorktreeDir(ctx context.Context, worktreePath, repoPath 
 		}
 
 		// Prune stale worktree entries
-		pruneCmd := exec.CommandContext(ctx, "git", "worktree", "prune")
+		pruneCmd := newGitCommand(ctx, "worktree", "prune")
 		pruneCmd.Dir = repoPath
 		if err := runGitCmd(ctx, pruneCmd); err != nil {
 			m.logger.Debug("git worktree prune failed", zap.Error(err))
@@ -397,32 +501,87 @@ func (m *Manager) tryRemoveEmptyTaskDir(worktreePath string) {
 	}
 }
 
-// forceRemoveDir removes a directory, retrying on transient failures.
-// On macOS, os.RemoveAll can fail with "directory not empty" when files
-// have special attributes or were recently released by other processes
-// (e.g. .next/dev build cache). Falls back to rm -rf as a last resort.
+// forceRemoveDir removes a directory, retrying transient filesystem failures.
+// Native Windows cleanup intentionally stays within Go's portable filesystem
+// APIs. Unix hosts get a final non-shell rm fallback for persistent removal
+// failures caused by filesystems that reject os.RemoveAll while allowing rm.
 func (m *Manager) forceRemoveDir(ctx context.Context, dir string) error {
 	const maxRetries = 3
 	const retryDelay = 200 * time.Millisecond
+	return m.removeDirWithRetriesAndFallback(
+		ctx, dir, maxRetries, retryDelay, os.RemoveAll, forceRemoveDirUnix, isUnixLikeOS(runtime.GOOS),
+	)
+}
+
+func (m *Manager) removeDirWithRetries(
+	ctx context.Context, dir string, maxRetries int, retryDelay time.Duration, removeAll func(string) error,
+) error {
+	var lastErr error
 
 	for i := range maxRetries {
-		err := os.RemoveAll(dir)
-		if err == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = removeAll(dir)
+		if lastErr == nil {
 			return nil
 		}
 		if i < maxRetries-1 {
 			m.logger.Debug("os.RemoveAll failed, retrying",
 				zap.String("path", dir),
 				zap.Int("attempt", i+1),
-				zap.Error(err))
-			time.Sleep(retryDelay)
+				zap.Error(lastErr))
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return err
+			}
 		}
 	}
+	return fmt.Errorf("remove directory %s after %d attempts: %w", dir, maxRetries, lastErr)
+}
 
-	// Last resort: shell out to rm -rf which handles macOS edge cases better
-	cmd := exec.CommandContext(ctx, "rm", "-rf", dir)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("rm -rf failed: %w (output: %s)", err, string(output))
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) removeDirWithRetriesAndFallback(
+	ctx context.Context, dir string, maxRetries int, retryDelay time.Duration,
+	removeAll func(string) error, fallback func(context.Context, string) error,
+	useFallback bool,
+) error {
+	err := m.removeDirWithRetries(ctx, dir, maxRetries, retryDelay, removeAll)
+	if err == nil || !useFallback || ctx.Err() != nil {
+		return err
+	}
+	if fallbackErr := fallback(ctx, dir); fallbackErr != nil {
+		return fmt.Errorf("remove directory %s with Unix fallback: %w", dir, errors.Join(err, fallbackErr))
 	}
 	return nil
+}
+
+func forceRemoveDirUnix(ctx context.Context, dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("refusing to remove an empty directory path")
+	}
+	cmd := exec.CommandContext(ctx, "rm", "-rf", "--", dir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("rm -rf -- %q: %w: %s", dir, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func isUnixLikeOS(goos string) bool {
+	switch goos {
+	case "aix", "android", "darwin", "dragonfly", "freebsd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris":
+		return true
+	default:
+		return false
+	}
 }

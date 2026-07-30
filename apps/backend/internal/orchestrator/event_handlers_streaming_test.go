@@ -147,6 +147,25 @@ type serviceBackedMessageCreator struct {
 	svc *taskservice.Service
 }
 
+func (m *serviceBackedMessageCreator) CreateSessionMessage(
+	ctx context.Context,
+	taskID, content, sessionID, messageType, turnID string,
+	metadata map[string]interface{},
+	requestsInput bool,
+) error {
+	_, err := m.svc.CreateMessage(ctx, &taskservice.CreateMessageRequest{
+		TaskSessionID: sessionID,
+		TaskID:        taskID,
+		TurnID:        turnID,
+		Content:       content,
+		AuthorType:    "agent",
+		Type:          messageType,
+		Metadata:      metadata,
+		RequestsInput: requestsInput,
+	})
+	return err
+}
+
 func (m *serviceBackedMessageCreator) UpdateToolCallMessage(
 	ctx context.Context,
 	taskID, toolCallID, parentToolCallID, status, result, agentSessionID, title, turnID, msgType string,
@@ -252,6 +271,34 @@ func TestUpdateTaskSessionStatePublishesPersistedUpdatedAt(t *testing.T) {
 	require.Equal(t, session.UpdatedAt.UTC().Format(time.RFC3339Nano), data["updated_at"])
 }
 
+func TestUpdateTaskSessionState_EnabledClaudePublishesSettledBackground(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "task-state-claude", "session-state-claude", "step1")
+	eb := &recordingEventBus{}
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+	enableClaudeBackgroundPromptHandoffForTest(t, svc)
+	setSessionAgentNameForTest(t, svc, "session-state-claude", "claude-acp")
+	svc.eventBus = eb
+	svc.registerBackgroundTask("session-state-claude", "background-1")
+	svc.markForegroundIdle("session-state-claude")
+
+	svc.updateTaskSessionState(
+		ctx,
+		"task-state-claude",
+		"session-state-claude",
+		models.TaskSessionStateWaitingForInput,
+		"",
+		false,
+	)
+
+	require.Len(t, eb.events, 1)
+	require.Equal(t, events.TaskSessionStateChanged, eb.events[0].subject)
+	data, ok := eb.events[0].event.Data.(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, string(v1.ForegroundActivityBackground), data["foreground_activity"])
+}
+
 func TestTransitionTaskSessionStateReportsAcceptedWrite(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
@@ -266,6 +313,7 @@ func TestTransitionTaskSessionStateReportsAcceptedWrite(t *testing.T) {
 		"s1",
 		models.TaskSessionStateCancelled,
 		"coordinator stop",
+		nil,
 	)
 
 	require.NoError(t, err)
@@ -291,6 +339,7 @@ func TestTransitionTaskSessionStateReportsPersistenceFailure(t *testing.T) {
 		"s1",
 		models.TaskSessionStateCancelled,
 		"coordinator stop",
+		nil,
 	)
 
 	require.ErrorIs(t, err, writeFailure)
@@ -825,6 +874,72 @@ func TestStatuslessToolUpdateDoesNotCreateTurn(t *testing.T) {
 	require.Zero(t, openTurnCount(t, repo, "session1"))
 }
 
+func TestResumedSessionStatusDoesNotCreateTurnForWaitingSession(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "task1", "session1", "step1")
+
+	session, err := repo.GetTaskSession(ctx, "session1")
+	require.NoError(t, err)
+	session.State = models.TaskSessionStateWaitingForInput
+	require.NoError(t, repo.UpdateTaskSession(ctx, session))
+
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+	svc.turnService = &repoTurnService{repo: repo}
+	svc.messageCreator = newServiceBackedMessageCreator(repo)
+
+	svc.handleSessionStatusEvent(ctx, &lifecycle.AgentStreamEventPayload{
+		TaskID:    "task1",
+		SessionID: "session1",
+		Data: &lifecycle.AgentStreamEventData{
+			Type:          "session_status",
+			SessionStatus: streams.SessionStatusResumed,
+		},
+	})
+
+	require.Zero(t, openTurnCount(t, repo, "session1"),
+		"resume status metadata must not create a phantom active turn")
+	messages, err := repo.ListMessages(ctx, "session1")
+	require.NoError(t, err)
+	require.Empty(t, messages, "resume status without an active turn must not create a message")
+}
+
+func TestResumedSessionStatusUsesExistingActiveTurn(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "task1", "session1", "step1")
+
+	now := time.Now().UTC()
+	require.NoError(t, repo.CreateTurn(ctx, &models.Turn{
+		ID:            "turn1",
+		TaskSessionID: "session1",
+		TaskID:        "task1",
+		StartedAt:     now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}))
+
+	svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+	svc.turnService = &repoTurnService{repo: repo}
+	svc.messageCreator = newServiceBackedMessageCreator(repo)
+
+	svc.handleSessionStatusEvent(ctx, &lifecycle.AgentStreamEventPayload{
+		TaskID:    "task1",
+		SessionID: "session1",
+		Data: &lifecycle.AgentStreamEventData{
+			Type:          "session_status",
+			SessionStatus: streams.SessionStatusResumed,
+		},
+	})
+
+	require.Equal(t, 1, openTurnCount(t, repo, "session1"))
+	messages, err := repo.ListMessages(ctx, "session1")
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, "turn1", messages[0].TurnID)
+	require.Equal(t, "Session resumed", messages[0].Content)
+}
+
 func TestToolUpdateFromCompletedExecutionDoesNotCreateMessage(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
@@ -919,6 +1034,10 @@ func TestCompleteStreamFromCompletedExecutionFlushesAgentText(t *testing.T) {
 	firstTurn, err := svc.turnService.StartTurn(ctx, "s1")
 	require.NoError(t, err)
 	svc.markExecutionCompleted("s1", "exec-1")
+	// StopExecution can emit agent.stopped after agent.completed but before this
+	// buffered terminal stream. The stopped marker must not downgrade permission
+	// to flush the successful execution's final text and metadata.
+	svc.markExecutionFailed("s1", "exec-1")
 	svc.completeTurnForSession(ctx, "s1")
 	nextTurn, err := svc.turnService.StartTurn(ctx, "s1")
 	require.NoError(t, err)
@@ -1507,6 +1626,89 @@ func TestWriteTaskReviewStateOnCancelSkipsWhenSessionListFails(t *testing.T) {
 		"cancel REVIEW writes must fail closed when sibling session reconciliation fails")
 }
 
+func TestRuntimeStateOwnershipUsesCanonicalOfficeProjection(t *testing.T) {
+	tests := []struct {
+		name           string
+		isFromOffice   bool
+		assignee       string
+		wantReview     bool
+		wantInProgress bool
+	}{
+		{name: "unassigned Office task", isFromOffice: true},
+		{name: "assigned Kanban task", assignee: "assigned-agent", wantReview: true, wantInProgress: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedSession(t, repo, "t1", "s1", "")
+			session, err := repo.GetTaskSession(ctx, "s1")
+			require.NoError(t, err)
+			session.State = models.TaskSessionStateWaitingForInput
+			require.NoError(t, repo.UpdateTaskSession(ctx, session))
+
+			taskRepo := newMockTaskRepo()
+			seedMockTaskState(taskRepo, "t1", v1.TaskStateInProgress)
+			svc := createTestService(repo, newMockStepGetter(), taskRepo)
+			svc.repo = ownershipOverrideRepo{
+				sessionExecutorStore: repo,
+				tasks: map[string]*models.Task{"t1": {
+					ID: "t1", IsFromOffice: tt.isFromOffice, AssigneeAgentProfileID: tt.assignee,
+				}},
+			}
+
+			svc.writeTaskReviewState(ctx, "t1", "s1")
+			reviewWritten := taskRepo.updatedStates["t1"] == v1.TaskStateReview
+			require.Equal(t, tt.wantReview, reviewWritten)
+
+			taskRepo.updatedStates = make(map[string]v1.TaskState)
+			require.NoError(t, repo.UpdateTaskSessionState(ctx, "s1", models.TaskSessionStateStarting, ""))
+			require.NoError(t, svc.reconcileTaskStateForRuntime(ctx, "t1", "s1", v1.TaskStateInProgress))
+			inProgressWritten := taskRepo.updatedStates["t1"] == v1.TaskStateInProgress
+			require.Equal(t, tt.wantInProgress, inProgressWritten)
+		})
+	}
+}
+
+func TestCancelStateOwnershipUsesCanonicalOfficeProjection(t *testing.T) {
+	tests := []struct {
+		name         string
+		isFromOffice bool
+		assignee     string
+		wantReview   bool
+	}{
+		{name: "unassigned Office task", isFromOffice: true},
+		{name: "assigned Kanban task", assignee: "assigned-agent", wantReview: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedSession(t, repo, "t1", "s1", "")
+			session, err := repo.GetTaskSession(ctx, "s1")
+			require.NoError(t, err)
+			session.State = models.TaskSessionStateWaitingForInput
+			require.NoError(t, repo.UpdateTaskSession(ctx, session))
+
+			taskRepo := newMockTaskRepo()
+			seedMockTaskState(taskRepo, "t1", v1.TaskStateInProgress)
+			svc := createTestService(repo, newMockStepGetter(), taskRepo)
+			svc.repo = ownershipOverrideRepo{
+				sessionExecutorStore: repo,
+				tasks: map[string]*models.Task{"t1": {
+					ID: "t1", IsFromOffice: tt.isFromOffice, AssigneeAgentProfileID: tt.assignee,
+				}},
+			}
+
+			svc.writeTaskReviewStateOnCancel(ctx, "t1", "s1")
+			reviewWritten := taskRepo.updatedStates["t1"] == v1.TaskStateReview
+			require.Equal(t, tt.wantReview, reviewWritten)
+		})
+	}
+}
+
 func TestToolUpdateFromFailedExecutionDoesNotCreateMessage(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
@@ -1566,6 +1768,35 @@ func TestCompletedExecutionMarkerExpiresAndDeletes(t *testing.T) {
 	svc.deleteCompletedExecutionIfExpired(currentKey, laterExpiry)
 	_, ok = svc.completedExecutions.Load(currentKey)
 	require.False(t, ok, "matching expiry callback should delete the marker")
+}
+
+func TestTerminalExecutionMarker_CompletionPermissionIsMonotonic(t *testing.T) {
+	svc := &Service{}
+	const sessionID, executionID = "session-terminal-race", "execution-terminal-race"
+	key := terminalExecutionKey(sessionID, executionID)
+
+	for range 25 {
+		svc.completedExecutions.Delete(key)
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			svc.markExecutionCompleted(sessionID, executionID)
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			svc.markExecutionFailed(sessionID, executionID)
+		}()
+		close(start)
+		wait.Wait()
+
+		marker, ok := svc.terminalCompleteStreamMarker(sessionID, executionID)
+		require.True(t, ok, "concurrent stopped marker downgraded successful completion")
+		require.True(t, marker.allowCompleteStream)
+	}
 }
 
 // TestSetSessionRunning_NoRedundantTaskWrites locks in the dedup: when the
@@ -1655,7 +1886,9 @@ func TestSetSessionStartingWritesTaskInProgress(t *testing.T) {
 	taskRepo := newMockTaskRepo()
 	svc := createTestService(repo, newMockStepGetter(), taskRepo)
 
-	require.NoError(t, svc.setSessionStarting(ctx, "t1", session, true))
+	require.NoError(t, svc.setSessionStarting(
+		ctx, "t1", session, models.TaskSessionStateRunning, true,
+	))
 
 	updated, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
@@ -1678,7 +1911,9 @@ func TestSetSessionStartingCanDeferTaskInProgress(t *testing.T) {
 	taskRepo := newMockTaskRepo()
 	svc := createTestService(repo, newMockStepGetter(), taskRepo)
 
-	require.NoError(t, svc.setSessionStarting(ctx, "t1", session, false))
+	require.NoError(t, svc.setSessionStarting(
+		ctx, "t1", session, models.TaskSessionStateRunning, false,
+	))
 
 	updated, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
@@ -1704,7 +1939,9 @@ func TestSetSessionStartingRejectsTerminalSession(t *testing.T) {
 	taskRepo := newMockTaskRepo()
 	svc := createTestService(repo, newMockStepGetter(), taskRepo)
 
-	require.Error(t, svc.setSessionStarting(ctx, "t1", &next, true))
+	require.Error(t, svc.setSessionStarting(
+		ctx, "t1", &next, models.TaskSessionStateCancelled, true,
+	))
 
 	updated, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
@@ -1712,7 +1949,7 @@ func TestSetSessionStartingRejectsTerminalSession(t *testing.T) {
 	require.Empty(t, taskRepo.stateWrites)
 }
 
-func TestSetSessionStartingRejectsCancelledTerminalResumeWithoutPromotion(t *testing.T) {
+func TestSetSessionStartingAllowsExplicitlyCancelledResumeWithoutPromotion(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
 	seedSession(t, repo, "t1", "s1", "step1")
@@ -1720,6 +1957,7 @@ func TestSetSessionStartingRejectsCancelledTerminalResumeWithoutPromotion(t *tes
 	current, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
 	current.State = models.TaskSessionStateCancelled
+	current.ErrorMessage = "stopped via API"
 	require.NoError(t, repo.UpdateTaskSession(ctx, current))
 
 	next := *current
@@ -1730,7 +1968,37 @@ func TestSetSessionStartingRejectsCancelledTerminalResumeWithoutPromotion(t *tes
 	taskRepo := newMockTaskRepo()
 	svc := createTestService(repo, newMockStepGetter(), taskRepo)
 
-	require.Error(t, svc.setSessionStarting(ctx, "t1", &next, false))
+	require.NoError(t, svc.setSessionStarting(
+		ctx, "t1", &next, models.TaskSessionStateCancelled, false,
+	))
+
+	updated, err := repo.GetTaskSession(ctx, "s1")
+	require.NoError(t, err)
+	require.Equal(t, models.TaskSessionStateStarting, updated.State)
+	require.Empty(t, taskRepo.stateWrites)
+}
+
+func TestSetSessionStartingRejectsCancellationAfterResumeSnapshot(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+
+	stale, err := repo.GetTaskSession(ctx, "s1")
+	require.NoError(t, err)
+	stale.State = models.TaskSessionStateStarting
+
+	current, err := repo.GetTaskSession(ctx, "s1")
+	require.NoError(t, err)
+	current.State = models.TaskSessionStateCancelled
+	current.ErrorMessage = "stopped via API"
+	require.NoError(t, repo.UpdateTaskSession(ctx, current))
+
+	taskRepo := newMockTaskRepo()
+	svc := createTestService(repo, newMockStepGetter(), taskRepo)
+
+	require.Error(t, svc.setSessionStarting(
+		ctx, "t1", stale, models.TaskSessionStateRunning, false,
+	))
 
 	updated, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
@@ -1760,13 +2028,54 @@ func TestSetSessionStartingAllowsTerminalResumeWithoutTaskPromotion(t *testing.T
 	taskRepo := newMockTaskRepo()
 	svc := createTestService(repo, newMockStepGetter(), taskRepo)
 
-	require.NoError(t, svc.setSessionStarting(ctx, "t1", &next, false))
+	require.NoError(t, svc.setSessionStarting(
+		ctx, "t1", &next, models.TaskSessionStateFailed, false,
+	))
 
 	updated, err := repo.GetTaskSession(ctx, "s1")
 	require.NoError(t, err)
 	require.Equal(t, models.TaskSessionStateStarting, updated.State)
 	require.Nil(t, updated.CompletedAt)
 	require.Empty(t, taskRepo.stateWrites)
+}
+
+// TestSetSessionStartingAllowsArchiveCancelledResumeWithoutPromotion covers
+// sessions cancelled by an archive (Service.ArchiveTask or the cascade
+// archive path), which carry a distinct ErrorMessage; unlike an explicit
+// user/coordinator stop, these must recover into STARTING like a Failed
+// session so Resume works normally once the task is unarchived (bug:
+// "Can't resume this un-archived task").
+func TestSetSessionStartingAllowsArchiveCancelledResumeWithoutPromotion(t *testing.T) {
+	for _, reason := range []string{models.SessionArchiveCancelReason, models.SessionArchiveTreeCancelReason} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedSession(t, repo, "t1", "s1", "step1")
+
+			current, err := repo.GetTaskSession(ctx, "s1")
+			require.NoError(t, err)
+			current.State = models.TaskSessionStateCancelled
+			current.ErrorMessage = reason
+			require.NoError(t, repo.UpdateTaskSession(ctx, current))
+
+			next := *current
+			next.State = models.TaskSessionStateStarting
+			next.ErrorMessage = ""
+			next.UpdatedAt = time.Now().UTC()
+
+			taskRepo := newMockTaskRepo()
+			svc := createTestService(repo, newMockStepGetter(), taskRepo)
+
+			require.NoError(t, svc.setSessionStarting(
+				ctx, "t1", &next, models.TaskSessionStateCancelled, false,
+			))
+
+			updated, err := repo.GetTaskSession(ctx, "s1")
+			require.NoError(t, err)
+			require.Equal(t, models.TaskSessionStateStarting, updated.State)
+			require.Empty(t, taskRepo.stateWrites)
+		})
+	}
 }
 
 // Pins the call-site wiring: cancelled office turn must NOT leave the session at IDLE.

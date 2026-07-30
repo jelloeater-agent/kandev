@@ -19,9 +19,7 @@ import {
   useAgentProfileAutopickEffect,
   useWorkflowAgentProfileEffect,
 } from "@/components/task-create-dialog-autopick";
-import { useMultiRepoGuardEffect } from "@/components/task-create-dialog-multi-repo-guard";
 import { useRepositoryAutoSelectEffect } from "@/components/task-create-dialog-repository-autopick";
-import { computeSelectedRepoCount } from "@/components/task-create-dialog-computed";
 import { createDebugLogger, isDebug } from "@/lib/debug/log";
 
 // Re-export autopick hooks for callers that imported them from this module.
@@ -32,19 +30,33 @@ export { decideAgentProfileAutopick } from "@/components/task-create-dialog-auto
 
 const selectionDebug = createDebugLogger("task-create:selection");
 
-export function useWorkflowStepsEffect(fs: DialogFormState, workflowId: string | null) {
-  const { selectedWorkflowId, setFetchedSteps } = fs;
+export function useWorkflowStepsEffect(
+  fs: DialogFormState,
+  open: boolean,
+  workflowId: string | null,
+  effectiveWorkflowId: string | null,
+) {
+  const { setFetchedSteps } = fs;
   useEffect(() => {
-    if (!selectedWorkflowId || selectedWorkflowId === workflowId) {
-      void Promise.resolve().then(() => setFetchedSteps(null));
+    void Promise.resolve().then(() => setFetchedSteps(null));
+    if (!open || !effectiveWorkflowId || effectiveWorkflowId === workflowId) {
       return;
     }
     let cancelled = false;
-    listWorkflowSteps(selectedWorkflowId)
+    listWorkflowSteps(effectiveWorkflowId)
       .then((response) => {
         if (cancelled) return;
         const sorted = [...response.steps].sort((a, b) => a.position - b.position);
-        setFetchedSteps(sorted.map((s) => ({ id: s.id, title: s.name, events: s.events })));
+        setFetchedSteps(
+          sorted.map((s) => ({
+            id: s.id,
+            title: s.name,
+            workflowId: effectiveWorkflowId,
+            position: s.position,
+            is_start_step: s.is_start_step,
+            events: s.events,
+          })),
+        );
       })
       .catch(() => {
         if (!cancelled) setFetchedSteps(null);
@@ -52,7 +64,7 @@ export function useWorkflowStepsEffect(fs: DialogFormState, workflowId: string |
     return () => {
       cancelled = true;
     };
-  }, [selectedWorkflowId, workflowId, setFetchedSteps]);
+  }, [effectiveWorkflowId, open, workflowId, setFetchedSteps]);
 }
 
 export function useDiscoverReposEffect(
@@ -447,7 +459,6 @@ export function useDefaultSelectionsEffect(
     noRepository,
     useRemote,
     repositories,
-    remoteRepos,
   } = fs;
   const preferLocalExecutor =
     !noRepository && !useRemote && repositories.some((row) => Boolean(row.localPath));
@@ -500,25 +511,6 @@ export function useDefaultSelectionsEffect(
       }
     }
   }, [executorProfileId, executors, setExecutorId]);
-
-  const selectedRepoCount = useMemo(
-    () =>
-      computeSelectedRepoCount({
-        noRepository,
-        useRemote,
-        remoteRepos,
-        repositories,
-      } as DialogFormState),
-    [noRepository, useRemote, remoteRepos, repositories],
-  );
-  useMultiRepoGuardEffect({
-    open,
-    executorProfileId,
-    setExecutorProfileId,
-    executors,
-    selectedRepoCount,
-    lastUsedExecutorProfileId: sel.lastUsedExecutorProfileId ?? null,
-  });
 }
 
 /**
@@ -558,7 +550,8 @@ export function useGitHubUrlErrorEffect(fs: DialogFormState, open: boolean) {
 }
 
 export function useTaskCreateDialogEffects(fs: DialogFormState, args: TaskCreateEffectsArgs) {
-  const { open, workspaceId, workflowId, repositories, repositoriesLoading } = args;
+  const { open, workspaceId, workflowId, effectiveWorkflowId, repositories, repositoriesLoading } =
+    args;
   const {
     agentProfiles,
     compatibleAgentProfiles,
@@ -569,7 +562,7 @@ export function useTaskCreateDialogEffects(fs: DialogFormState, args: TaskCreate
     workflows,
     isLocalExecutor,
   } = args;
-  useWorkflowStepsEffect(fs, workflowId);
+  useWorkflowStepsEffect(fs, open, workflowId, effectiveWorkflowId);
   useWorkflowAgentProfileEffect(fs, workflows, agentProfiles, compatibleAgentProfiles, {
     lastUsedAgentProfileId: args.lastUsedAgentProfileId,
     authLoaded,

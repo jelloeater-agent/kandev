@@ -16,6 +16,7 @@ type memoryRepository struct {
 	entries      map[string][]*QueuedMessage // sessionID -> ordered list (head = index 0)
 	nextPosition map[string]int64            // sessionID -> monotonic counter
 	pendingMoves map[string]*PendingMove
+	generation   map[string]int64
 }
 
 // NewMemoryRepository returns an in-memory Repository. Suitable for tests.
@@ -24,13 +25,69 @@ func NewMemoryRepository() Repository {
 		entries:      make(map[string][]*QueuedMessage),
 		nextPosition: make(map[string]int64),
 		pendingMoves: make(map[string]*PendingMove),
+		generation:   make(map[string]int64),
 	}
+}
+
+func (r *memoryRepository) LifecycleGeneration(_ context.Context, taskID string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generation[taskID], nil
+}
+
+func (r *memoryRepository) PurgeTask(_ context.Context, taskID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := 0
+	for sessionID, list := range r.entries {
+		kept := list[:0]
+		for _, msg := range list {
+			if msg.TaskID == taskID {
+				removed++
+				continue
+			}
+			kept = append(kept, msg)
+		}
+		if len(kept) == 0 {
+			delete(r.entries, sessionID)
+			delete(r.nextPosition, sessionID)
+			continue
+		}
+		r.entries[sessionID] = kept
+	}
+	r.generation[taskID]++
+	return removed, nil
 }
 
 func (r *memoryRepository) Insert(_ context.Context, msg *QueuedMessage, maxPerSession int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.insertLocked(msg, maxPerSession)
+}
+
+func (r *memoryRepository) Restore(_ context.Context, msg *QueuedMessage, maxPerSession int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	list := r.entries[msg.SessionID]
+	if maxPerSession > 0 && len(list) >= maxPerSession {
+		return ErrQueueFull
+	}
+	if msg.ID == "" {
+		msg.ID = uuid.New().String()
+	}
+	if msg.QueuedAt.IsZero() {
+		msg.QueuedAt = time.Now().UTC()
+	}
+	clone := *msg
+	index := sort.Search(len(list), func(i int) bool { return list[i].Position > clone.Position })
+	list = append(list, nil)
+	copy(list[index+1:], list[index:])
+	list[index] = &clone
+	r.entries[msg.SessionID] = list
+	if clone.Position > r.nextPosition[msg.SessionID] {
+		r.nextPosition[msg.SessionID] = clone.Position
+	}
+	return nil
 }
 
 // insertLocked performs the actual insert. Caller must already hold r.mu.
@@ -119,6 +176,41 @@ func (r *memoryRepository) InsertOrReplaceByCoalesceKey(_ context.Context, msg *
 	return msg, false, nil
 }
 
+// The memory queue has no task store. Tests which need an archive race wrap
+// this method with their deterministic active-task guard.
+func (r *memoryRepository) InsertOrReplaceLifecycleByCoalesceKey(ctx context.Context, msg *QueuedMessage, coalesceKey string, maxPerSession int, allowInsert bool) (*QueuedMessage, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	expected, ok := lifecycleGenerationFromMetadata(msg.Metadata)
+	if !ok || expected != r.generation[msg.TaskID] {
+		return nil, false, ErrLifecycleCancelled
+	}
+	for _, existing := range r.entries[msg.SessionID] {
+		if existing.QueuedBy != msg.QueuedBy || metadataString(existing.Metadata, MetadataCoalesceKey) != coalesceKey {
+			continue
+		}
+		if msg.QueuedAt.IsZero() {
+			msg.QueuedAt = time.Now().UTC()
+		}
+		existing.TaskID = msg.TaskID
+		existing.Content = msg.Content
+		existing.Model = msg.Model
+		existing.PlanMode = msg.PlanMode
+		existing.Attachments = msg.Attachments
+		existing.Metadata = msg.Metadata
+		existing.QueuedAt = msg.QueuedAt
+		out := *existing
+		return &out, true, nil
+	}
+	if !allowInsert {
+		return nil, false, ErrEntryNotFound
+	}
+	if err := r.insertLocked(msg, maxPerSession); err != nil {
+		return nil, false, err
+	}
+	return msg, false, nil
+}
+
 func (r *memoryRepository) ListBySession(_ context.Context, sessionID string) ([]QueuedMessage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -154,6 +246,50 @@ func (r *memoryRepository) TakeHead(_ context.Context, sessionID string) (*Queue
 	return &out, nil
 }
 
+func (r *memoryRepository) ReserveHead(_ context.Context, sessionID string) (*QueuedMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	list := r.entries[sessionID]
+	if len(list) == 0 {
+		return nil, nil
+	}
+	head := list[0]
+	out := *head
+	if head.IsDurableLifecycle() {
+		// Mirror the SQLite reservation: the stored row is flagged in flight so
+		// queue status stops listing it, while the returned copy keeps the
+		// unmarked metadata a requeue would write back.
+		out.Metadata = clearReservedMetadata(head.Metadata)
+		out.reservedLifecycleDelivery = true
+		head.Metadata = markReservedMetadata(out.Metadata)
+		return &out, nil
+	}
+	r.entries[sessionID] = list[1:]
+	if len(r.entries[sessionID]) == 0 {
+		delete(r.entries, sessionID)
+		delete(r.nextPosition, sessionID)
+	}
+	return &out, nil
+}
+
+func (r *memoryRepository) AcknowledgeByID(_ context.Context, sessionID, entryID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	list := r.entries[sessionID]
+	for i, msg := range list {
+		if msg.ID != entryID {
+			continue
+		}
+		r.entries[sessionID] = append(list[:i], list[i+1:]...)
+		if len(r.entries[sessionID]) == 0 {
+			delete(r.entries, sessionID)
+			delete(r.nextPosition, sessionID)
+		}
+		return nil
+	}
+	return ErrEntryNotFound
+}
+
 // TakeByID atomically returns and deletes the entry identified by entryID,
 // regardless of its FIFO position. Unlike DeleteByID, it has no
 // QueuedByAgent guard — see the Repository interface doc comment.
@@ -179,9 +315,16 @@ func (r *memoryRepository) TakeByID(_ context.Context, sessionID, entryID string
 	return nil, nil
 }
 
-func (r *memoryRepository) UpdateContent(_ context.Context, sessionID, entryID, content string, attachments []MessageAttachment, queuedBy string) error {
+func (r *memoryRepository) UpdateContent(ctx context.Context, sessionID, entryID, content string, attachments []MessageAttachment, queuedBy string) error {
+	return r.UpdateContentAndMetadata(ctx, sessionID, entryID, content, attachments, nil, queuedBy)
+}
+
+func (r *memoryRepository) UpdateContentAndMetadata(_ context.Context, sessionID, entryID, content string, attachments []MessageAttachment, metadataUpdates map[string]interface{}, queuedBy string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if queuedBy == "" || IsReservedQueuedBy(queuedBy) {
+		return ErrEntryNotFound
+	}
 	list, ok := r.entries[sessionID]
 	if !ok {
 		return ErrEntryNotFound
@@ -193,8 +336,12 @@ func (r *memoryRepository) UpdateContent(_ context.Context, sessionID, entryID, 
 		if queuedBy != "" && m.QueuedBy != queuedBy {
 			return ErrEntryNotFound
 		}
+		if IsReservedQueuedBy(m.QueuedBy) {
+			return ErrEntryNotFound
+		}
 		m.Content = content
 		m.Attachments = attachments
+		m.Metadata = applyMetadataUpdates(m.Metadata, metadataUpdates)
 		return nil
 	}
 	return ErrEntryNotFound
@@ -211,7 +358,7 @@ func (r *memoryRepository) DeleteByID(_ context.Context, sessionID, entryID stri
 		if m.ID != entryID {
 			continue
 		}
-		if m.QueuedBy == QueuedByAgent {
+		if IsReservedQueuedBy(m.QueuedBy) {
 			return ErrEntryNotFound
 		}
 		r.entries[sessionID] = append(list[:i], list[i+1:]...)
@@ -227,10 +374,23 @@ func (r *memoryRepository) DeleteByID(_ context.Context, sessionID, entryID stri
 func (r *memoryRepository) DeleteAllBySession(_ context.Context, sessionID string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := len(r.entries[sessionID])
-	delete(r.entries, sessionID)
-	delete(r.nextPosition, sessionID)
-	return n, nil
+	list := r.entries[sessionID]
+	kept := list[:0]
+	removed := 0
+	for _, msg := range list {
+		if IsReservedQueuedBy(msg.QueuedBy) {
+			kept = append(kept, msg)
+			continue
+		}
+		removed++
+	}
+	if len(kept) == 0 {
+		delete(r.entries, sessionID)
+		delete(r.nextPosition, sessionID)
+	} else {
+		r.entries[sessionID] = kept
+	}
+	return removed, nil
 }
 
 func (r *memoryRepository) TransferSession(_ context.Context, oldSessionID, newSessionID string) error {

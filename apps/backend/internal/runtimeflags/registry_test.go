@@ -40,6 +40,47 @@ func TestDefinitionsIncludePluginsExperimentalMetadata(t *testing.T) {
 	}
 }
 
+func TestDefinitionsIncludeAppStatusBarMetadata(t *testing.T) {
+	def, ok := DefinitionByKey("features.appStatusBar")
+	if !ok {
+		t.Fatal("features.appStatusBar definition missing")
+	}
+	if def.EnvVar != "KANDEV_FEATURES_APP_STATUS_BAR" {
+		t.Fatalf("EnvVar = %q, want KANDEV_FEATURES_APP_STATUS_BAR", def.EnvVar)
+	}
+	if !def.RestartRequired {
+		t.Fatal("RestartRequired = false, want true")
+	}
+}
+
+func TestDefinitionsIncludeClaudeBackgroundPromptHandoffMetadata(t *testing.T) {
+	def, ok := DefinitionByKey("features.claudeBackgroundPromptHandoff")
+	if !ok {
+		t.Fatal("features.claudeBackgroundPromptHandoff definition missing")
+	}
+	if def.EnvVar != "KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF" {
+		t.Fatalf(
+			"EnvVar = %q, want KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF",
+			def.EnvVar,
+		)
+	}
+	if def.Stability != StabilityExperimental {
+		t.Fatalf("Stability = %q, want %q", def.Stability, StabilityExperimental)
+	}
+	if def.RiskLevel != RiskHigh {
+		t.Fatalf("RiskLevel = %q, want %q", def.RiskLevel, RiskHigh)
+	}
+	if def.RiskDescription == "" {
+		t.Fatal("RiskDescription empty")
+	}
+	if !def.RestartRequired {
+		t.Fatal("RestartRequired = false, want true")
+	}
+	if !def.Mutable {
+		t.Fatal("Mutable = false, want true")
+	}
+}
+
 func TestDefinitionsExposeSingleUserFacingDebugToggle(t *testing.T) {
 	def, ok := DefinitionByKey("debug.devMode")
 	if !ok {

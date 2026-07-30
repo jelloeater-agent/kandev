@@ -142,10 +142,45 @@ test.describe("Plugins — gRPC plugin install/load/live-update/uninstall", () =
     const navItem = testPage.getByTestId(`plugin-nav-item-${NAV_ITEM_ID}`);
     await expect(navItem).toBeVisible({ timeout: 15_000 });
     await expect(navItem).toHaveText("Hello E2E");
+    await expect(testPage.locator("#hello-status-left")).toHaveText("Hello status bar no-task");
+    await expect(testPage.locator("#hello-status-right")).toHaveText("Hello status bar no-task");
 
     // --- 2b. main-top-bar slot renders on the default app top bar (Home) ---
     await expect(testPage.locator("#hello-main-top-bar")).toBeVisible();
     await expect(testPage.locator("#hello-main-top-bar")).toHaveText("Hello kanban");
+
+    const movedOrderingId = `plugin:${PLUGIN_ID}:app-status-bar-left:0`;
+    const movedContribution = testPage.locator(`[data-status-item-id="${movedOrderingId}"]`);
+    const [movedBox, statusBarBox] = await Promise.all([
+      movedContribution.boundingBox(),
+      testPage.getByTestId("app-status-bar").boundingBox(),
+    ]);
+    if (!movedBox || !statusBarBox) throw new Error("plugin status drag geometry unavailable");
+    const orderSaved = testPage.waitForResponse(
+      (response) =>
+        response.request().method() === "PATCH" && response.url().endsWith("/api/v1/user/settings"),
+    );
+    await testPage.keyboard.down("Meta");
+    await testPage.mouse.move(movedBox.x + movedBox.width / 2, movedBox.y + movedBox.height / 2);
+    await testPage.mouse.down();
+    await testPage.mouse.move(
+      statusBarBox.x + statusBarBox.width - 8,
+      statusBarBox.y + statusBarBox.height / 2,
+      { steps: 8 },
+    );
+    await testPage.mouse.up();
+    await testPage.keyboard.up("Meta");
+    expect((await orderSaved).ok()).toBe(true);
+    expect(await testPage.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+    await expect(movedContribution).toHaveAttribute("data-status-side", "right");
+
+    await backend.restart();
+    await testPage.reload();
+    await expect(testPage.locator(`[data-status-item-id="${movedOrderingId}"]`)).toHaveAttribute(
+      "data-status-side",
+      "right",
+      { timeout: 15_000 },
+    );
 
     await navItem.click();
     await expect(testPage).toHaveURL(new RegExp(`${PLUGIN_ROUTE}$`));
@@ -163,6 +198,7 @@ test.describe("Plugins — gRPC plugin install/load/live-update/uninstall", () =
     await session.waitForLoad();
     await expect(session.sidebar).toBeVisible({ timeout: 10_000 });
     await expect(testPage.locator("#hello-sidebar")).toBeVisible();
+    await expect(testPage.locator("#hello-status-left")).toContainText(seedTask.id);
 
     // --- 4. Back on the plugin's own page (mounted, no navigation from here
     // on): create a task and prove BOTH the live WS path (counter) and the
@@ -198,15 +234,26 @@ test.describe("Plugins — gRPC plugin install/load/live-update/uninstall", () =
     await expect(pluginRow.getByText("Active", { exact: true })).toBeVisible();
     await pluginRow.getByRole("button", { name: "Disable" }).click();
     await expect(pluginRow.getByText("Disabled", { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(testPage.locator("#hello-status-left")).toHaveCount(0);
+    await expect(testPage.locator("#hello-status-right")).toHaveCount(0);
     await testPage.goto("/");
     await expect(testPage.getByTestId(`plugin-nav-item-${NAV_ITEM_ID}`)).toHaveCount(0);
+    await expect(testPage.locator("#hello-status-left")).toHaveCount(0);
+    await expect(testPage.locator("#hello-status-right")).toHaveCount(0);
 
     // --- 6. Re-enable: nav item reappears live (no reload needed) ---
     await testPage.goto("/settings/plugins");
     await pluginRow.getByRole("button", { name: "Enable" }).click();
     await expect(pluginRow.getByText("Active", { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(testPage.locator(`[data-status-item-id="${movedOrderingId}"]`)).toHaveAttribute(
+      "data-status-side",
+      "right",
+      { timeout: 15_000 },
+    );
     await testPage.goto("/");
     await expect(testPage.getByTestId(`plugin-nav-item-${NAV_ITEM_ID}`)).toBeVisible();
+    await expect(testPage.locator("#hello-status-left")).toHaveText("Hello status bar no-task");
+    await expect(testPage.locator("#hello-status-right")).toHaveText("Hello status bar no-task");
 
     await testPage.goto("/settings/plugins");
 
@@ -218,6 +265,90 @@ test.describe("Plugins — gRPC plugin install/load/live-update/uninstall", () =
 
     const pluginDir = path.join(pluginsDir, PLUGIN_ID);
     await expect.poll(() => fs.existsSync(pluginDir), { timeout: 10_000 }).toBe(false);
+  });
+
+  test("auto-update: global default persists and a per-plugin override toggles and resets", async ({
+    testPage,
+  }) => {
+    test.setTimeout(60_000);
+
+    await openInstallDialog(testPage);
+    await uploadPackage(testPage, PACKAGE_PATH);
+    const pluginRow = testPage.getByTestId(`plugin-row-${PLUGIN_ID}`);
+    await expect(pluginRow).toBeVisible({ timeout: 15_000 });
+
+    const globalToggle = testPage.getByTestId("plugins-auto-update-default");
+    const rowToggle = pluginRow.getByTestId(`plugin-auto-update-${PLUGIN_ID}`);
+    const rowReset = pluginRow.getByTestId(`plugin-auto-update-reset-${PLUGIN_ID}`);
+
+    // Default is off (opt-in); the row inherits it — unchecked, no override.
+    await expect(globalToggle).toBeEnabled({ timeout: 15_000 });
+    await expect(globalToggle).toHaveAttribute("aria-checked", "false");
+    await expect(rowToggle).toHaveAttribute("aria-checked", "false");
+    await expect(rowReset).toHaveCount(0);
+
+    // Turn the instance-wide default on; the inheriting row reflects it.
+    await globalToggle.click();
+    await expect(globalToggle).toHaveAttribute("aria-checked", "true");
+    await expect(rowToggle).toHaveAttribute("aria-checked", "true");
+    await expect(rowReset).toHaveCount(0);
+
+    // The default persisted server-side (plugin_settings) across a reload.
+    await testPage.reload();
+    await expect(globalToggle).toHaveAttribute("aria-checked", "true", { timeout: 15_000 });
+    await expect(rowToggle).toHaveAttribute("aria-checked", "true");
+
+    // Override the row OFF despite the on default → shows override + Reset.
+    await rowToggle.click();
+    await expect(rowToggle).toHaveAttribute("aria-checked", "false");
+    await expect(rowReset).toBeVisible();
+
+    // The per-plugin override persisted on the plugin record across a reload.
+    await testPage.reload();
+    await expect(rowToggle).toHaveAttribute("aria-checked", "false", { timeout: 15_000 });
+    await expect(rowReset).toBeVisible();
+
+    // Reset clears the override → the row inherits the (still on) default again.
+    await rowReset.click();
+    await expect(rowToggle).toHaveAttribute("aria-checked", "true");
+    await expect(rowReset).toHaveCount(0);
+
+    // Leave the instance-wide default off so sibling tests start clean.
+    await globalToggle.click();
+    await expect(globalToggle).toHaveAttribute("aria-checked", "false");
+  });
+
+  test("keybinding declared in the manifest opens a host.openModal demo modal", async ({
+    testPage,
+  }) => {
+    test.setTimeout(60_000);
+
+    // --- Install via the upload UI, then reload so the boot payload (and
+    // the manifest-driven keybinding registration) is live. ---
+    await openInstallDialog(testPage);
+    await uploadPackage(testPage, PACKAGE_PATH);
+    const pluginRow = testPage.getByTestId(`plugin-row-${PLUGIN_ID}`);
+    await expect(pluginRow).toBeVisible({ timeout: 15_000 });
+
+    await testPage.goto("/");
+    await testPage.reload();
+    await expect(testPage.getByTestId(`plugin-nav-item-${NAV_ITEM_ID}`)).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // --- manifest.yaml declares `ui.keybindings: [{ id: open-demo, default:
+    // mod+shift+j }]`; bundle.js binds it to host.openModal(...). "mod"
+    // resolves to Ctrl/Cmd per-platform, matching Playwright's
+    // "ControlOrMeta" pseudo-modifier. ---
+    await testPage.keyboard.press("ControlOrMeta+Shift+J");
+    const modal = testPage.getByTestId("hello-demo-modal");
+    await expect(modal).toBeVisible();
+    await expect(modal).toHaveText("Hello from the plugin modal");
+
+    // --- The host Dialog's built-in close button dismisses the (dismissible
+    // by default) modal. ---
+    await testPage.getByRole("button", { name: "Close" }).click();
+    await expect(modal).not.toBeVisible();
   });
 
   test("settings page: schema-driven form, secret masking, and Host GetConfig delivery", async ({

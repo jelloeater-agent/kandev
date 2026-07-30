@@ -1,7 +1,7 @@
 ---
-status: shipped
+status: building
 created: 2026-05-04
-updated: 2026-07-20
+updated: 2026-07-22
 owner: tbd
 ---
 
@@ -31,6 +31,10 @@ workflows are not usable end to end.
 - GitLab browse, task-link, review, watch, and write endpoints require an
   authoritative `workspace_id` and resolve that workspace's connection. Data
   or credentials from another workspace are never used as fallback.
+- Task creation is the narrow unauthenticated exception: branch discovery for
+  an explicitly entered public `gitlab.com` repository URL works without a
+  saved workspace connection. It does not expose private projects, browse
+  results, merge requests, issues, or write actions.
 - GitLab repository matching uses provider, normalized provider host, and full
   subgroup project path. Repositories with unknown or mismatched provider hosts
   are not eligible for GitLab linking or merge-request actions.
@@ -43,6 +47,13 @@ workflows are not usable end to end.
 - Users can link an existing task to a merge request by pasting a full MR URL,
   including URLs from the workspace's configured self-managed host. They can
   unlink one association without deleting the task or upstream MR.
+- For a workspace with GitLab configured, task context menus expose
+  `GitLab Merge Request` inside the shared `Link` submenu. Desktop users can
+  reach it by right-clicking a task, and touch users can reach the same action
+  through the task row's visible actions menu.
+- An unlinked task does not show a persistent `Link MR` action in its task top
+  bar. After at least one MR is linked, the top bar shows the linked-MR status
+  control and continues to allow opening, unlinking, or linking another MR.
 - Linked MRs are visible from both the GitLab list and task detail. Multiple
   tasks can link to one MR, and a multi-repository task can link one MR per
   repository.
@@ -158,6 +169,10 @@ validated against any supplied value.
 
 ### Browse and review
 
+- `GET /projects/branches?workspace_id=<id>&project=<path>` uses the workspace
+  connection when configured. When the workspace is unconfigured and the
+  requested host is `gitlab.com`, it may list branches anonymously for the
+  explicitly named public project so Remote task creation can continue.
 - `GET /user/mrs?workspace_id=<id>&filter=<filter>&page=<n>&per_page=<n>` and
   `GET /user/issues?workspace_id=<id>&filter=<filter>&page=<n>&per_page=<n>`
   return the active workspace's paginated search results.
@@ -221,7 +236,9 @@ protocol action name for compatibility.
 - `409` indicates a workspace/resource invariant conflict that cannot be
   applied idempotently.
 - `422` indicates GitLab rejected a valid write, such as an ineligible reviewer.
-- `503` indicates the workspace connection is absent or currently unavailable.
+- `503` indicates the workspace connection is absent or currently unavailable,
+  except for anonymous branch discovery of an explicitly named public
+  `gitlab.com` project.
 - Provider error bodies and logs are sanitized and never include tokens or
   authenticated remote URLs.
 
@@ -316,12 +333,26 @@ protocol action name for compatibility.
 - **GIVEN** two workspaces connected to different GitLab hosts, **WHEN** each
   opens its GitLab page, **THEN** each sees only data fetched with its own host
   and credential.
+- **GIVEN** a workspace without a GitLab connection, **WHEN** the user enters a
+  public `gitlab.com` repository URL in Remote task creation, **THEN** Kandev
+  lists its branches anonymously without making any other GitLab browse or
+  write capability available.
 - **GIVEN** a legacy global GitLab host and token, **WHEN** Kandev starts after
   upgrade, **THEN** one deterministic workspace receives the config and secret
   and other workspaces remain unconfigured.
 - **GIVEN** a self-managed workspace connection, **WHEN** a user links a valid
   MR URL from that host, **THEN** the task shows the linked MR and its live
   review details after reload.
+- **GIVEN** a task with no linked MR in a GitLab-configured workspace, **WHEN**
+  the task detail opens, **THEN** the top bar has no `Link MR` action and the
+  task's contextual `Link` submenu offers `GitLab Merge Request`.
+- **GIVEN** a touch viewport and a task with no linked MR in a GitLab-configured
+  workspace, **WHEN** the user opens the task row's visible actions menu and
+  chooses `Link` then `GitLab Merge Request`, **THEN** the GitLab MR link dialog
+  opens without relying on right-click or long press.
+- **GIVEN** a task with a linked GitLab MR, **WHEN** the task detail opens,
+  **THEN** the top bar shows the linked MR status control rather than a generic
+  link action.
 - **GIVEN** an MR URL from a different host, **WHEN** it is linked in the current
   workspace, **THEN** the request is rejected and no association is written.
 - **GIVEN** a linked MR, **WHEN** the user unlinks it, **THEN** it disappears

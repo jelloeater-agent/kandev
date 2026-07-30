@@ -1,7 +1,7 @@
 "use client";
 
 import { memo, useMemo } from "react";
-import type { TaskState, TaskSessionState } from "@/lib/types/http";
+import type { ForegroundActivity, TaskState, TaskSessionState } from "@/lib/types/http";
 import { TaskItem } from "./task-item";
 import { TaskItemWithContextMenu, type StepDef } from "./task-switcher-context-menu";
 import {
@@ -18,6 +18,8 @@ export type TaskSwitcherItem = {
   title: string;
   state?: TaskState;
   sessionState?: TaskSessionState;
+  /** Task-level most-active-wins busy aggregate (ADR-0049) from the task record. */
+  foregroundActivity?: ForegroundActivity | null;
   description?: string;
   workflowId?: string;
   workflowName?: string;
@@ -58,10 +60,12 @@ type TaskSwitcherProps = {
   onSelectTask: (taskId: string) => void;
   onRenameTask?: (taskId: string, currentTitle: string) => void;
   onArchiveTask?: (taskId: string) => void;
+  onCreateSubtask?: (taskId: string, taskTitle: string) => void;
   onDeleteTask?: (taskId: string) => void;
   onDetachTask?: (taskId: string) => void;
   onLinkPullRequest?: TaskLinkHandler;
   onLinkIssue?: TaskLinkHandler;
+  onLinkMergeRequest?: TaskLinkHandler;
   onLinkJiraTicket?: TaskLinkHandler;
   onLinkLinearIssue?: TaskLinkHandler;
   onLinkSentryIssue?: TaskLinkHandler;
@@ -142,10 +146,12 @@ type TaskRowProps = {
   onSelectTask: (taskId: string) => void;
   onRenameTask?: (taskId: string, currentTitle: string) => void;
   onArchiveTask?: (taskId: string) => void;
+  onCreateSubtask?: (taskId: string, taskTitle: string) => void;
   onDeleteTask?: (taskId: string) => void;
   onDetachTask?: (taskId: string) => void;
   onLinkPullRequest?: TaskLinkHandler;
   onLinkIssue?: TaskLinkHandler;
+  onLinkMergeRequest?: TaskLinkHandler;
   onLinkJiraTicket?: TaskLinkHandler;
   onLinkLinearIssue?: TaskLinkHandler;
   onLinkSentryIssue?: TaskLinkHandler;
@@ -169,6 +175,7 @@ function taskLinkHandlerProps(props: Pick<TaskRowProps, keyof TaskLinkHandlerPro
   return {
     onLinkPullRequest: props.onLinkPullRequest,
     onLinkIssue: props.onLinkIssue,
+    onLinkMergeRequest: props.onLinkMergeRequest,
     onLinkJiraTicket: props.onLinkJiraTicket,
     onLinkLinearIssue: props.onLinkLinearIssue,
     onLinkSentryIssue: props.onLinkSentryIssue,
@@ -178,6 +185,7 @@ function taskLinkHandlerProps(props: Pick<TaskRowProps, keyof TaskLinkHandlerPro
 type TaskLinkHandlerProps = {
   onLinkPullRequest?: TaskLinkHandler;
   onLinkIssue?: TaskLinkHandler;
+  onLinkMergeRequest?: TaskLinkHandler;
   onLinkJiraTicket?: TaskLinkHandler;
   onLinkLinearIssue?: TaskLinkHandler;
   onLinkSentryIssue?: TaskLinkHandler;
@@ -195,6 +203,7 @@ function TaskRow({
   onSelectTask,
   onRenameTask,
   onArchiveTask,
+  onCreateSubtask,
   onDeleteTask,
   onDetachTask,
   onMoveToStep,
@@ -214,9 +223,8 @@ function TaskRow({
   ...props
 }: TaskRowProps) {
   const isSelected = task.id === selectedTaskId || task.id === activeTaskId;
-  const isMultiSelected = selectedTaskIds?.has(task.id) ?? false;
-  const isSelecting = (selectedTaskIds?.size ?? 0) > 0;
   const taskSteps = task.workflowId ? stepsByWorkflowId?.[task.workflowId] : undefined;
+  const stepId = task.workflowStepId;
   return (
     <TaskItemWithContextMenu
       task={task}
@@ -225,6 +233,7 @@ function TaskRow({
       steps={taskSteps}
       onRenameTask={onRenameTask}
       onArchiveTask={onArchiveTask}
+      onCreateSubtask={onCreateSubtask}
       onDeleteTask={onDeleteTask}
       onDetachTask={onDetachTask}
       {...taskLinkHandlerProps(props)}
@@ -242,9 +251,9 @@ function TaskRow({
       isMixedWorkflowSelection={isMixedWorkflowSelection}
     >
       <TaskItem
-        isMultiSelected={isMultiSelected}
+        isMultiSelected={selectedTaskIds?.has(task.id) ?? false}
         onSelect={(e) =>
-          dispatchSidebarRowClick(e, task.id, isSelecting, {
+          dispatchSidebarRowClick(e, task.id, (selectedTaskIds?.size ?? 0) > 0, {
             onSelectTask,
             onToggleSelectTask,
             onSelectTaskRange,
@@ -253,6 +262,7 @@ function TaskRow({
         title={task.title}
         state={task.state}
         sessionState={task.sessionState}
+        foregroundActivity={task.foregroundActivity}
         isArchived={task.isArchived}
         isSelected={isSelected}
         diffStats={task.diffStats}
@@ -269,6 +279,7 @@ function TaskRow({
         issueInfo={task.issueInfo}
         agentErrorMessage={task.agentErrorMessage}
         isSubTask={isSubTask}
+        isOnLastWorkflowStep={!!stepId && taskSteps?.at(-1)?.id === stepId}
         depth={depth}
         subtaskCount={subtaskToggle?.subtaskCount}
         subtasksCollapsed={subtaskToggle?.subtasksCollapsed}
@@ -400,10 +411,12 @@ type GroupSectionProps = {
   onSelectTask: (taskId: string) => void;
   onRenameTask?: (taskId: string, currentTitle: string) => void;
   onArchiveTask?: (taskId: string) => void;
+  onCreateSubtask?: (taskId: string, taskTitle: string) => void;
   onDeleteTask?: (taskId: string) => void;
   onDetachTask?: (taskId: string) => void;
   onLinkPullRequest?: TaskLinkHandler;
   onLinkIssue?: TaskLinkHandler;
+  onLinkMergeRequest?: TaskLinkHandler;
   onLinkJiraTicket?: TaskLinkHandler;
   onLinkLinearIssue?: TaskLinkHandler;
   onLinkSentryIssue?: TaskLinkHandler;
@@ -440,10 +453,12 @@ function GroupSection({
   onSelectTask,
   onRenameTask,
   onArchiveTask,
+  onCreateSubtask,
   onDeleteTask,
   onDetachTask,
   onLinkPullRequest,
   onLinkIssue,
+  onLinkMergeRequest,
   onLinkJiraTicket,
   onLinkLinearIssue,
   onLinkSentryIssue,
@@ -478,10 +493,12 @@ function GroupSection({
       onSelectTask,
       onRenameTask,
       onArchiveTask,
+      onCreateSubtask,
       onDeleteTask,
       onDetachTask,
       onLinkPullRequest,
       onLinkIssue,
+      onLinkMergeRequest,
       onLinkJiraTicket,
       onLinkLinearIssue,
       onLinkSentryIssue,
@@ -534,10 +551,12 @@ export const TaskSwitcher = memo(function TaskSwitcher({
   onSelectTask,
   onRenameTask,
   onArchiveTask,
+  onCreateSubtask,
   onDeleteTask,
   onDetachTask,
   onLinkPullRequest,
   onLinkIssue,
+  onLinkMergeRequest,
   onLinkJiraTicket,
   onLinkLinearIssue,
   onLinkSentryIssue,
@@ -590,10 +609,12 @@ export const TaskSwitcher = memo(function TaskSwitcher({
           onSelectTask={onSelectTask}
           onRenameTask={onRenameTask}
           onArchiveTask={onArchiveTask}
+          onCreateSubtask={onCreateSubtask}
           onDeleteTask={onDeleteTask}
           onDetachTask={onDetachTask}
           onLinkPullRequest={onLinkPullRequest}
           onLinkIssue={onLinkIssue}
+          onLinkMergeRequest={onLinkMergeRequest}
           onLinkJiraTicket={onLinkJiraTicket}
           onLinkLinearIssue={onLinkLinearIssue}
           onLinkSentryIssue={onLinkSentryIssue}

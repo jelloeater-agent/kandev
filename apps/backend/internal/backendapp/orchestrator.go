@@ -27,7 +27,9 @@ import (
 	linearpkg "github.com/kandev/kandev/internal/linear"
 	officesqlite "github.com/kandev/kandev/internal/office/repository/sqlite"
 	"github.com/kandev/kandev/internal/orchestrator"
+	executorpkg "github.com/kandev/kandev/internal/orchestrator/executor"
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
+	promptservice "github.com/kandev/kandev/internal/prompts/service"
 	"github.com/kandev/kandev/internal/repoclone"
 	"github.com/kandev/kandev/internal/secrets"
 	sentrypkg "github.com/kandev/kandev/internal/sentry"
@@ -59,6 +61,8 @@ func provideOrchestrator(
 	workflowSvc *workflowservice.Service,
 	secretStore secrets.SecretStore,
 	repoCloner *repoclone.Cloner,
+	promptSvc *promptservice.Service,
+	githubSvc *githubpkg.Service,
 ) (*orchestrator.Service, *messageCreatorAdapter, error) {
 	if lifecycleMgr == nil {
 		return nil, nil, errors.New("lifecycle manager is required: configure agent runtime (docker or standalone)")
@@ -68,6 +72,8 @@ func provideOrchestrator(
 	agentManagerClient := newLifecycleAdapter(lifecycleMgr, agentRegistry, log)
 
 	serviceCfg := orchestrator.DefaultServiceConfig()
+	serviceCfg.ClaudeBackgroundPromptHandoff =
+		cfg != nil && cfg.Features.ClaudeBackgroundPromptHandoff
 	namespace := resolveEventNamespace(cfg)
 	serviceCfg.QueueGroup = "orchestrator." + namespace
 	busMode := "memory"
@@ -90,6 +96,13 @@ func provideOrchestrator(
 		zap.Int("max_per_session", maxPerSession))
 
 	orchestratorSvc := orchestrator.NewService(serviceCfg, eventBus, agentManagerClient, taskRepoAdapter, taskRepo, userSvc, secretStore, msgQueue, log)
+	if githubSvc != nil {
+		orchestratorSvc.SetGitHubCredentialBroker(
+			githubExecutorCredentialLeaseAdapter{service: githubSvc},
+			githubCredentialBrokerEndpoint(cfg),
+		)
+		orchestratorSvc.SetTaskGitCredentialPolicyResolver(githubExecutorCredentialPolicyAdapter{service: githubSvc})
+	}
 	taskSvc.SetExecutionStopper(orchestratorSvc)
 	taskSvc.SetGitArchiveCapture(orchestratorSvc)
 	orchestratorSvc.SetWorktreeManager(lifecycleMgr.WorktreeManager())
@@ -103,6 +116,17 @@ func provideOrchestrator(
 	// owns the canonical rich payload. Covers workflow transitions, workflow
 	// step moves, and the primary-session-set callback below.
 	orchestratorSvc.SetTaskEventPublisher(taskSvc)
+
+	// Let the task service read the live per-session busy substate so it can
+	// compute the task-level MOST-ACTIVE-WINS activity aggregate carried on the
+	// boot payload and task.updated events.
+	taskSvc.SetForegroundActivityProvider(orchestratorSvc)
+
+	// Per-user scoping for the session-keyed WS actions. The orchestrator
+	// resolves sessions through its own repo handle, so it does not inherit the
+	// task service's authorize* checks.
+	orchestratorSvc.SetSessionAccessChecker(taskSvc.AuthorizeSessionAccess)
+	orchestratorSvc.SetTaskAccessChecker(taskSvc.AuthorizeTaskAccess)
 
 	// Publish task.updated when the first session is marked primary so the
 	// frontend receives primary_session_id for newly created tasks.
@@ -120,6 +144,12 @@ func provideOrchestrator(
 	// Wire workflow step getter for prompt building
 	if workflowSvc != nil {
 		orchestratorSvc.SetWorkflowStepGetter(&orchestratorWorkflowStepGetterAdapter{svc: workflowSvc})
+	}
+
+	// Wire "@name" saved-prompt reference expansion into workflow-step prompt
+	// building.
+	if promptSvc != nil {
+		orchestratorSvc.SetPromptReferenceExpander(promptSvc)
 	}
 
 	// Wire review task creator for auto-creating tasks from review watch PRs
@@ -147,6 +177,63 @@ func provideOrchestrator(
 	}
 
 	return orchestratorSvc, msgCreator, nil
+}
+
+type githubCredentialLeaseService interface {
+	IssueGitHubCredentialLease(context.Context, githubpkg.CredentialLeaseRequest) (*githubpkg.CredentialLease, error)
+	DescribeTaskGitCredentialPolicy(context.Context, string) (githubpkg.TaskGitCredentialPolicy, error)
+}
+
+type githubExecutorCredentialPolicyAdapter struct {
+	service githubCredentialLeaseService
+}
+
+func (a githubExecutorCredentialPolicyAdapter) ResolveTaskGitCredentialPolicy(
+	ctx context.Context,
+	workspaceID string,
+) (executorpkg.TaskGitCredentialPolicy, error) {
+	policy, err := a.service.DescribeTaskGitCredentialPolicy(ctx, workspaceID)
+	if err != nil {
+		return executorpkg.TaskGitCredentialPolicy{}, err
+	}
+	return executorpkg.TaskGitCredentialPolicy{
+		Mode:            policy.Mode,
+		WorkspaceMethod: policy.WorkspaceMethod,
+		WorkspaceActor:  policy.WorkspaceActor,
+	}, nil
+}
+
+type githubExecutorCredentialLeaseAdapter struct {
+	service githubCredentialLeaseService
+}
+
+func (a githubExecutorCredentialLeaseAdapter) IssueGitHubCredentialLease(
+	ctx context.Context,
+	request executorpkg.GitHubCredentialLeaseRequest,
+) (executorpkg.GitHubCredentialLease, error) {
+	lease, err := a.service.IssueGitHubCredentialLease(ctx, githubpkg.CredentialLeaseRequest{
+		WorkspaceID: request.WorkspaceID, TaskID: request.TaskID, SessionID: request.SessionID,
+		RepositoryID: request.RepositoryID, Owner: request.Owner, Repo: request.Repo, Host: request.Host,
+	})
+	if err != nil {
+		return executorpkg.GitHubCredentialLease{}, err
+	}
+	if lease == nil {
+		return executorpkg.GitHubCredentialLease{}, errors.New("GitHub credential broker returned no lease")
+	}
+	return executorpkg.GitHubCredentialLease{Token: lease.Token}, nil
+}
+
+func githubCredentialBrokerEndpoint(cfg *config.Config) string {
+	if cfg != nil {
+		if publicBaseURL := strings.TrimRight(strings.TrimSpace(cfg.GitHubCredentialBroker.PublicBaseURL), "/"); publicBaseURL != "" {
+			return publicBaseURL + "/api/v1/github/credentials/resolve"
+		}
+		if cfg.Server.Port != 0 {
+			return fmt.Sprintf("http://localhost:%d/api/v1/github/credentials/resolve", cfg.Server.Port)
+		}
+	}
+	return fmt.Sprintf("http://localhost:%d/api/v1/github/credentials/resolve", portsBackendDefault)
 }
 
 // resolveQueueMaxPerSession honors the KANDEV_QUEUE_MAX_PER_SESSION env var,
@@ -704,7 +791,7 @@ func (a *repositoryResolverAdapter) ResolveForReview(
 		return "", "", fmt.Errorf("unsupported provider: %w", err)
 	}
 
-	localPath, err := a.cloner.EnsureCloned(ctx, cloneURL, owner, name)
+	localPath, err := a.cloner.EnsureWorkspaceCloned(ctx, workspaceID, provider, cloneURL, owner, name)
 	if err != nil {
 		return "", "", fmt.Errorf("clone repository: %w", err)
 	}

@@ -86,6 +86,20 @@ Messages show peer attribution, and Kandev gives the receiving agent hidden repl
 
 Desktop panel groups can host agent chat, files, terminals, Changes, the task plan, previews, and GitHub pull-request detail. Use **+** to add a panel. Mobile exposes sessions, files, terminal, and changes through task navigation and sheets. Its task switcher opens as an inset bottom card, and the current-session control shows the active agent's icon and name.
 
+Press **Cmd+Shift+F** on macOS or **Ctrl+Shift+F** elsewhere to search the
+contents of every file in the active task workspace. Results are grouped by
+repository and show the repository-relative path, line number, and matching
+line; selecting one opens that repository's file at the match. Content search
+includes tracked files and untracked files that are not ignored. Use
+**Cmd/Ctrl+Shift+K** when you want to search only file names and paths across
+all repositories in the active task. The palette keeps **Commands**, **Files**,
+and **Contents** visible as compact tabs beside the search field while an active
+task workbench is open; elsewhere the palette remains command-only and leaves
+the workspace-search shortcuts untouched. Click a mode or press **Tab** /
+**Shift+Tab** to switch without clearing your query or moving focus from the
+search field. File matches are grouped by repository. Hover a mode to see its
+direct shortcut.
+
 Open **Settings > General > Layouts** to configure reusable desktop workbench profiles. Select a tab in a built-in layout to reveal its nearby edit controls, arrange or remove tabs and splits, then use the floating **Save changes** control. Kandev keeps the built-in row visible, marks it **Customized**, and stores your override without requiring a duplicate. Choose **Reset** beside a customized built-in to restore its original definition. Removing Terminal from the Default layout also prevents Kandev from creating its initial user shell. Changing the default does not replace a layout already saved for a task; choose **Reset Layout** from the workbench layout menu when you want that task to adopt the latest default.
 
 All panels for a task point at the same task environment. In a multi-repository task, check the repository label before editing, committing, or reviewing. A preview also requires the application to listen on a reachable interface and expose a forwarded port.
@@ -107,9 +121,19 @@ Changes are grouped by repository and then by state:
 
 From this panel you can stage or unstage files, discard working-tree changes, commit, amend, reset or revert commits, pull, rebase, merge, push, force-push, rename the task branch, choose a base branch, and create or open a pull request or merge request. Operations apply to the selected repository. Discarding a file is permanent, and history-changing operations can lose work or invalidate review; read [Git operations](git-operations.md) before using them.
 
+### Open a file in its external repository
+
+When Kandev has unambiguous repository context, file toolbars in Changes, Review, built-in viewers and editors, and their mobile layouts show **Open file in GitHub**, **Open file in GitLab**, or **Open file in Azure DevOps**. The action opens the provider page in a new browser tab. GitLab links support both `gitlab.com` and configured self-managed hosts.
+
+The link uses the published source branch from a linked pull or merge request for that repository when available; otherwise it uses the task repository's base branch. Added or untracked files do not show the action until they exist on a published source branch. Deleted files open their base-branch version, while renamed files open the new path on a published source branch or the previous path on the base branch.
+
+Kandev hides the action instead of guessing when a repository is local-only, unsupported, incompletely configured, or ambiguous. If a colleague cannot open the resulting page, check their permissions on the external repository; opening a link does not change provider access.
+
 ## Review a diff
 
 Select **Review** in the Changes header. Kandev builds a repository-aware file list by merging available uncommitted, cumulative committed, and linked-PR files. When a path occurs in more than one source, the uncommitted version wins deduplication.
+
+When a task has multiple linked pull requests, use the PR selector in the Changes diff header or Review toolbar to inspect one PR revision at a time. The selection is scoped to that task for the current app session. Switching PRs replaces only the remote PR contribution; uncommitted and committed sources keep their normal precedence. Selecting a file from a specific PR row opens that exact PR revision, even when a sibling PR changes the same path.
 
 <DocsVideo
   webm="./media/feature-guides/diff-line-feedback.webm"
@@ -134,7 +158,7 @@ Pending inline comments are scoped to the current review session but persist onl
 
 ## Generate a walkthrough
 
-Select **Walkthrough** from Changes or Review. Kandev sends the built-in `changes-walkthrough` prompt to the active session. If the agent is running, the request queues; otherwise it starts a new turn. The agent must have task MCP and must call `show_walkthrough_kandev` with an ordered list of file and line anchors.
+Select **Walkthrough** from Changes or Review. Kandev sends the built-in `changes-walkthrough` prompt to the active session. If the agent is actively generating, the request queues; if it is idle, it starts a new turn immediately. A running Claude Code session that is only waiting on recognized background work also starts immediately when the high-risk **Claude background prompt handoff** experiment is enabled; the default behavior queues it. The agent must have task MCP and must call `show_walkthrough_kandev` with an ordered list of file and line anchors.
 
 <DocsVideo
   webm="./media/feature-guides/code-walkthrough.webm"
@@ -165,18 +189,23 @@ The creation dialog requires a title, defaults it from the task title, accepts a
 - Azure Repos uses `az repos pr create` and requires Azure CLI, the `azure-devops` extension, and either `az login` or `AZURE_DEVOPS_EXT_PAT`.
 - Other Git hosts do not have a built-in creation path. Use that host's tooling from the terminal.
 
-GitHub has the complete in-app PR review path. A linked PR detail panel shows checks, reviews, comments, conflicts, and merge readiness. It can add PR feedback to agent context, submit an approval when allowed, ask an agent to address conflicts, and merge using a method allowed by the repository. Branch protection remains authoritative; merge is enabled only when required checks, review state, and mergeability are ready.
+GitHub has the complete in-app PR review path. A linked PR detail panel shows checks, reviews, comments, conflicts, and merge readiness. It can add PR feedback to agent context, submit an approval when allowed, ask an agent to address conflicts, and merge using a method allowed by the repository. On an open PR, use the reviews list to re-request a reviewer whose review was dismissed. On a phone, open **Review** from the task bottom navigation to reach the same PR detail. GitHub permissions and repository policy remain authoritative; merge is enabled only when required checks, review state, and mergeability are ready.
 
 GitLab has a provider-specific linked-MR panel. It shows overview and branch state, approvals and pipeline rollup, files, commits, reviewers, assignees, labels, and threaded discussions. It can add selected feedback to agent context, reply or resolve discussions, approve or unapprove, update people and labels, toggle MR notifications, merge, refresh, and unlink. GitLab permissions and project policy remain authoritative. See [Integrations](integrations.md#gitlab) for linking and watch limits.
 
 ### GitHub PR automation
 
-The PR panel has two opt-in controls:
+The PR panel has two action controls:
 
 - **Auto-fix CI and address comments** waits for a check run to finish, then sends newly failed checks or review comments to the agent. It refreshes about once a minute, coalesces queued updates, and stops after 10 repair rounds for that PR. Disable and re-enable it after manual review to reset the limit.
 - **Auto-merge when ready** merges only after CI, required reviews, and mergeability are all ready.
 
-The repair prompt comes from the built-in `ci-auto-fix` saved prompt and can be overridden for the task. These controls currently operate on GitHub-linked PRs, require the GitHub integration and repository permissions, and do not bypass provider policy. Azure PR creation returns a URL but does not supply the same linked checks, review, or automation panel. See [Integrations](integrations.md).
+Open **Review follow-up** for three notification controls:
+
+- **Your review is requested** wakes the agent for any new request, including re-review after changes.
+- **PR merged** and **PR closed without merging** independently wake the agent when review work ends.
+
+Lifecycle messages only report the observed event and canonical PR URL; the task workflow and agent context decide what to do next. The repair prompt comes from the built-in `ci-auto-fix` saved prompt and can be overridden for the task. These controls currently operate on GitHub-linked PRs, require the GitHub integration and repository permissions, and do not bypass provider policy. Azure PR creation returns a URL but does not supply the same linked checks, review, or automation panel. See [Integrations](integrations.md).
 
 ## Share a session
 

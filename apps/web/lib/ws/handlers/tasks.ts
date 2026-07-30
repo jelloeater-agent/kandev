@@ -23,6 +23,28 @@ function hasPayloadField(payload: TaskEventPayload, field: keyof TaskEventPayloa
   return Object.prototype.hasOwnProperty.call(payload, field);
 }
 
+function preservePrimaryExecutorFields(
+  existing: KanbanTask,
+  merged: KanbanTask,
+  payload: TaskEventPayload,
+): void {
+  const primarySessionCleared =
+    hasPayloadField(payload, "primary_session_id") && payload.primary_session_id === null;
+  if (primarySessionCleared) return;
+  if (!hasPayloadField(payload, "primary_executor_id")) {
+    merged.primaryExecutorId = existing.primaryExecutorId;
+  }
+  if (!hasPayloadField(payload, "primary_executor_type")) {
+    merged.primaryExecutorType = existing.primaryExecutorType;
+  }
+  if (!hasPayloadField(payload, "primary_executor_name")) {
+    merged.primaryExecutorName = existing.primaryExecutorName;
+  }
+  if (!hasPayloadField(payload, "is_remote_executor")) {
+    merged.isRemoteExecutor = existing.isRemoteExecutor;
+  }
+}
+
 function mergeTaskUpdate(
   existing: KanbanTask | undefined,
   nextTask: KanbanTask,
@@ -47,6 +69,28 @@ function mergeTaskUpdate(
     nextTask.primarySessionPendingAction === undefined
   ) {
     merged.primarySessionPendingAction = existing.primarySessionPendingAction;
+  }
+  preservePrimaryExecutorFields(existing, merged, payload);
+  if (
+    !hasPayloadField(payload, "task_pending_action") &&
+    nextTask.taskPendingAction === undefined
+  ) {
+    merged.taskPendingAction = existing.taskPendingAction;
+  }
+  // Preserve the task-level activity aggregate only when the event omits it
+  // entirely (e.g. a lightweight kanban.update). A task.updated that carries an
+  // explicit null clears a stale background-running reading, so it must win.
+  if (
+    !hasPayloadField(payload, "foreground_activity") &&
+    nextTask.foregroundActivity === undefined
+  ) {
+    merged.foregroundActivity = existing.foregroundActivity;
+  }
+  if (
+    !hasPayloadField(payload, "active_subagent_count") &&
+    nextTask.activeSubagentCount === undefined
+  ) {
+    merged.activeSubagentCount = existing.activeSubagentCount;
   }
   return merged;
 }
@@ -343,14 +387,19 @@ function handleTaskUpdated(store: StoreApi<AppState>, message: TaskUpdatedMessag
   //  - the user is currently viewing this task,
   //  - the user was sitting on the previous primary,
   //  - they do NOT have a non-terminal pinned session for this task, and
-  //  - the primary actually changed.
+  //  - a real previous primary actually changed.
   // This makes workflow profile switches transparent for unpinned users
-  // without yanking users off a live session they deliberately selected.
+  // without yanking users off a live session they deliberately selected. A
+  // pinned user whose session is being retired is followed via the session
+  // state-transition handoff (maybeAdoptSessionOnTransition) once that session
+  // actually reaches a terminal state — not from here, where we cannot yet tell
+  // a retirement from a manual "Set as Primary" that leaves the old session live.
   const afterState = store.getState();
   logTaskMerge("task.updated", beforeState, afterState, message.payload);
   const newPrimary = findTaskInState(afterState, taskId)?.primarySessionId ?? null;
   if (
     newPrimary &&
+    previousPrimary &&
     newPrimary !== previousPrimary &&
     afterState.tasks.activeTaskId === taskId &&
     afterState.tasks.activeSessionId === previousPrimary &&

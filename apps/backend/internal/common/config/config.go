@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,22 +29,51 @@ type Config struct {
 	// <repo>/.kandev-dev during local development). When empty, falls back
 	// to ~/.kandev. All workspace artifacts (data, tasks, worktrees, repos)
 	// live under this root.
-	HomeDir             string                    `mapstructure:"homeDir"`
-	Server              ServerConfig              `mapstructure:"server"`
-	Database            DatabaseConfig            `mapstructure:"database"`
-	NATS                NATSConfig                `mapstructure:"nats"`
-	Events              EventsConfig              `mapstructure:"events"`
-	Docker              DockerConfig              `mapstructure:"docker"`
-	Agent               AgentConfig               `mapstructure:"agent"`
-	Auth                AuthConfig                `mapstructure:"auth"`
-	Logging             LoggingConfig             `mapstructure:"logging"`
-	RepositoryDiscovery RepositoryDiscoveryConfig `mapstructure:"repositoryDiscovery"`
-	Worktree            WorktreeConfig            `mapstructure:"worktree"`
-	RepoClone           RepoCloneConfig           `mapstructure:"repoClone"`
-	Debug               DebugConfig               `mapstructure:"debug"`
-	Office              OfficeConfig              `mapstructure:"office"`
-	Voice               VoiceConfig               `mapstructure:"voice"`
-	Features            FeaturesConfig            `mapstructure:"features"`
+	HomeDir                string                       `mapstructure:"homeDir"`
+	Server                 ServerConfig                 `mapstructure:"server"`
+	Database               DatabaseConfig               `mapstructure:"database"`
+	NATS                   NATSConfig                   `mapstructure:"nats"`
+	Events                 EventsConfig                 `mapstructure:"events"`
+	Docker                 DockerConfig                 `mapstructure:"docker"`
+	Agent                  AgentConfig                  `mapstructure:"agent"`
+	Auth                   AuthConfig                   `mapstructure:"auth"`
+	Logging                LoggingConfig                `mapstructure:"logging"`
+	RepositoryDiscovery    RepositoryDiscoveryConfig    `mapstructure:"repositoryDiscovery"`
+	Worktree               WorktreeConfig               `mapstructure:"worktree"`
+	RepoClone              RepoCloneConfig              `mapstructure:"repoClone"`
+	Debug                  DebugConfig                  `mapstructure:"debug"`
+	Office                 OfficeConfig                 `mapstructure:"office"`
+	Voice                  VoiceConfig                  `mapstructure:"voice"`
+	Features               FeaturesConfig               `mapstructure:"features"`
+	GitHubCredentialBroker GitHubCredentialBrokerConfig `mapstructure:"githubCredentialBroker"`
+}
+
+// GitHubCredentialBrokerConfig holds the externally reachable service URL
+// used by managed remote executors. It is independent of GitHub App setup so
+// PAT and named gh CLI workspaces can use remote executors.
+type GitHubCredentialBrokerConfig struct {
+	PublicBaseURL string `mapstructure:"publicBaseUrl" json:"-"`
+}
+
+func (c GitHubCredentialBrokerConfig) validate() error {
+	if strings.TrimSpace(c.PublicBaseURL) == "" {
+		return nil
+	}
+	return validatePublicBaseURL("githubCredentialBroker.publicBaseUrl", c.PublicBaseURL)
+}
+
+func validatePublicBaseURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Hostname() == "" {
+		return fmt.Errorf("%s must be an absolute URL", field)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%s must not include credentials, query, or fragment", field)
+	}
+	if u.Scheme != "https" && (u.Scheme != "http" || !IsLoopbackHost(u.Hostname())) {
+		return fmt.Errorf("%s must use HTTPS outside loopback development", field)
+	}
+	return nil
 }
 
 // expandTilde expands a leading "~/" to the user's home directory.
@@ -296,10 +326,20 @@ type DockerConfig struct {
 	VolumeBasePath string `mapstructure:"volumeBasePath"`
 }
 
-// AuthConfig holds authentication configuration.
+// AuthConfig holds authentication configuration. Whether authentication is
+// enforced is controlled by the `features.auth` runtime flag
+// (KANDEV_FEATURES_AUTH), not here — these are only session-mechanics knobs.
 type AuthConfig struct {
 	JWTSecret     string `mapstructure:"jwtSecret"`
 	TokenDuration int    `mapstructure:"tokenDuration"` // in seconds
+
+	// SessionTTLHours is the sliding lifetime of a browser session. A session
+	// is extended whenever it is used with less than TTL-24h remaining.
+	SessionTTLHours int `mapstructure:"sessionTTLHours"`
+
+	// CookieName is the session cookie name. Only override for unusual
+	// reverse-proxy setups that need distinct cookie names per instance.
+	CookieName string `mapstructure:"cookieName"`
 }
 
 // OfficeConfig holds configuration for the office (autonomous agents) feature.
@@ -343,6 +383,26 @@ type FeaturesConfig struct {
 	// construction, HTTP/WS route registration, and frontend nav/route
 	// visibility.
 	Plugins bool `mapstructure:"plugins" json:"plugins"`
+
+	// AppStatusBar gates the global status bar on tablet/desktop and the
+	// corresponding Status drawer on phones. The snake_case mapstructure key
+	// keeps the config and KANDEV_FEATURES_APP_STATUS_BAR environment name aligned.
+	AppStatusBar bool `mapstructure:"app_status_bar" json:"appStatusBar"`
+
+	// Auth is the on/off switch for opt-in authentication and per-user
+	// workspaces. When on, every visitor must sign in (the first becomes the
+	// admin via a setup wizard) and workspaces are private per user; the
+	// Users/Account settings surfaces also become visible. Set via the
+	// runtime feature toggle KANDEV_FEATURES_AUTH (Settings > System > Feature
+	// Toggles). Off by default so kandev stays single-user until a deployment
+	// opts in.
+	Auth bool `mapstructure:"auth" json:"auth"`
+
+	// ClaudeBackgroundPromptHandoff gates the high-risk experiment that lets a
+	// claude-acp session accept a successor prompt after an adapter-attested
+	// foreground handoff while background work remains live. It is off in every
+	// embedded profile and must fail closed for every other provider.
+	ClaudeBackgroundPromptHandoff bool `mapstructure:"claude_background_prompt_handoff" json:"claudeBackgroundPromptHandoff"`
 }
 
 // LoggingConfig holds logging configuration.
@@ -500,7 +560,9 @@ func setDefaults(v *viper.Viper) {
 
 	// Auth defaults
 	v.SetDefault("auth.jwtSecret", "")
-	v.SetDefault("auth.tokenDuration", 3600) // 1 hour
+	v.SetDefault("auth.tokenDuration", 3600)  // 1 hour
+	v.SetDefault("auth.sessionTTLHours", 720) // 30 days, sliding
+	v.SetDefault("auth.cookieName", "kandev_session")
 
 	// Office defaults
 	v.SetDefault("office.jwtSigningKey", "")
@@ -625,6 +687,10 @@ func LoadWithPath(configPath string) (*Config, error) {
 	_ = v.BindEnv("debug.devMode", "KANDEV_DEBUG_DEV_MODE")
 	_ = v.BindEnv("debug.pprofEnabled", "KANDEV_DEBUG_PPROF_ENABLED")
 	_ = v.BindEnv("voice.openAIApiKey", "KANDEV_VOICE_OPENAI_API_KEY")
+	_ = v.BindEnv(
+		"githubCredentialBroker.publicBaseUrl",
+		"KANDEV_GITHUB_CREDENTIAL_BROKER_PUBLIC_BASE_URL",
+	)
 
 	// Configure config file
 	v.SetConfigName("config")
@@ -720,6 +786,10 @@ func validate(cfg *Config) error {
 
 	if cfg.RepositoryDiscovery.MaxDepth <= 0 {
 		errs = append(errs, "repositoryDiscovery.maxDepth must be positive")
+	}
+
+	if err := cfg.GitHubCredentialBroker.validate(); err != nil {
+		errs = append(errs, err.Error())
 	}
 
 	if len(errs) > 0 {

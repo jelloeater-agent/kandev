@@ -36,8 +36,10 @@ Product-wide capabilities that are not tied to a single feature area.
 
 | Spec | Status |
 |---|---|
+| [background-work-liveness](platform/background-work-liveness.md) | shipped |
 | [plugins](plugins/spec.md) | draft |
 | [plugins — marketplace](plugins/marketplace.md) | building |
+| [semantic-notifications](platform/notifications.md) | shipped |
 | [workspace-git-status](platform/workspace-git-status.md) | shipped |
 
 ## tasks/ — task & workflow model
@@ -51,6 +53,7 @@ Kandev's task model: documents, execution stages, labels, blocker escalation, su
 | [labels](tasks/labels.md) | shipped |
 | [model-unification](tasks/model-unification.md) | draft |
 | [without-repositories](tasks/without-repositories.md) | draft |
+| [attach-workspace-sources](tasks/attach-workspace-sources.md) | building |
 | [subtask-checklist](tasks/subtask-checklist.md) | shipped |
 | [subtask-detachment](tasks/subtask-detachment.md) | shipped |
 | [subtask-completion-trigger](tasks/subtask-completion-trigger.md) | draft |
@@ -59,13 +62,14 @@ Kandev's task model: documents, execution stages, labels, blocker escalation, su
 | [runtime-cleanup](tasks/runtime-cleanup.md) | draft |
 | [archive-confirmation](tasks/archive-confirmation.md) | shipped |
 | [link-existing-task-github-issue](tasks/link-existing-task-github-issue.md) | building |
-| [wip-limit-pull-system](tasks/wip-limit-pull-system.md) | building |
+| [wip-limit-pull-system](tasks/wip-limit-pull-system.md) | draft |
 | [multi-branch](tasks/multi-branch/spec.md) | shipped |
 | [quick-chat-sessions](tasks/quick-chat-expiration.md) | shipped |
 | [quick-chat-repository-context](tasks/quick-chat-repository-context.md) | shipped |
 | [parent-child-message-interrupt](tasks/parent-child-message-interrupt.md) | shipped |
 | [parent-child-task-stop](tasks/parent-child-task-stop.md) | shipped |
 | [mcp-task-agent-profile-default](tasks/mcp-task-agent-profile-default/spec.md) | shipped |
+| [explicit-completion-signal](workflow/explicit-completion-signal/spec.md) | shipped |
 
 ## agents/ — agent governance
 
@@ -73,6 +77,7 @@ Roles, governance gates, and granular permissions that apply across human users 
 
 | Spec | Status |
 |---|---|
+| [runtime-updates](agents/runtime-updates.md) | approved |
 | [roles](agents/roles.md) | shipped |
 | [governance](agents/governance.md) | shipped |
 | [granular-permissions](agents/granular-permissions.md) | draft |
@@ -86,13 +91,15 @@ Per-workspace credentials and triage triggers for external services.
 | [azure-devops-integration](azure-devops-integration/spec.md) | shipped |
 | [slack](integrations/slack.md) | shipped |
 | [external-mcp](integrations/external-mcp.md) | draft |
-| [gitlab-integration](gitlab-integration/spec.md) | building |
+| [github-authentication](integrations/github-authentication.md) | draft |
+| [gitlab-integration](gitlab-integration/spec.md) | shipped |
 | [jira-status-filter](jira-status-filter/spec.md) | shipped |
 
 ## workspaces/ — workspace lifecycle
 
 | Spec | Status |
 |---|---|
+| [creation](workspaces/creation.md) | building |
 | [deletion](workspaces/deletion.md) | shipped |
 | [local-repositories](workspaces/local-repositories.md) | shipped |
 
@@ -109,18 +116,30 @@ Subscription quota tracking and per-agent cheap-model profile routing.
 
 | Spec | Status |
 |---|---|
-| [ci-pr-automation](ui/ci-pr-automation.md) | draft |
+| [ci-pr-automation](ui/ci-pr-automation.md) | building |
+| [github-pr-review-actions](ui/github-pr-review-actions.md) | shipped |
 | [comment-markdown](ui/comment-markdown.md) | shipped |
 | [empty-turn-notice](ui/empty-turn-notice.md) | shipped |
 | [acp-shell-command-output](ui/acp-shell-command-output.md) | shipped |
 | [acp-model-configuration-summary](ui/acp-model-configuration-summary.md) | shipped |
 | [review-file-status](ui/review-file-status.md) | building |
+| [review-markdown-preview](ui/review-markdown-preview.md) | draft |
 | [sidebar-view-creation](ui/sidebar-view-creation.md) | shipped |
+| [sidebar-task-completion-icons](ui/sidebar-task-completion-icons.md) | shipped |
 | [slash-command-composer](ui/slash-command-composer.md) | shipped |
+| [entity-reference-composer](ui/entity-reference-composer.md) | draft |
 | [settings-manual-save](ui/settings-manual-save.md) | shipped |
+| [app-status-bar](ui/app-status-bar.md) | draft |
 | [mobile-task-navigation](ui/mobile-task-navigation.md) | shipped |
+| [adaptive-kanban](ui/adaptive-kanban.md) | shipped |
 | [task-layout-profiles](ui/task-layout-profiles.md) | draft |
+| [task-surface-refresh](ui/task-surface-refresh.md) | draft |
+| [walkthrough-navigation-layout](walkthrough-navigation-layout/spec.md) | shipped |
 | [agent-message-comments](ui/agent-message-comments.md) | shipped |
+| [external-vcs-file-links](ui/external-vcs-file-links.md) | shipped |
+| [task-listing-display-preferences](ui/task-listing-display-preferences.md) | shipped |
+| [task-workspace-content-search](ui/task-workspace-content-search.md) | shipped |
+| [embedded-vscode-windows-availability](ui/embedded-vscode-windows-availability.md) | shipped |
 
 ## system-page/ — operational diagnostics & maintenance UI
 
@@ -138,8 +157,12 @@ System pages (Radarr/Sonarr-style) for status, disk usage, database maintenance,
 
 | Spec | Status |
 |---|---|
+| [agent-resume-runtime-recovery](agent-resume-runtime-recovery/spec.md) | shipped |
+| [agent-stall-recovery](agent-stall-recovery/spec.md) | draft |
+| [auth](auth/spec.md) | building |
+| [create-local-repository](create-local-repository/spec.md) | shipped |
 | [workflow-cycle-guardrails](workflow-cycle-guardrails/spec.md) | building |
-| [improve-kandev](improve-kandev/spec.md) | draft |
+| [improve-kandev](improve-kandev/spec.md) | building |
 | [homebrew-core](homebrew-core/spec.md) | draft |
 | [native-kandev-cli](native-kandev-cli/spec.md) | draft |
 | [desktop-tauri-app](desktop-tauri-app/spec.md) | shipped |
@@ -148,6 +171,7 @@ System pages (Radarr/Sonarr-style) for status, disk usage, database maintenance,
 | [cli-mode-parity](cli-mode-parity/spec.md) | draft |
 | [workflow-settings-autosave](workflow-settings-autosave/spec.md) | archived; superseded by settings-manual-save |
 | [mobile-quick-chat-topbar](mobile-quick-chat-topbar/spec.md) | building |
+| [native-code-review](native-code-review/spec.md) | building |
 
 ---
 

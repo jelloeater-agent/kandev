@@ -12,6 +12,7 @@ import { stripSystemTags } from "@/lib/utils/system-tags";
 import { useQueue } from "@/hooks/domains/session/use-queue";
 import { isWorkflowQueuedMessage, QueuedGhostMessage } from "./queued-ghost-message";
 import type { QueuedMessage } from "@/lib/state/slices/session/types";
+import type { EntityReference } from "@/lib/types/entity-reference";
 
 const HEAD_PREVIEW_MAX = 80;
 
@@ -72,7 +73,12 @@ type QueueAffordanceProps = {
 type QueuePanelHandlerArgs = {
   clearAll: () => Promise<void>;
   drainNext: () => Promise<void>;
-  editEntry: (entryId: string, content: string) => Promise<void>;
+  editEntry: (
+    entryId: string,
+    content: string,
+    attachments?: undefined,
+    entityReferences?: EntityReference[],
+  ) => Promise<void>;
   removeEntry: (entryId: string) => Promise<void>;
 };
 
@@ -83,8 +89,8 @@ function useQueuePanelHandlers({
   removeEntry,
 }: QueuePanelHandlerArgs) {
   const handleSave = useCallback(
-    async (entryId: string, content: string) => {
-      await editEntry(entryId, content);
+    async (entryId: string, content: string, entityReferences: EntityReference[]) => {
+      await editEntry(entryId, content, undefined, entityReferences);
     },
     [editEntry],
   );
@@ -272,7 +278,7 @@ type QueuePanelProps = {
   onClose: () => void;
   onClear: () => void;
   onDrain: () => void;
-  onSave: (entryId: string, content: string) => Promise<void>;
+  onSave: (entryId: string, content: string, entityReferences: EntityReference[]) => Promise<void>;
   onRemove: (entryId: string) => Promise<void>;
 };
 
@@ -296,7 +302,8 @@ function QueuePanel({
       aria-label="Queued messages"
       data-testid="queued-ghost-list"
       className={cn(
-        "flex-shrink-0 px-3 pt-1.5 pb-1 border-t border-border/40",
+        "flex max-h-[min(40dvh,32rem)] flex-shrink-0 flex-col px-3 pt-1.5 pb-1",
+        "border-t border-border/40",
         "animate-in slide-in-from-bottom-2 fade-in-0 duration-200",
       )}
     >
@@ -310,14 +317,17 @@ function QueuePanel({
         onDrain={onDrain}
         onClose={onClose}
       />
-      <div className="space-y-1.5">
+      <div
+        data-testid="queue-scroll-region"
+        className="min-h-0 flex-1 space-y-1.5 overflow-y-auto overscroll-contain pr-1"
+      >
         {entries.map((entry, index) => (
           <QueuedGhostMessage
             key={entry.id}
             entry={entry}
             index={index}
             canEdit={canUserEditEntry(entry)}
-            onSave={(content) => onSave(entry.id, content)}
+            onSave={(content, entityReferences) => onSave(entry.id, content, entityReferences)}
             onRemove={() => onRemove(entry.id)}
           />
         ))}
@@ -349,7 +359,7 @@ function QueuePanelHeader({
 }: QueuePanelHeaderProps) {
   const capacityText = max > 0 ? `${count} of ${max}` : `${count}`;
   return (
-    <div className="flex items-center justify-between gap-3 py-1">
+    <div className="flex shrink-0 items-center justify-between gap-3 py-1">
       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
         <IconLayoutList className="h-3.5 w-3.5" />
         <span className="uppercase tracking-wide">Queued</span>

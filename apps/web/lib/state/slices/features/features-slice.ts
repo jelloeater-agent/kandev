@@ -8,6 +8,9 @@ export const defaultFeaturesState: FeaturesSliceState = {
   features: {
     office: false,
     plugins: false,
+    appStatusBar: false,
+    auth: false,
+    claudeBackgroundPromptHandoff: false,
   },
 };
 

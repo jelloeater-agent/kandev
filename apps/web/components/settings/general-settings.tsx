@@ -10,6 +10,7 @@ import {
   IconKeyboard,
   IconGitBranch,
   IconArchive,
+  IconArrowBackUp,
 } from "@tabler/icons-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@kandev/ui/card";
 import { Label } from "@kandev/ui/label";
@@ -23,10 +24,14 @@ import { GENERAL_NAV_ITEMS } from "@/components/settings/general-nav";
 import { useAppStore, useAppStoreApi } from "@/components/state-provider";
 import { updateUserSettings } from "@/lib/api";
 import type { Theme } from "@/lib/settings/types";
+import type { UserSettingsState } from "@/lib/state/slices/settings/types";
 import { ArchiveConfirmationSettings } from "@/components/settings/archive-confirmation-settings";
 import { MCPTaskAgentProfileDefaultSettings } from "@/components/settings/mcp-task-agent-profile-default-settings";
+import { AnchoredPromptBarSettings } from "@/components/settings/anchored-prompt-bar-settings";
 import { useSettingsSaveContributor } from "@/components/settings/settings-save-provider";
 import type { StoredShortcutOverrides } from "@/lib/keyboard/shortcut-overrides";
+import { buildPluginShortcutEntries } from "@/lib/keyboard/plugin-shortcuts";
+import { usePlugins } from "@/hooks/domains/plugins/use-plugins";
 
 function ThemeSettingsCard({
   theme,
@@ -137,6 +142,18 @@ function ChangesPanelLayoutCard({
   );
 }
 
+function createAppearanceSavedState(
+  theme: Theme,
+  userSettings: Pick<UserSettingsState, "changesPanelLayout" | "systemMetricsDisplay">,
+) {
+  return {
+    theme,
+    changesPanelLayout: userSettings.changesPanelLayout,
+    showMetrics: userSettings.systemMetricsDisplay.showInTopbar,
+    simplifiedMetrics: userSettings.systemMetricsDisplay.simplified,
+  };
+}
+
 export function GeneralSettings() {
   return (
     <div className="space-y-8">
@@ -174,6 +191,16 @@ export function TaskActionsSettings() {
           <ArchiveConfirmationSettings />
         </div>
       </SettingsSection>
+
+      <Separator />
+
+      <SettingsSection
+        icon={<IconArrowBackUp className="h-5 w-5" />}
+        title="Transcript Navigation"
+        description="The scroll-up buttons next to the share button are always available; optionally show a sticky prompt bar on desktop"
+      >
+        <AnchoredPromptBarSettings />
+      </SettingsSection>
     </div>
   );
 }
@@ -183,11 +210,7 @@ export function AppearanceSettings() {
   const setUserSettings = useAppStore((state) => state.setUserSettings);
   const storeApi = useAppStoreApi();
   const { savedTheme, previewTheme, commitTheme, restoreTheme } = useTheme();
-  const [saved, setSaved] = useState(() => ({
-    theme: savedTheme,
-    changesPanelLayout: userSettings.changesPanelLayout,
-    showMetrics: userSettings.systemMetricsDisplay.showInTopbar,
-  }));
+  const [saved, setSaved] = useState(() => createAppearanceSavedState(savedTheme, userSettings));
   const [draft, setDraft] = useState(saved);
   const draftRef = useRef(draft);
   draftRef.current = draft;
@@ -206,7 +229,10 @@ export function AppearanceSettings() {
         workspace_id: current.workspaceId || "",
         repository_ids: current.repositoryIds || [],
         changes_panel_layout: submitted.changesPanelLayout,
-        system_metrics_display: { show_in_topbar: submitted.showMetrics },
+        system_metrics_display: {
+          show_in_topbar: submitted.showMetrics,
+          simplified: submitted.simplifiedMetrics,
+        },
       });
       commitTheme(submitted.theme);
       if (draftRef.current.theme !== submitted.theme) {
@@ -216,7 +242,10 @@ export function AppearanceSettings() {
       setUserSettings({
         ...storeApi.getState().userSettings,
         changesPanelLayout: submitted.changesPanelLayout,
-        systemMetricsDisplay: { showInTopbar: submitted.showMetrics },
+        systemMetricsDisplay: {
+          showInTopbar: submitted.showMetrics,
+          simplified: submitted.simplifiedMetrics,
+        },
       });
     },
     discard: () => {
@@ -272,6 +301,9 @@ export function AppearanceSettings() {
           showInTopbar={draft.showMetrics}
           isShowInTopbarDirty={draft.showMetrics !== saved.showMetrics}
           onShowInTopbarChange={(showMetrics) => updateDraft({ showMetrics })}
+          simplified={draft.simplifiedMetrics}
+          isSimplifiedDirty={draft.simplifiedMetrics !== saved.simplifiedMetrics}
+          onSimplifiedChange={(simplifiedMetrics) => updateDraft({ simplifiedMetrics })}
         />
       </SettingsSection>
     </div>
@@ -282,6 +314,8 @@ export function KeyboardShortcutsSettings() {
   const userSettings = useAppStore((state) => state.userSettings);
   const setUserSettings = useAppStore((state) => state.setUserSettings);
   const storeApi = useAppStoreApi();
+  const { items: pluginItems } = usePlugins();
+  const pluginShortcutEntries = buildPluginShortcutEntries(pluginItems);
   const [saved, setSaved] = useState(() => ({
     chatSubmitKey: userSettings.chatSubmitKey,
     keyboardShortcuts: userSettings.keyboardShortcuts as StoredShortcutOverrides,
@@ -335,6 +369,7 @@ export function KeyboardShortcutsSettings() {
           onChange={(keyboardShortcuts) =>
             setDraft((current) => ({ ...current, keyboardShortcuts }))
           }
+          pluginEntries={pluginShortcutEntries}
         />
       </SettingsSection>
     </div>

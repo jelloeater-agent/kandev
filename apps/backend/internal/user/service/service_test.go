@@ -27,6 +27,49 @@ func rawClear() **json.RawMessage {
 	return ptr((*json.RawMessage)(nil))
 }
 
+func TestApplyBasicSettingsTasksListShowDetails(t *testing.T) {
+	t.Run("omission preserves saved value", func(t *testing.T) {
+		settings := &models.UserSettings{TasksListShowDetails: true}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{}); err != nil {
+			t.Fatalf("apply basic settings: %v", err)
+		}
+		if !settings.TasksListShowDetails {
+			t.Fatal("TasksListShowDetails = false, want true")
+		}
+	})
+
+	for _, value := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit %t is applied", value), func(t *testing.T) {
+			settings := &models.UserSettings{TasksListShowDetails: !value}
+			if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{TasksListShowDetails: ptr(value)}); err != nil {
+				t.Fatalf("apply basic settings: %v", err)
+			}
+			if settings.TasksListShowDetails != value {
+				t.Fatalf("TasksListShowDetails = %t, want %t", settings.TasksListShowDetails, value)
+			}
+		})
+	}
+}
+
+func TestApplyBasicSettingsSystemMetricsDisplayPreservesOmittedFields(t *testing.T) {
+	settings := &models.UserSettings{
+		SystemMetricsDisplay: models.SystemMetricsDisplaySettings{
+			ShowInTopbar: false,
+			Simplified:   true,
+		},
+	}
+	req := &UpdateUserSettingsRequest{
+		SystemMetricsDisplay: &SystemMetricsDisplaySettingsPatch{ShowInTopbar: ptr(true)},
+	}
+
+	if err := applyBasicSettings(settings, req); err != nil {
+		t.Fatalf("apply basic settings: %v", err)
+	}
+	if !settings.SystemMetricsDisplay.Simplified {
+		t.Fatal("simplified = false, want existing value preserved when omitted")
+	}
+}
+
 func makeLayouts(n int) []models.SavedLayout {
 	layouts := make([]models.SavedLayout, n)
 	for i := range layouts {
@@ -140,6 +183,36 @@ func TestApplyBasicSettings_ConfirmTaskArchive(t *testing.T) {
 	})
 }
 
+func TestApplyBasicSettingsAppStatusBarOrder(t *testing.T) {
+	saved := models.AppStatusBarOrder{
+		LeftItemIDs:  []string{"builtin:connection"},
+		RightItemIDs: []string{"builtin:metrics"},
+	}
+	t.Run("omission preserves saved order", func(t *testing.T) {
+		settings := &models.UserSettings{AppStatusBarOrder: saved}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{}); err != nil {
+			t.Fatalf("apply settings: %v", err)
+		}
+		if fmt.Sprint(settings.AppStatusBarOrder) != fmt.Sprint(saved) {
+			t.Fatalf("AppStatusBarOrder = %#v, want %#v", settings.AppStatusBarOrder, saved)
+		}
+	})
+
+	t.Run("explicit value replaces saved order", func(t *testing.T) {
+		next := models.AppStatusBarOrder{
+			LeftItemIDs:  []string{"builtin:metrics"},
+			RightItemIDs: []string{"builtin:connection"},
+		}
+		settings := &models.UserSettings{AppStatusBarOrder: saved}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{AppStatusBarOrder: &next}); err != nil {
+			t.Fatalf("apply settings: %v", err)
+		}
+		if fmt.Sprint(settings.AppStatusBarOrder) != fmt.Sprint(next) {
+			t.Fatalf("AppStatusBarOrder = %#v, want %#v", settings.AppStatusBarOrder, next)
+		}
+	})
+}
+
 func TestApplyBasicSettingsMCPTaskAgentProfileDefault(t *testing.T) {
 	t.Run("omission preserves saved value", func(t *testing.T) {
 		settings := &models.UserSettings{MCPTaskAgentProfileDefault: models.MCPTaskAgentProfileDefaultWorkspaceDefault}
@@ -177,6 +250,55 @@ func TestApplyBasicSettingsMCPTaskAgentProfileDefault(t *testing.T) {
 			t.Fatalf("MCPTaskAgentProfileDefault = %q after invalid update, want workspace_default", settings.MCPTaskAgentProfileDefault)
 		}
 	})
+}
+
+func TestApplyBasicSettingsShowAnchoredPromptBar(t *testing.T) {
+	t.Run("omission preserves saved value", func(t *testing.T) {
+		settings := &models.UserSettings{ShowAnchoredPromptBar: true}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{}); err != nil {
+			t.Fatalf("apply settings: %v", err)
+		}
+		if !settings.ShowAnchoredPromptBar {
+			t.Fatal("ShowAnchoredPromptBar = false, want true (unchanged)")
+		}
+	})
+
+	t.Run("explicit value replaces saved value", func(t *testing.T) {
+		settings := &models.UserSettings{ShowAnchoredPromptBar: false}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{ShowAnchoredPromptBar: ptr(true)}); err != nil {
+			t.Fatalf("apply settings: %v", err)
+		}
+		if !settings.ShowAnchoredPromptBar {
+			t.Fatal("ShowAnchoredPromptBar = false, want true")
+		}
+	})
+
+	t.Run("explicit false disables it", func(t *testing.T) {
+		settings := &models.UserSettings{ShowAnchoredPromptBar: true}
+		if err := applyBasicSettings(settings, &UpdateUserSettingsRequest{ShowAnchoredPromptBar: ptr(false)}); err != nil {
+			t.Fatalf("apply settings: %v", err)
+		}
+		if settings.ShowAnchoredPromptBar {
+			t.Fatal("ShowAnchoredPromptBar = true, want false")
+		}
+	})
+}
+
+func TestApplyBasicSettingsTranscriptNavigation(t *testing.T) {
+	settings := &models.UserSettings{ShowScrollToLastPrompt: true, ShowScrollToStart: true}
+	if err := applyBasicSettings(
+		settings,
+		&UpdateUserSettingsRequest{ShowScrollToLastPrompt: ptr(false)},
+	); err != nil {
+		t.Fatalf("apply settings: %v", err)
+	}
+	if settings.ShowScrollToLastPrompt || !settings.ShowScrollToStart {
+		t.Fatalf(
+			"transcript controls = (%t, %t), want (false, true)",
+			settings.ShowScrollToLastPrompt,
+			settings.ShowScrollToStart,
+		)
+	}
 }
 
 func TestApplyBasicSettings_TasksListPreferences(t *testing.T) {
@@ -833,6 +955,27 @@ func TestPublishUserSettingsEventIncludesArchiveConfirmation(t *testing.T) {
 	}
 }
 
+func TestPublishUserSettingsEventIncludesTasksListShowDetails(t *testing.T) {
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatalf("logger.NewFromZap: %v", err)
+	}
+	eventBus := &recordingEventBus{}
+	svc := NewService(&recordingUserRepository{}, eventBus, log)
+	svc.publishUserSettingsEvent(context.Background(), &models.UserSettings{TasksListShowDetails: true})
+
+	if len(eventBus.publishedEvents) != 1 {
+		t.Fatalf("expected one settings event, got %d", len(eventBus.publishedEvents))
+	}
+	eventData, ok := eventBus.publishedEvents[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected event data map, got %T", eventBus.publishedEvents[0].Data)
+	}
+	if showDetails, ok := eventData["tasks_list_show_details"].(bool); !ok || !showDetails {
+		t.Fatalf("tasks_list_show_details = %#v, want true", eventData["tasks_list_show_details"])
+	}
+}
+
 func TestPublishUserSettingsEventIncludesNormalizedMCPTaskAgentProfileDefault(t *testing.T) {
 	log, err := logger.NewFromZap(zap.NewNop())
 	if err != nil {
@@ -853,6 +996,28 @@ func TestPublishUserSettingsEventIncludesNormalizedMCPTaskAgentProfileDefault(t 
 	}
 	if got := eventData["mcp_task_agent_profile_default"]; got != models.MCPTaskAgentProfileDefaultCurrentTask {
 		t.Fatalf("mcp_task_agent_profile_default = %#v, want current_task", got)
+	}
+}
+
+func TestPublishUserSettingsEventIncludesAppStatusBarOrder(t *testing.T) {
+	log, err := logger.NewFromZap(zap.NewNop())
+	if err != nil {
+		t.Fatalf("logger.NewFromZap: %v", err)
+	}
+	eventBus := &recordingEventBus{}
+	svc := NewService(&recordingUserRepository{}, eventBus, log)
+	want := models.AppStatusBarOrder{
+		LeftItemIDs:  []string{"left"},
+		RightItemIDs: []string{"right"},
+	}
+	svc.publishUserSettingsEvent(context.Background(), &models.UserSettings{AppStatusBarOrder: want})
+
+	eventData, ok := eventBus.publishedEvents[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected event data map, got %T", eventBus.publishedEvents[0].Data)
+	}
+	if got, ok := eventData["app_status_bar_order"].(models.AppStatusBarOrder); !ok || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("app_status_bar_order = %#v, want %#v", eventData["app_status_bar_order"], want)
 	}
 }
 

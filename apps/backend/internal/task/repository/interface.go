@@ -7,6 +7,7 @@ import (
 	agentdto "github.com/kandev/kandev/internal/agent/dto"
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/repository/repoerrors"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 )
 
@@ -15,6 +16,8 @@ var ErrWorkspaceNotFound = repoerrors.ErrWorkspaceNotFound
 var ErrTaskNotFound = repoerrors.ErrTaskNotFound
 var ErrTaskPlanNotFound = repoerrors.ErrTaskPlanNotFound
 var ErrRepositoryNotFound = repoerrors.ErrRepositoryNotFound
+var ErrTaskEnvironmentNotFound = repoerrors.ErrTaskEnvironmentNotFound
+var ErrWIPLimitExceeded = wfmodels.ErrWIPLimitExceeded
 
 // WorkspaceRepository handles workspace CRUD.
 type WorkspaceRepository interface {
@@ -52,6 +55,13 @@ type TaskRepository interface {
 	// Returns whether the row was updated.
 	UnarchiveTask(ctx context.Context, id string) (bool, error)
 	ListTasksForAutoArchive(ctx context.Context) ([]*models.Task, error)
+	// ListArchivedTasksWithActiveSessions returns the IDs of archived tasks
+	// (archived_at IS NOT NULL) that still have at least one task_sessions
+	// row in an active DB state (CREATED/STARTING/RUNNING/WAITING_FOR_INPUT).
+	// Candidate list for the periodic reconciliation sweep that recovers
+	// sessions left stranded when finalizeCancelledSessions's bounded
+	// in-line retry was exhausted by sustained SQLite writer contention.
+	ListArchivedTasksWithActiveSessions(ctx context.Context) ([]string, error)
 	ListExpiredQuickChatTasks(ctx context.Context, cutoff time.Time) ([]*models.Task, error)
 	DeleteExpiredQuickChatTask(ctx context.Context, id string, cutoff time.Time) (bool, error)
 	// CountOpenWatcherCreatedTasks returns the number of open watcher-created
@@ -64,8 +74,8 @@ type TaskRepository interface {
 	CountOpenWatcherCreatedTasks(ctx context.Context, metadataKey, watchID string) (int, error)
 	UpdateTaskState(ctx context.Context, id string, state v1.TaskState) error
 	// UpdateTaskStateIfSessionState atomically transitions task state only while
-	// the named owning session remains in expectedSessionState and the task is
-	// not archived. Returns the pre-update task state and whether a row changed.
+	// the named session remains in expectedSessionState and the task is not
+	// archived. Returns the pre-update state and whether a row changed.
 	UpdateTaskStateIfSessionState(
 		ctx context.Context,
 		taskID, sessionID string,
@@ -129,6 +139,16 @@ type TaskRepoRepository interface {
 	GetPrimaryTaskRepository(ctx context.Context, taskID string) (*models.TaskRepository, error)
 }
 
+// TaskWorkspaceFolderRepository handles canonical non-Git folder attachments.
+// It is intentionally separate from TaskRepoRepository to preserve existing
+// repository payload and Git-consumer contracts.
+type TaskWorkspaceFolderRepository interface {
+	ListTaskWorkspaceFolders(ctx context.Context, taskID string) ([]*models.TaskWorkspaceFolder, error)
+	ListTaskWorkspaceFoldersByTaskIDs(ctx context.Context, taskIDs []string) (map[string][]*models.TaskWorkspaceFolder, error)
+	CreateWorkspaceSourceBatch(ctx context.Context, batch *models.WorkspaceSourceBatch) error
+	CompensateWorkspaceSourceBatch(ctx context.Context, batch *models.WorkspaceSourceBatch) error
+}
+
 // WorkflowRepository handles workflow CRUD.
 type WorkflowRepository interface {
 	CreateWorkflow(ctx context.Context, workflow *models.Workflow) error
@@ -179,11 +199,15 @@ type SessionRepository interface {
 	GetActiveTaskSessionByTaskID(ctx context.Context, taskID string) (*models.TaskSession, error)
 	UpdateTaskSession(ctx context.Context, session *models.TaskSession) error
 	UpdateTaskSessionState(ctx context.Context, id string, state models.TaskSessionState, errorMessage string) error
+	// ClaimPromptableTaskSessionIfActive marks a promptable session RUNNING only
+	// while its owning task remains active. The state transition is the prompt
+	// claim: archive either wins first or follows normal cancellation semantics.
+	ClaimPromptableTaskSessionIfActive(ctx context.Context, id string) (models.PromptableTaskSessionClaim, error)
 	ResetTaskSessionBasesForRepository(ctx context.Context, taskID, repositoryID, baseBranch string) (int64, error)
 	ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error)
 	ListActiveTaskSessions(ctx context.Context) ([]*models.TaskSession, error)
 	ListActiveTaskSessionsByTaskID(ctx context.Context, taskID string) ([]*models.TaskSession, error)
-	CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) (int64, error)
+	CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) ([]*models.TaskSession, error)
 	HasActiveTaskSessionsByAgentProfile(ctx context.Context, agentProfileID string) (bool, error)
 	GetActiveTaskInfoByAgentProfile(ctx context.Context, agentProfileID string) ([]agentdto.ActiveTaskInfo, error)
 	HasActiveTaskSessionsByExecutor(ctx context.Context, executorID string) (bool, error)
@@ -264,6 +288,24 @@ type RepositoryEntityRepository interface {
 	ListRepositoryScripts(ctx context.Context, repositoryID string) ([]*models.RepositoryScript, error)
 	ListScriptsByRepositoryIDs(ctx context.Context, repoIDs []string) (map[string][]*models.RepositoryScript, error)
 	GetRepositoryByProviderInfo(ctx context.Context, workspaceID, provider, host, owner, name string) (*models.Repository, error)
+	// GetRepositoryByLocalPath finds a live repository by workspace and canonical
+	// local_path. Returns nil, nil if not found. Used by
+	// Service.FindOrCreateRepositoryByLocalPath to check for an existing row by
+	// canonical path immediately before insert (serialized via repoResolveMu),
+	// instead of relying solely on a batch snapshot that can go stale across
+	// concurrent callers within this process. This closes the common
+	// single-process race; it is not a substitute for a database-level
+	// uniqueness constraint against writers outside this process.
+	GetRepositoryByLocalPath(ctx context.Context, workspaceID, localPath string) (*models.Repository, error)
+}
+
+// RepositoryCleanupRepository performs guarded deletion of repositories
+// created during workspace-source attachment rollback.
+type RepositoryCleanupRepository interface {
+	// DeleteRepositoryIfUnreferenced soft-deletes a repository only when no
+	// task_repositories row currently adopts it. The predicate is part of the
+	// mutation so rollback cleanup cannot delete a repository another task won.
+	DeleteRepositoryIfUnreferenced(ctx context.Context, id string) (bool, error)
 }
 
 // ExecutorRepository handles executor CRUD, executor profiles, and running state.

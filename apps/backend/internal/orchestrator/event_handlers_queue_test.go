@@ -2,279 +2,884 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"reflect"
-	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
+	"github.com/jmoiron/sqlx"
 	"github.com/kandev/kandev/internal/github"
 	"github.com/kandev/kandev/internal/orchestrator/executor"
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
-	"github.com/kandev/kandev/internal/sysprompt"
+	"github.com/kandev/kandev/internal/orchestrator/watcher"
 	"github.com/kandev/kandev/internal/task/models"
+	wfmodels "github.com/kandev/kandev/internal/workflow/models"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 )
 
-func TestExecuteQueuedMessage_RequeuesWhenResetInProgress(t *testing.T) {
-	ctx := context.Background()
-	repo := setupTestRepo(t)
-	seedSession(t, repo, "t1", "s1", "step1")
-	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
-
-	session, err := repo.GetTaskSession(ctx, "s1")
-	if err != nil {
-		t.Fatalf("failed to get session: %v", err)
-	}
-	session.State = models.TaskSessionStateWaitingForInput
-	if err := repo.UpdateTaskSession(ctx, session); err != nil {
-		t.Fatalf("failed to update session: %v", err)
-	}
-
-	taskRepo := newMockTaskRepo()
-	agentMgr := &mockAgentManager{isAgentRunning: true, promptErr: ErrSessionResetInProgress}
-	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
-	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
-
-	queuedMsg := &messagequeue.QueuedMessage{
-		ID:        "q1",
-		SessionID: "s1",
-		TaskID:    "t1",
-		Content:   "hello",
-		QueuedBy:  "test",
-	}
-
-	svc.executeQueuedMessage("s1", queuedMsg)
-
-	status := svc.messageQueue.GetStatus(ctx, "s1")
-	if status.Count != 1 {
-		t.Fatalf("expected queued message to be requeued when reset is in progress, count=%d", status.Count)
-	}
-	if status.Entries[0].Content != "hello" {
-		t.Fatalf("expected queued content to be preserved, got %q", status.Entries[0].Content)
+func queuedReferenceFixture() v1.EntityReference {
+	return v1.EntityReference{
+		Version:  v1.EntityReferenceVersion,
+		Ref:      "mention:v1:kandev:task:workspace-1:task-2",
+		Provider: "kandev",
+		Kind:     "task",
+		ID:       "task-2",
+		Key:      "TASK-2",
+		Title:    "Referenced task",
+		URL:      "/t/task-2",
+		Scope:    "workspace-1",
 	}
 }
 
-func TestExecuteQueuedMessage_RequeuesCancelReleaseFailure(t *testing.T) {
-	ctx := context.Background()
-	repo := setupTestRepo(t)
-	seedSession(t, repo, "t1", "s1", "step1")
+type lifecycleClaimSequenceRepository struct {
+	repoStore
+	claimErrors []error
+	claimCalls  int
+}
 
-	session, err := repo.GetTaskSession(ctx, "s1")
+func (r *lifecycleClaimSequenceRepository) ClaimPromptableTaskSessionIfActive(
+	ctx context.Context, sessionID string,
+) (models.PromptableTaskSessionClaim, error) {
+	if r.claimCalls < len(r.claimErrors) {
+		err := r.claimErrors[r.claimCalls]
+		r.claimCalls++
+		if err != nil {
+			return models.PromptableTaskSessionClaim{}, err
+		}
+	}
+	return r.repoStore.ClaimPromptableTaskSessionIfActive(ctx, sessionID)
+}
+
+type lifecycleClaimBarrierRepository struct {
+	repoStore
+	claimEntered chan struct{}
+	allowClaim   chan struct{}
+}
+
+// lifecycleClaimHookRepository runs its hook only after the real SQLite
+// lifecycle claim has committed. It makes the gap between that claim and the
+// final prompt dispatch reproducible without timing sleeps.
+type lifecycleClaimHookRepository struct {
+	repoStore
+	afterClaim func()
+}
+
+// lifecycleResolveHookRepository changes task-session selection at the exact
+// final lifecycle-resolution boundary, after prompt preparation but before the
+// active-task claim. It avoids timing-dependent races in queue tests.
+type lifecycleResolveHookRepository struct {
+	repoStore
+	beforeResolve func()
+}
+
+type lifecycleResolveBarrierRepository struct {
+	repoStore
+	resolveEntered chan struct{}
+	allowResolve   chan struct{}
+	once           sync.Once
+}
+
+type lifecycleWorkflowBarrierRepository struct {
+	repoStore
+	sessionReadEntered chan struct{}
+	allowSessionRead   chan struct{}
+	once               sync.Once
+}
+
+type hookedMessageCreator struct {
+	*mockMessageCreator
+	beforeCreate func()
+}
+
+// archiveBeforeLifecycleRetryRepository commits an archive after a lifecycle
+// entry has been dequeued and its claim failed, but before the generic retry
+// insert runs. The channels make that schedule explicit without sleeps.
+type archiveBeforeLifecycleRetryRepository struct {
+	messagequeue.Repository
+	archive          func(context.Context) error
+	requeueStarted   chan struct{}
+	archiveCommitted chan struct{}
+	lifecycleCalls   int
+}
+
+func (r *archiveBeforeLifecycleRetryRepository) InsertOrReplaceLifecycleByCoalesceKey(
+	ctx context.Context,
+	msg *messagequeue.QueuedMessage,
+	coalesceKey string,
+	maxPerSession int,
+	allowInsert bool,
+) (*messagequeue.QueuedMessage, bool, error) {
+	r.lifecycleCalls++
+	if r.lifecycleCalls == 1 {
+		return r.Repository.InsertOrReplaceLifecycleByCoalesceKey(ctx, msg, coalesceKey, maxPerSession, allowInsert)
+	}
+	r.requeueStarted <- struct{}{}
+	if err := r.archive(ctx); err != nil {
+		return nil, false, err
+	}
+	r.archiveCommitted <- struct{}{}
+	return nil, false, messagequeue.ErrTaskInactive
+}
+
+func (r *lifecycleClaimBarrierRepository) ClaimPromptableTaskSessionIfActive(
+	ctx context.Context, sessionID string,
+) (models.PromptableTaskSessionClaim, error) {
+	r.claimEntered <- struct{}{}
+	<-r.allowClaim
+	return r.repoStore.ClaimPromptableTaskSessionIfActive(ctx, sessionID)
+}
+
+func (r *lifecycleClaimHookRepository) ClaimPromptableTaskSessionIfActive(
+	ctx context.Context, sessionID string,
+) (models.PromptableTaskSessionClaim, error) {
+	claim, err := r.repoStore.ClaimPromptableTaskSessionIfActive(ctx, sessionID)
+	if err == nil && claim.Status == models.PromptableTaskSessionClaimed && r.afterClaim != nil {
+		r.afterClaim()
+	}
+	return claim, err
+}
+
+func (r *lifecycleResolveHookRepository) ListTaskSessions(ctx context.Context, taskID string) ([]*models.TaskSession, error) {
+	if r.beforeResolve != nil {
+		r.beforeResolve()
+		r.beforeResolve = nil
+	}
+	return r.repoStore.ListTaskSessions(ctx, taskID)
+}
+
+func (r *lifecycleResolveBarrierRepository) ListTaskSessions(
+	ctx context.Context, taskID string,
+) ([]*models.TaskSession, error) {
+	r.once.Do(func() {
+		close(r.resolveEntered)
+		<-r.allowResolve
+	})
+	return r.repoStore.ListTaskSessions(ctx, taskID)
+}
+
+func (r *lifecycleWorkflowBarrierRepository) GetTaskSession(
+	ctx context.Context,
+	sessionID string,
+) (*models.TaskSession, error) {
+	r.once.Do(func() {
+		close(r.sessionReadEntered)
+		<-r.allowSessionRead
+	})
+	return r.repoStore.GetTaskSession(ctx, sessionID)
+}
+
+func (m *hookedMessageCreator) CreateUserMessage(
+	ctx context.Context,
+	taskID, content, sessionID, turnID string,
+	metadata map[string]interface{},
+) error {
+	if m.beforeCreate != nil {
+		m.beforeCreate()
+	}
+	return m.mockMessageCreator.CreateUserMessage(ctx, taskID, content, sessionID, turnID, metadata)
+}
+
+func TestExecuteQueuedMessage_LifecycleRequeueAfterArchiveIsDiscardedBeforeUnarchiveDrain(t *testing.T) {
+	ctx := context.Background()
+	baseRepo := setupTestRepo(t)
+	seedSession(t, baseRepo, "t1", "s1", "step1")
+	seedExecutorRunning(t, baseRepo, "s1", "t1", "exec-1")
+	session, err := baseRepo.GetTaskSession(ctx, "s1")
 	if err != nil {
-		t.Fatalf("failed to get session: %v", err)
+		t.Fatalf("get session: %v", err)
 	}
 	session.State = models.TaskSessionStateWaitingForInput
-	session.AgentExecutionID = "exec-1"
-	seedExecutorRunning(t, repo, session.ID, session.TaskID, "exec-1")
-	if err := repo.UpdateTaskSession(ctx, session); err != nil {
-		t.Fatalf("failed to update session: %v", err)
+	if err := baseRepo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
 	}
 
-	taskRepo := newMockTaskRepo()
 	agentMgr := &mockAgentManager{
-		isAgentRunning: true,
-		promptErr:      fmt.Errorf("failed to trigger prompt: prompt abandoned after cancel: %w", lifecycle.ErrCancelEscalated),
+		isAgentRunning:         true,
+		promptDone:             make(chan struct{}),
+		repoForExecutionLookup: baseRepo,
 	}
-	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
-	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	svc := createTestServiceWithAgent(baseRepo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, baseRepo, testLogger(), executor.ExecutorConfig{})
+	svc.repo = &lifecycleClaimSequenceRepository{
+		repoStore:   baseRepo,
+		claimErrors: []error{errors.New("transient lifecycle claim error")},
+	}
+	queueRepo := &archiveBeforeLifecycleRetryRepository{
+		Repository:       messagequeue.NewMemoryRepository(),
+		archive:          func(ctx context.Context) error { return baseRepo.ArchiveTask(ctx, "t1") },
+		requeueStarted:   make(chan struct{}, 1),
+		archiveCommitted: make(chan struct{}, 1),
+	}
+	svc.messageQueue = messagequeue.NewService(queueRepo, messagequeue.DefaultMaxPerSession, testLogger())
 
-	queuedMsg := &messagequeue.QueuedMessage{
-		ID:        "q-cancel",
-		SessionID: "s1",
-		TaskID:    "t1",
-		Content:   "hello after cancel",
-		QueuedBy:  "test",
+	// Start with a lifecycle-specific accepted entry, then take it as the
+	// normal ready-drain path does before executeQueuedMessage retries it.
+	_, _, accepted, err := svc.messageQueue.QueueLifecycleMessageWithCoalesceKey(
+		ctx, "s1", "t1", "stale lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+		false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("queue lifecycle entry: accepted=%v err=%v", accepted, err)
+	}
+	queued, ok := svc.messageQueue.TakeQueued(ctx, "s1")
+	if !ok {
+		t.Fatal("lifecycle entry was not dequeued")
 	}
 
-	svc.markQueuedDispatchInFlight("s1", queuedMsg.ID)
-	svc.executeQueuedMessage("s1", queuedMsg)
+	// The failed claim reaches the generic requeue. Its repository barrier
+	// commits the archive before that insert is allowed to proceed.
+	svc.executeQueuedMessage("s1", queued)
+	<-queueRepo.requeueStarted
+	<-queueRepo.archiveCommitted
 
-	status := svc.messageQueue.GetStatus(ctx, "s1")
-	if status.Count != 1 {
-		t.Fatalf("expected queued message to be requeued after cancel-release failure, count=%d", status.Count)
+	task, err := baseRepo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get archived task: %v", err)
 	}
-	if status.Entries[0].Content != "hello after cancel" {
-		t.Fatalf("expected queued content to be preserved, got %q", status.Entries[0].Content)
+	if task.ArchivedAt == nil {
+		t.Fatal("archive did not commit before the lifecycle retry insert")
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 0 {
+		t.Errorf("archived lifecycle retry entries = %d, want 0", got)
+	}
+
+	if _, err := baseRepo.UnarchiveTask(ctx, "t1"); err != nil {
+		t.Fatalf("unarchive task: %v", err)
+	}
+	if dispatched := svc.drainQueuedMessageForPromptableSession(ctx, "s1"); dispatched {
+		<-agentMgr.promptDone
+		t.Error("unarchive readiness drained a lifecycle retry that archive should have discarded")
+	}
+	if got := len(agentMgr.capturedPrompts); got != 0 {
+		t.Errorf("lifecycle prompts after archive/unarchive = %d, want 0", got)
 	}
 }
 
-// TestExecuteQueuedMessage_SkipsUserMessageWhenAlreadyRecorded pins the
-// duplicate-prompt fix: when a queued workflow auto-start carries
-// metadata[user_message_recorded]=true (set by autoStartStepPrompt's
-// post-recordAutoStartMessage retry branches), executeQueuedMessage must NOT
-// call CreateUserMessage. Without this guard, the boot_ready drain produces
-// the second identical "Merge"-step user row observed on the ACP-removal task.
-func TestExecuteQueuedMessage_SkipsUserMessageWhenAlreadyRecorded(t *testing.T) {
+func TestExecuteQueuedMessage_LifecycleClaimErrorClearsInFlightTokenForRetryDrain(t *testing.T) {
 	ctx := context.Background()
-	repo := setupTestRepo(t)
-	seedSession(t, repo, "t1", "s1", "step1")
-
-	session, err := repo.GetTaskSession(ctx, "s1")
+	baseRepo := setupTestRepo(t)
+	seedSession(t, baseRepo, "t1", "s1", "step1")
+	seedExecutorRunning(t, baseRepo, "s1", "t1", "exec-1")
+	session, err := baseRepo.GetTaskSession(ctx, "s1")
 	if err != nil {
-		t.Fatalf("failed to get session: %v", err)
+		t.Fatalf("get session: %v", err)
 	}
 	session.State = models.TaskSessionStateWaitingForInput
-	session.AgentExecutionID = "exec-1"
-	if err := repo.UpdateTaskSession(ctx, session); err != nil {
-		t.Fatalf("failed to update session: %v", err)
+	if err := baseRepo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
 	}
 
-	taskRepo := newMockTaskRepo()
-	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: repo}
-	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
-	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
-	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: baseRepo}
+	svc := createTestServiceWithAgent(baseRepo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, baseRepo, testLogger(), executor.ExecutorConfig{})
+	svc.repo = &lifecycleClaimSequenceRepository{
+		repoStore:   baseRepo,
+		claimErrors: []error{errors.New("transient claim database error")},
+	}
+	queued := &messagequeue.QueuedMessage{
+		ID: "lifecycle-claim-error", SessionID: "s1", TaskID: "t1", Content: "retry lifecycle prompt",
+		Metadata: map[string]interface{}{"origin": githubPRAutomationOrigin},
+	}
 
-	mc := &mockMessageCreator{}
-	svc.messageCreator = mc
+	svc.markQueuedDispatchInFlight("s1", queued.ID)
+	svc.executeQueuedMessage("s1", queued)
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("claim-error lifecycle retry entries = %d, want 1", got)
+	}
+	if svc.isQueuedDispatchInFlight("s1") {
+		t.Fatal("claim-error lifecycle dispatch left an in-flight token that blocks retry")
+	}
+	if !svc.drainQueuedMessageForPromptableSession(ctx, "s1") {
+		t.Fatal("retry lifecycle queue did not drain after transient claim error")
+	}
+}
 
-	queuedMsg := &messagequeue.QueuedMessage{
-		ID:        "q1",
-		SessionID: "s1",
-		TaskID:    "t1",
-		Content:   "merge it",
-		QueuedBy:  messagequeue.QueuedByWorkflow,
+func TestExecuteQueuedMessage_LifecycleDispatchFailureRestoresStateAndRetriesWithoutDuplicateMessage(t *testing.T) {
+	ctx := context.Background()
+	baseRepo := setupTestRepo(t)
+	seedSession(t, baseRepo, "t1", "s1", "step1")
+	seedExecutorRunning(t, baseRepo, "s1", "t1", "exec-1")
+	session, err := baseRepo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := baseRepo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
+	}
+
+	agentMgr := &mockAgentManager{
+		isAgentRunning:         true,
+		promptErr:              fmt.Errorf("agent stream disconnected while prompting"),
+		repoForExecutionLookup: baseRepo,
+	}
+	svc := createTestServiceWithAgent(baseRepo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, baseRepo, testLogger(), executor.ExecutorConfig{})
+	svc.messageCreator = &mockMessageCreator{}
+	queued := &messagequeue.QueuedMessage{
+		ID: "lifecycle-dispatch-failure", SessionID: "s1", TaskID: "t1", Content: "retry lifecycle prompt",
 		Metadata: map[string]interface{}{
-			"workflow_step_name":       "Merge",
-			metaKeyUserMessageRecorded: true,
+			"origin":                         githubPRAutomationOrigin,
+			messagequeue.MetadataCoalesceKey: "github-pr:repo:1:merged",
 		},
 	}
 
-	svc.markQueuedDispatchInFlight("s1", queuedMsg.ID)
-	svc.executeQueuedMessage("s1", queuedMsg)
-
-	if len(mc.userMessages) != 0 {
-		t.Fatalf("expected 0 user messages (already recorded before queueing), got %d", len(mc.userMessages))
+	svc.executeQueuedMessage("s1", queued)
+	persisted, err := baseRepo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("reload session after failed lifecycle dispatch: %v", err)
 	}
-	if len(agentMgr.capturedPrompts) != 1 {
-		t.Fatalf("expected the prompt to still reach PromptAgent, captured=%d", len(agentMgr.capturedPrompts))
+	if persisted.State != models.TaskSessionStateWaitingForInput {
+		t.Fatalf("session state after failed lifecycle dispatch = %s, want WAITING_FOR_INPUT", persisted.State)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("failed lifecycle dispatch retry entries = %d, want 1", got)
+	}
+
+	retry, ok := svc.messageQueue.TakeQueued(ctx, "s1")
+	if !ok {
+		t.Fatal("failed lifecycle dispatch did not retain a retry entry")
+	}
+	agentMgr.promptErr = nil
+	svc.executeQueuedMessage("s1", retry)
+	if got := len(svc.messageCreator.(*mockMessageCreator).userMessages); got != 1 {
+		t.Fatalf("lifecycle retry created %d visible messages, want 1", got)
 	}
 }
 
-func TestExecuteQueuedMessage_RecordsCIAutomationPromptOnDrain(t *testing.T) {
+// A lifecycle executor rejection is not a normal completed turn: the runtime
+// claim moved the task to IN_PROGRESS solely to make the pending delivery
+// observable. It must be rolled back to the captured pre-claim state rather
+// than sent to REVIEW like an ordinary user prompt failure.
+func TestExecuteQueuedMessage_LifecycleExecutorFailureRestoresPreClaimTaskState(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
 	seedSession(t, repo, "t1", "s1", "step1")
-
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
 	session, err := repo.GetTaskSession(ctx, "s1")
 	if err != nil {
-		t.Fatalf("failed to get session: %v", err)
+		t.Fatalf("get session: %v", err)
 	}
 	session.State = models.TaskSessionStateWaitingForInput
-	session.AgentExecutionID = "exec-1"
 	if err := repo.UpdateTaskSession(ctx, session); err != nil {
-		t.Fatalf("failed to update session: %v", err)
+		t.Fatalf("set session waiting: %v", err)
 	}
 
 	taskRepo := newMockTaskRepo()
-	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: repo}
+	seedMockTaskState(taskRepo, "t1", v1.TaskStateTODO)
+	agentMgr := &mockAgentManager{
+		isAgentRunning:         true,
+		promptErr:              errors.New("executor rejected lifecycle prompt"),
+		repoForExecutionLookup: repo,
+	}
 	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
 	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
-	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	svc.messageCreator = &mockMessageCreator{}
 
-	mc := &mockMessageCreator{}
-	svc.messageCreator = mc
-
-	queuedMsg := &messagequeue.QueuedMessage{
-		ID:        "q1",
-		SessionID: "s1",
-		TaskID:    "t1",
-		Content: ciAutomationChatPrompt(ciAutomationRenderPrompt(
-			"Fix the PR\n\n{{pr.feedback}}",
-			&github.TaskPR{Owner: "acme", Repo: "widget", PRNumber: 42},
-			ciAutomationCheckpoint{
-				FailedChecks: []ciAutomationCheckSnapshot{{Name: "unit", Conclusion: "failure"}},
-			},
-		)),
-		QueuedBy: messagequeue.QueuedByWorkflow,
+	svc.executeQueuedMessage("s1", &messagequeue.QueuedMessage{
+		ID: "lifecycle-executor-failure", SessionID: "s1", TaskID: "t1", Content: "retry lifecycle prompt",
 		Metadata: map[string]interface{}{
-			"origin":     ciAutomationOrigin,
-			"auto_start": true,
+			"origin": githubPRAutomationOrigin, messagequeue.MetadataCoalesceKey: "github-pr:repo:1:merged",
+		},
+	})
+
+	task, err := taskRepo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.State != v1.TaskStateTODO {
+		t.Fatalf("task state after rejected lifecycle prompt = %s, want restored TODO", task.State)
+	}
+	persisted, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	if persisted.State != models.TaskSessionStateWaitingForInput {
+		t.Fatalf("session state after rejected lifecycle prompt = %s, want WAITING_FOR_INPUT", persisted.State)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("rejected lifecycle prompt retries = %d, want 1", got)
+	}
+}
+
+// A lifecycle delivery must not complete a turn that belonged to an earlier
+// dispatch. It adopts such a turn only to associate the visible message; on
+// executor rejection, no lifecycle-owned turn exists to roll back.
+func TestExecuteQueuedMessage_LifecycleExecutorFailurePreservesPreexistingTurn(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := repo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set session waiting: %v", err)
+	}
+
+	turns := &repoTurnService{repo: repo}
+	preexisting, err := turns.StartTurn(ctx, "s1")
+	if err != nil {
+		t.Fatalf("create preexisting turn: %v", err)
+	}
+	taskRepo := newMockTaskRepo()
+	seedMockTaskState(taskRepo, "t1", v1.TaskStateReview)
+	agentMgr := &mockAgentManager{
+		isAgentRunning:         true,
+		promptErr:              errors.New("executor rejected lifecycle prompt"),
+		repoForExecutionLookup: repo,
+	}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	svc.turnService = turns
+	svc.messageCreator = &mockMessageCreator{}
+
+	svc.executeQueuedMessage("s1", &messagequeue.QueuedMessage{
+		ID: "lifecycle-existing-turn", SessionID: "s1", TaskID: "t1", Content: "retry lifecycle prompt",
+		Metadata: map[string]interface{}{
+			"origin": githubPRAutomationOrigin, messagequeue.MetadataCoalesceKey: "github-pr:repo:1:merged",
+		},
+	})
+
+	active, err := turns.GetActiveTurn(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get active turn: %v", err)
+	}
+	if active == nil || active.ID != preexisting.ID {
+		t.Fatalf("active turn after rejected lifecycle prompt = %+v, want preexisting %q still open", active, preexisting.ID)
+	}
+}
+
+// A concurrent task transition owns its result. Lifecycle error recovery may
+// restore only its own IN_PROGRESS claim, never overwrite the newer state.
+func TestExecuteQueuedMessage_LifecycleExecutorFailureDoesNotClobberConcurrentTaskTransition(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := repo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set session waiting: %v", err)
+	}
+
+	taskRepo := newMockTaskRepo()
+	seedMockTaskState(taskRepo, "t1", v1.TaskStateTODO)
+	agentMgr := &mockAgentManager{
+		isAgentRunning:         true,
+		repoForExecutionLookup: repo,
+		promptAgentFunc: func(context.Context, string, string, []v1.MessageAttachment, bool) (*executor.PromptResult, error) {
+			if err := taskRepo.UpdateTaskState(ctx, "t1", v1.TaskStateFailed); err != nil {
+				t.Errorf("concurrent task transition: %v", err)
+			}
+			return nil, errors.New("executor rejected lifecycle prompt")
+		},
+	}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	svc.messageCreator = &mockMessageCreator{}
+
+	svc.executeQueuedMessage("s1", &messagequeue.QueuedMessage{
+		ID: "lifecycle-concurrent-transition", SessionID: "s1", TaskID: "t1", Content: "retry lifecycle prompt",
+		Metadata: map[string]interface{}{
+			"origin": githubPRAutomationOrigin, messagequeue.MetadataCoalesceKey: "github-pr:repo:1:merged",
+		},
+	})
+
+	task, err := taskRepo.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.State != v1.TaskStateFailed {
+		t.Fatalf("concurrent task transition was clobbered: got %s, want FAILED", task.State)
+	}
+}
+
+func TestHandleAgentReady_PassthroughAcknowledgesLifecycleOnlyAfterPTYAcceptance(t *testing.T) {
+	tests := []struct {
+		name           string
+		lifecycle      bool
+		passthroughErr error
+		wantQueued     int
+	}{
+		{
+			name:           "lifecycle PTY failure retains durable entry",
+			lifecycle:      true,
+			passthroughErr: errors.New("PTY write failed"),
+			wantQueued:     1,
+		},
+		{
+			name:       "lifecycle PTY acceptance acknowledges durable entry",
+			lifecycle:  true,
+			wantQueued: 0,
+		},
+		{
+			name:           "ordinary PTY failure keeps legacy destructive dequeue",
+			passthroughErr: errors.New("PTY write failed"),
+			wantQueued:     0,
 		},
 	}
 
-	svc.markQueuedDispatchInFlight("s1", queuedMsg.ID)
-	svc.executeQueuedMessage("s1", queuedMsg)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedSession(t, repo, "t1", "s1", "step1")
+			agentMgr := &mockAgentManager{
+				isPassthrough:          true,
+				passthroughStdinErr:    tt.passthroughErr,
+				isAgentRunning:         true,
+				repoForExecutionLookup: repo,
+			}
+			steps := newMockStepGetter()
+			steps.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", WorkflowID: "wf1"}
+			taskRepo := newMockTaskRepo()
+			seedMockTaskState(taskRepo, "t1", v1.TaskStateReview)
+			svc := createTestServiceWithAgent(repo, steps, taskRepo, agentMgr)
+			svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+			svc.messageCreator = &mockMessageCreator{}
+			if tt.lifecycle {
+				seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+			}
 
-	if len(mc.userMessages) != 1 {
-		t.Fatalf("expected CI automation user message to be recorded on drain, got %d", len(mc.userMessages))
-	}
-	chatMessage := mc.userMessages[0]
-	visible := sysprompt.StripSystemContent(chatMessage.content)
-	if !strings.Contains(visible, "@ci-auto-fix") || !strings.Contains(visible, "PR: acme/widget#42") || !strings.Contains(visible, "unit: failure") {
-		t.Fatalf("expected visible chat prompt to include @ci-auto-fix and PR snapshot, got %q", visible)
-	}
-	if strings.Contains(visible, "Fix the PR") {
-		t.Fatalf("expected shared CI prompt to stay hidden, got %q", visible)
-	}
-	if !strings.Contains(chatMessage.content, "<kandev-system>") || !strings.Contains(chatMessage.content, "Fix the PR") || !strings.Contains(chatMessage.content, "unit") {
-		t.Fatalf("expected raw chat message to preserve hidden CI prompt, got %q", chatMessage.content)
-	}
-	if chatMessage.metadata["origin"] != ciAutomationOrigin || chatMessage.metadata["auto_start"] != true {
-		t.Fatalf("expected CI automation metadata, got %+v", chatMessage.metadata)
-	}
-	if len(agentMgr.capturedPrompts) != 1 {
-		t.Fatalf("expected the prompt to reach PromptAgent, captured=%d", len(agentMgr.capturedPrompts))
+			if tt.lifecycle {
+				_, _, accepted, err := svc.messageQueue.QueueLifecycleMessageWithCoalesceKey(
+					ctx, "s1", "t1", "merged lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+					false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+				)
+				if err != nil || !accepted {
+					t.Fatalf("queue lifecycle prompt: accepted=%v err=%v", accepted, err)
+				}
+			} else if _, err := svc.messageQueue.QueueMessage(ctx, "s1", "t1", "ordinary prompt", "", "user", false, nil); err != nil {
+				t.Fatalf("queue ordinary prompt: %v", err)
+			}
+
+			svc.handleAgentReady(ctx, watcher.AgentEventData{TaskID: "t1", SessionID: "s1"})
+
+			if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != tt.wantQueued {
+				t.Fatalf("queued entries after PTY result = %d, want %d", got, tt.wantQueued)
+			}
+		})
 	}
 }
 
-func TestExecuteQueuedMessage_StoresAttachmentsInUserMessageMetadata(t *testing.T) {
+func TestHandleAgentReady_PassthroughLifecyclePersistsVisibleMessageBeforePTYAcceptance(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+
+	ptyEntered := make(chan struct{})
+	releasePTY := make(chan struct{})
+	ptyAccepted := make(chan struct{})
+	agentMgr := &mockAgentManager{
+		isPassthrough:          true,
+		isAgentRunning:         true,
+		repoForExecutionLookup: repo,
+		passthroughStdinFunc: func(context.Context, string, string) error {
+			close(ptyEntered)
+			<-releasePTY
+			close(ptyAccepted)
+			return nil
+		},
+	}
+	taskRepo := newMockTaskRepo()
+	seedMockTaskState(taskRepo, "t1", v1.TaskStateReview)
+	steps := newMockStepGetter()
+	steps.steps["step1"] = &wfmodels.WorkflowStep{ID: "step1", WorkflowID: "wf1"}
+	svc := createTestServiceWithAgent(repo, steps, taskRepo, agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	messages := &mockMessageCreator{}
+	svc.messageCreator = messages
+	_, _, accepted, err := svc.messageQueue.QueueLifecycleMessageWithCoalesceKey(
+		ctx, "s1", "t1", "merged lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+		false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("queue lifecycle prompt: accepted=%v err=%v", accepted, err)
+	}
+
+	readyDone := make(chan struct{})
+	go func() {
+		svc.handleAgentReady(ctx, watcher.AgentEventData{TaskID: "t1", SessionID: "s1"})
+		close(readyDone)
+	}()
+	select {
+	case <-ptyEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for lifecycle PTY dispatch")
+	}
+
+	if got := len(messages.userMessages); got != 1 {
+		t.Fatalf("visible lifecycle messages before PTY acceptance = %d, want 1", got)
+	}
+	close(releasePTY)
+	<-ptyAccepted
+	<-readyDone
+}
+
+func TestArchiveTask_PersistentQueueCallbackDoesNotPurgeReacceptedGeneration(t *testing.T) {
 	ctx := context.Background()
 	repo := setupTestRepo(t)
 	seedSession(t, repo, "t1", "s1", "step1")
 
-	session, err := repo.GetTaskSession(ctx, "s1")
+	db := sqlx.NewDb(repo.DB(), "sqlite3")
+	persistentRepo, err := messagequeue.NewSQLiteRepository(db, db)
 	if err != nil {
-		t.Fatalf("failed to get session: %v", err)
+		t.Fatalf("new persistent queue repository: %v", err)
 	}
-	session.State = models.TaskSessionStateWaitingForInput
-	session.AgentExecutionID = "exec-1"
-	if err := repo.UpdateTaskSession(ctx, session); err != nil {
-		t.Fatalf("failed to update session: %v", err)
+	persistentQueue := messagequeue.NewService(persistentRepo, messagequeue.DefaultMaxPerSession, testLogger())
+	// An explicitly registered ephemeral mirror runs after the task mutation
+	// commits. It may observe an unarchive and a fresh G+1 lifecycle entry;
+	// NewService must leave that callback intact instead of replacing it with
+	// a second purge of the shared SQLite queue.
+	repo.SetTaskQueuePurger(func(hookCtx context.Context, taskID string) {
+		if _, err := repo.UnarchiveTask(hookCtx, taskID); err != nil {
+			t.Fatalf("unarchive during post-commit queue callback: %v", err)
+		}
+		_, _, accepted, err := persistentQueue.QueueLifecycleMessageWithCoalesceKey(
+			hookCtx, "s1", taskID, "fresh lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+			false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+		)
+		if err != nil || !accepted {
+			t.Fatalf("accept fresh lifecycle generation: accepted=%v err=%v", accepted, err)
+		}
+	})
+
+	// A supplied queue is production-owned and shares SQLite with the task
+	// repository, so NewService must not replace the separately registered
+	// ephemeral-mirror callback above.
+	_ = NewService(ServiceConfig{}, nil, &mockAgentManager{}, newMockTaskRepo(), repo, nil, nil, persistentQueue, testLogger())
+	_, _, accepted, err := persistentQueue.QueueLifecycleMessageWithCoalesceKey(
+		ctx, "s1", "t1", "old lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+		false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("accept original lifecycle generation: accepted=%v err=%v", accepted, err)
 	}
 
-	taskRepo := newMockTaskRepo()
-	agentMgr := &mockAgentManager{isAgentRunning: true}
-	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
-	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
-
-	mc := &mockMessageCreator{}
-	svc.messageCreator = mc
-
-	queuedAtts := []messagequeue.MessageAttachment{
-		{Type: "image", Data: "base64payload", MimeType: "image/png"},
+	if err := repo.ArchiveTask(ctx, "t1"); err != nil {
+		t.Fatalf("archive task: %v", err)
 	}
-	queuedMsg := &messagequeue.QueuedMessage{
-		ID:          "q1",
-		SessionID:   "s1",
-		TaskID:      "t1",
-		Content:     "look at this screenshot",
-		Attachments: queuedAtts,
-		QueuedBy:    "test",
+	if got := persistentQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("fresh lifecycle entries after archive callback = %d, want 1", got)
 	}
-
-	svc.executeQueuedMessage("s1", queuedMsg)
-
-	if len(mc.userMessages) != 1 {
-		t.Fatalf("expected 1 user message recorded, got %d", len(mc.userMessages))
+	generation, err := persistentRepo.LifecycleGeneration(ctx, "t1")
+	if err != nil {
+		t.Fatalf("read lifecycle generation: %v", err)
 	}
-	meta := mc.userMessages[0].metadata
-	if meta == nil {
-		t.Fatalf("expected metadata on user message, got nil")
-	}
-	raw, ok := meta["attachments"]
-	if !ok {
-		t.Fatalf("expected metadata to contain 'attachments' key, got %v", meta)
-	}
-	got, ok := raw.([]v1.MessageAttachment)
-	if !ok {
-		t.Fatalf("expected attachments to be []v1.MessageAttachment, got %T", raw)
-	}
-	want := []v1.MessageAttachment{
-		{Type: "image", Data: "base64payload", MimeType: "image/png"},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("attachments mismatch\n got: %+v\nwant: %+v", got, want)
+	if generation != 1 {
+		t.Fatalf("lifecycle generation after archive = %d, want 1", generation)
 	}
 }
+
+// Archive cancels accepted lifecycle work even when the currently selected
+// session is busy and therefore cannot drain it immediately. Unarchiving must
+// not resurrect that historical observation into a fresh agent prompt.
+func TestDispatchTaskPRAgentPrompt_ArchivePurgesBusyAcceptedLifecycleEntry(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{})
+	pr := &github.TaskPR{TaskID: "t1", RepositoryID: "repo-1", Owner: "acme", Repo: "widget", PRNumber: 42}
+
+	if _, err := svc.dispatchTaskPRAgentPrompt(ctx, pr, "merged lifecycle prompt", taskPRAgentEventMerged); err != nil {
+		t.Fatalf("accept lifecycle prompt while busy: %v", err)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("accepted lifecycle entries = %d, want 1", got)
+	}
+	if err := repo.ArchiveTask(ctx, "t1"); err != nil {
+		t.Fatalf("archive task: %v", err)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 0 {
+		t.Fatalf("archived task retained %d accepted lifecycle entries, want 0", got)
+	}
+	if _, err := repo.UnarchiveTask(ctx, "t1"); err != nil {
+		t.Fatalf("unarchive task: %v", err)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 0 {
+		t.Fatalf("unarchive resurrected %d lifecycle entries, want 0", got)
+	}
+}
+
+// Lifecycle rows are server-owned: an untrusted client cannot remove one by
+// guessing its ID, but the task-deletion path has privileged authority to
+// purge it together with the task so no orphan work survives.
+func TestHandleTaskDeleted_PrivilegedCleanupPurgesLifecycleRowsWithoutClientDeleteAuthority(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	svc := createTestServiceWithScheduler(repo, newMockStepGetter(), newMockTaskRepo(), &mockAgentManager{})
+	queued, _, accepted, err := svc.messageQueue.QueueLifecycleMessageWithCoalesceKey(
+		ctx, "s1", "t1", "merged lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+		false, nil, map[string]interface{}{"origin": githubPRAutomationOrigin}, "github-pr:repo:1:merged", true,
+	)
+	if err != nil || !accepted {
+		t.Fatalf("queue lifecycle prompt: accepted=%v err=%v", accepted, err)
+	}
+	if err := svc.messageQueue.RemoveEntry(ctx, "s1", queued.ID); !errors.Is(err, messagequeue.ErrEntryNotFound) {
+		t.Fatalf("client lifecycle removal error = %v, want ErrEntryNotFound", err)
+	}
+	if err := repo.DeleteTask(ctx, "t1"); err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+	svc.handleTaskDeleted(ctx, watcher.TaskEventData{TaskID: "t1"})
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 0 {
+		t.Fatalf("deleted task retained %d lifecycle queue rows, want 0", got)
+	}
+}
+
+func TestExecuteQueuedMessage_LifecycleBusyClaimRequeuesInsteadOfDropping(t *testing.T) {
+	ctx := context.Background()
+	baseRepo := setupTestRepo(t)
+	seedSession(t, baseRepo, "t1", "s1", "step1")
+	seedExecutorRunning(t, baseRepo, "s1", "t1", "exec-1")
+	session, err := baseRepo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := baseRepo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
+	}
+
+	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: baseRepo}
+	svc := createTestServiceWithAgent(baseRepo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, baseRepo, testLogger(), executor.ExecutorConfig{})
+	claimRepo := &lifecycleClaimBarrierRepository{
+		repoStore: baseRepo, claimEntered: make(chan struct{}), allowClaim: make(chan struct{}),
+	}
+	svc.repo = claimRepo
+	queued := &messagequeue.QueuedMessage{
+		ID: "lifecycle-busy-claim", SessionID: "s1", TaskID: "t1", Content: "preserve lifecycle prompt",
+		Metadata: map[string]interface{}{"origin": githubPRAutomationOrigin},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		svc.executeQueuedMessage("s1", queued)
+		close(done)
+	}()
+	<-claimRepo.claimEntered
+	if err := baseRepo.UpdateTaskSessionState(ctx, "s1", models.TaskSessionStateRunning, "direct prompt won"); err != nil {
+		t.Fatalf("direct prompt claim: %v", err)
+	}
+	close(claimRepo.allowClaim)
+	<-done
+
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Fatalf("busy lifecycle claim retained %d queue entries, want 1", got)
+	}
+}
+
+// The lifecycle claim currently writes RUNNING before ensureSessionRunning and
+// executor dispatch. If reset starts in that interval, the claim must be
+// rolled back to its prior promptable state so the retained entry can drain
+// once reset completes.
+func TestExecuteQueuedMessage_LifecycleResetAfterClaimRestoresStateAndRetryDrains(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := repo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
+	}
+
+	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: repo}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	svc.repo = &lifecycleClaimHookRepository{
+		repoStore: repo,
+		afterClaim: func() {
+			svc.setSessionResetInProgress("s1", true)
+		},
+	}
+	defer svc.setSessionResetInProgress("s1", false)
+
+	queued := &messagequeue.QueuedMessage{
+		ID: "lifecycle-reset-claim", SessionID: "s1", TaskID: "t1", Content: "retry after reset",
+		Metadata: map[string]interface{}{"origin": githubPRAutomationOrigin},
+	}
+	svc.markQueuedDispatchInFlight("s1", queued.ID)
+	svc.executeQueuedMessage("s1", queued)
+
+	persisted, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("reload claimed session: %v", err)
+	}
+	if persisted.State != models.TaskSessionStateWaitingForInput {
+		t.Errorf("state after reset won post-claim = %s, want WAITING_FOR_INPUT", persisted.State)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Errorf("retained lifecycle entries after reset = %d, want 1", got)
+	}
+
+	svc.setSessionResetInProgress("s1", false)
+	if !svc.drainQueuedMessageForPromptableSession(ctx, "s1") {
+		t.Error("reset retry was not drainable after the session became promptable")
+	}
+}
+
+// A newer queued dispatch can supersede the entry after lifecycle's database
+// claim commits but before executor.Prompt. The stale worker must requeue its
+// entry and never prompt the agent; the succeeding dispatch token remains the
+// only active owner.
+func TestExecuteQueuedMessage_LifecycleSupersededClaimBeforePromptDoesNotDispatch(t *testing.T) {
+	ctx := context.Background()
+	repo := setupTestRepo(t)
+	seedSession(t, repo, "t1", "s1", "step1")
+	seedExecutorRunning(t, repo, "s1", "t1", "exec-1")
+	session, err := repo.GetTaskSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	session.State = models.TaskSessionStateWaitingForInput
+	if err := repo.UpdateTaskSession(ctx, session); err != nil {
+		t.Fatalf("set waiting session: %v", err)
+	}
+
+	agentMgr := &mockAgentManager{isAgentRunning: true, repoForExecutionLookup: repo}
+	svc := createTestServiceWithAgent(repo, newMockStepGetter(), newMockTaskRepo(), agentMgr)
+	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	svc.repo = &lifecycleClaimHookRepository{
+		repoStore: repo,
+		afterClaim: func() {
+			svc.markQueuedDispatchInFlight("s1", "newer-dispatch")
+		},
+	}
+
+	queued := &messagequeue.QueuedMessage{
+		ID: "lifecycle-stale-claim", SessionID: "s1", TaskID: "t1", Content: "do not stale-dispatch",
+		Metadata: map[string]interface{}{"origin": githubPRAutomationOrigin},
+	}
+	svc.markQueuedDispatchInFlight("s1", queued.ID)
+	svc.executeQueuedMessage("s1", queued)
+
+	if got := len(agentMgr.capturedPrompts); got != 0 {
+		t.Errorf("stale lifecycle worker called executor.Prompt %d times, want 0", got)
+	}
+	if got := svc.messageQueue.GetStatus(ctx, "s1").Count; got != 1 {
+		t.Errorf("superseded lifecycle entry count = %d, want 1 retry entry", got)
+	}
+	if !svc.isCurrentQueuedDispatch("s1", "newer-dispatch") {
+		t.Error("stale lifecycle cleanup replaced the newer dispatch token")
+	}
+}
+
+// A lifecycle entry is task-owned, rather than permanently owned by the
+// session that happened to be selected when it was accepted. If task session
+// selection changes before the final lifecycle claim, retain the same
+// coalesced event for the replacement session instead of treating the old
+// session as an inactive task and silently discarding it.

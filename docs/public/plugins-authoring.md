@@ -253,6 +253,22 @@ its resource in `capabilities.api_read` (e.g. `tasks`, `sessions`, `messages`,
 Calling one without the declared capability returns gRPC `PermissionDenied`
 with a message naming the missing capability — declare what you use.
 
+**External login (`capabilities.auth`).** An auth-capable plugin can log a
+visitor in against an external IdP (OIDC/SAML). Handle the IdP callback / SAML
+ACS in a `webhook`, validate the token yourself, then set the reserved
+`X-Kandev-Auth-Login` response header to a JSON object
+`{"provider","subject","email","display_name"}`. Kandev maps it to a user
+(link-by-email or just-in-time member provisioning), mints the session, and sets
+the `kandev_session` cookie itself — your plugin never handles the raw token,
+and any `Set-Cookie` you return is dropped. Requires authentication enabled;
+emitting the header without `capabilities.auth` returns 403.
+
+**You MUST only assert an `email` the IdP has verified as owned by `subject`.**
+Kandev auto-links that email to (or provisions) an account, so an unverified or
+user-settable email claim is an account-takeover vector. Kandev refuses to
+auto-link to an admin account as defense-in-depth, but it cannot tell a verified
+email from an unverified one — that is on your plugin. See ADR 0050.
+
 **Writable data directory.** Kandev injects `KANDEV_PLUGIN_DATA_DIR` into
 every spawned plugin subprocess — a per-plugin writable directory
 (`~/.kandev/plugins/<id>/data`) for anything you'd rather keep on disk than
@@ -303,10 +319,14 @@ interface PluginRegistry {
   registerSettingsRoute(path: string, Component: React.ComponentType): void;
   // Named slot injection. Initial slots: "task-sidebar", "settings-nav",
   // "main-nav-footer", "chat-input-actions", "chat-top-bar", "main-top-bar",
-  // "plugin-settings" (see "Named slots" below).
+  // "app-status-bar-left", "app-status-bar-right", and "plugin-settings"
+  // (see "Named slots" below).
   registerComponent(slot: string, Component: React.ComponentType<{ slotProps?: unknown }>): void;
   // WS action handler, bridged into the existing lib/ws dispatch.
   registerWsHandler(action: string, handler: (payload: unknown) => void): void;
+  // Bind a handler to a keybinding declared in this plugin's manifest
+  // (ui.keybindings[].id). See "Keybindings" below.
+  registerKeybinding(id: string, handler: (event: KeyboardEvent) => void): void;
 }
 
 interface NavItem {
@@ -363,6 +383,19 @@ interface PluginHostApi {
   theme: "light" | "dark";
   // Soft SPA navigation (history push/replace), same as the app's own router.
   navigate(href: string, options?: { replace?: boolean }): void;
+  // Imperatively opens a modal window. See "Modal windows" below.
+  openModal(options: PluginModalOptions): PluginModalHandle;
+}
+
+interface PluginModalOptions {
+  title?: string;                     // rendered in DialogHeader/DialogTitle; omit for no title
+  content: React.ComponentType;       // reuses the slot-component contract
+  size?: "sm" | "md" | "lg" | "xl";    // default "md"
+  dismissible?: boolean;               // overlay click / Escape; default true
+}
+
+interface PluginModalHandle {
+  close(): void; // no-op if already closed
 }
 ```
 
@@ -380,6 +413,28 @@ here for routes that opt out and render their own chrome), and
 create-task flow (repo/branch/agent pickers, validation) instead of POSTing
 directly. See `apps/web/lib/plugins/host-api.ts` for the exact current list.
 
+### Modal windows
+
+`host.openModal(options)` imperatively opens a host-owned Dialog — rendered
+by a `<PluginModalHost/>` mounted once at the app root, isolated behind its
+own error boundary, and auto-closed if the plugin is disabled or uninstalled
+while it's open. It's independent of keybindings: call it from a keybinding
+handler, a nav route, a slot component, or a WS handler. It complements the
+declarative `host.ui.Dialog` — reach for `host.ui.Dialog` when a dialog is
+embedded in a slot's own render tree, and `host.openModal` when you need to
+pop one open imperatively from anywhere in your plugin's code.
+
+```js
+const handle = host.openModal({
+  title: "Acme settings",
+  content: SettingsPanel,
+  size: "lg",
+});
+
+// later, e.g. after the panel calls back on save:
+handle.close();
+```
+
 ## Named slots
 
 `registerComponent(slot, Component)` injects a component into a host-defined
@@ -395,6 +450,8 @@ plugins at once. Available slots:
 | `chat-input-actions` | Chat composer toolbar, beside the model picker, mic, and send button | `{ taskId, taskTitle, activeSessionId, sessionIds }` |
 | `chat-top-bar` | Session top bar, beside the CPU/DB metrics and the document/editor/debug controls | `{ taskId, taskTitle, workspaceId, activeSessionId, sessionIds }` |
 | `main-top-bar` | Default app top bar (Home / Kanban / Tasks), beside the CPU/DB metrics and the view/display controls | `{ workspaceId, workspaceLabel, currentPage }` |
+| `app-status-bar-left` | Default-left item in the global status surface | `AppStatusBarSlotProps` |
+| `app-status-bar-right` | Default-right item in the global status surface | `AppStatusBarSlotProps` |
 | `plugin-settings` | A plugin's own settings page (**Settings > Plugins > `<plugin>`**), at the top above the settings form | `{ pluginId, status }` |
 
 `plugin-settings` is the one exception to "every plugin's component renders":
@@ -467,8 +524,7 @@ example.
 ### Session top bar
 
 Register a `chat-top-bar` component to surface at-a-glance status in the
-session top bar, beside the first-party CPU/DB metrics and the
-document/editor/debug controls. The host passes the current context as
+session top bar, beside first-party document/editor/debug controls. The host passes the current context as
 `slotProps`:
 
 ```ts
@@ -544,6 +600,86 @@ show.
 // inside initialize(registry, host):
 registry.registerComponent("plugin-settings", makeSettingsStatus(host));
 ```
+
+### Global Status bar
+
+Register `app-status-bar-left` or `app-status-bar-right` for app-wide, compact
+status UI. Kandev mounts exactly one presentation: a 24 px bar on tablet and
+desktop, or an in-flow Status drawer section on phone. Keep bar content small;
+render a touch-usable row when `presentation` is `"mobile-drawer"`.
+
+```js
+function StatusContribution({ slotProps }) {
+  const { placement, presentation, activeTaskId } = slotProps ?? {};
+  return host.jsx(
+    "span",
+    { className: presentation === "bar" ? "truncate text-xs" : "block min-h-11 px-3 py-2" },
+    `${placement}: ${activeTaskId ?? "no active task"}`,
+  );
+}
+
+registry.registerComponent("app-status-bar-left", StatusContribution);
+registry.registerComponent("app-status-bar-right", StatusContribution);
+```
+
+Each contribution receives this exact context:
+
+```ts
+type AppStatusBarSlotProps = {
+  placement: "left" | "right";
+  presentation: "bar" | "mobile-drawer";
+  density: "full" | "compact";
+  pathname: string;
+  activeWorkspaceId: string | null;
+  activeTaskId: string | null;
+  activeSessionId: string | null;
+};
+```
+
+The IDs are hints; use `host.store` for full records. Each component registration
+is one opaque item: Kandev does not inspect or separately reorder its children.
+The slot chooses the default side. A user can Cmd-drag (macOS) or Ctrl-drag
+(other desktop platforms) with a mouse across the full bar, and Kandev preserves
+that backend-owned order across reloads, restarts, and plugin disable/enable.
+Phone lists the saved left sequence followed by the saved right sequence and does
+not offer drag ordering. There is no keyboard-arrow, touch, or plugin-priority
+ordering API. Enable, disable, and uninstall update the live surface without a
+reload, and each contribution has its own error boundary. A full-bleed route
+(`topbar: false`) owns its own chrome; mount the host Status trigger there if that
+route should expose Status.
+
+## Keybindings
+
+Declare each keybinding in `manifest.yaml`'s `ui.keybindings` (requires
+`ui.bundle`), then bind a handler at runtime with `registry.registerKeybinding`:
+
+```yaml
+ui:
+  bundle: "/ui/bundle.js"
+  keybindings:
+    - id: "open-panel"                    # plugin-local slug: ^[a-z0-9][a-z0-9-]*$
+      default: "mod+shift+j"              # combo grammar, see below
+      description: "Open the Acme panel"
+```
+
+```js
+registry.registerKeybinding("open-panel", () => {
+  host.openModal({ title: "Acme panel", content: AcmePanel });
+});
+```
+
+The `default` combo is `+`-separated: zero or more modifiers from
+`mod | ctrl | cmd | meta | alt | option | shift` (`mod` resolves to ⌘ on
+macOS and Ctrl elsewhere) plus exactly one non-modifier key. `shift` may not
+combine with a digit or symbol key — the browser reports the shifted glyph
+for those keys (e.g. `shift+1` reports `!`), so the combo could never match.
+
+A plugin keybinding is **user-overridable** at **Settings > Keyboard
+Shortcuts**, namespaced `plugin:{pluginId}:{id}` so two plugins can each
+declare their own `open-panel` id without colliding. If a plugin's effective
+combo conflicts with a core kandev shortcut, the core shortcut always wins —
+the plugin handler is skipped for that combo — and the conflict is surfaced
+in that same settings page so the user can rebind it.
 
 ## Three integration patterns
 

@@ -42,6 +42,16 @@ func (f *fakeWorkflowStepGetter) GetNextStepByPosition(_ context.Context, workfl
 	return next, nil
 }
 
+func (f *fakeWorkflowStepGetter) ListStepsByWorkflow(_ context.Context, workflowID string) ([]*wfmodels.WorkflowStep, error) {
+	steps := make([]*wfmodels.WorkflowStep, 0, len(f.steps))
+	for _, step := range f.steps {
+		if step.WorkflowID == workflowID {
+			steps = append(steps, step)
+		}
+	}
+	return steps, nil
+}
+
 type testStepNotFound struct{}
 
 func (testStepNotFound) Error() string { return "step not found" }
@@ -85,6 +95,32 @@ func TestService_SetWorkflowHidden_HealsStaleRecord(t *testing.T) {
 	if found == nil || !found.Hidden {
 		t.Fatalf("expected wf-stale to be hidden after heal, got %+v", found)
 	}
+}
+
+func TestService_UpdateTaskStateIfPrimarySessionStatePublishesLifecycleEvent(t *testing.T) {
+	svc, eventBus, repo := createTestService(t)
+	ctx := context.Background()
+	createTaskWithoutRepositories(t, ctx, repo)
+	createRunningSession(t, ctx, repo, "session-1", "task-1", models.TaskSessionStateFailed)
+	if err := svc.SetPrimarySession(ctx, "session-1"); err != nil {
+		t.Fatalf("SetPrimarySession: %v", err)
+	}
+	eventBus.ClearEvents()
+
+	updated, err := svc.UpdateTaskStateIfPrimarySessionState(
+		ctx,
+		"task-1",
+		"session-1",
+		models.TaskSessionStateFailed,
+		v1.TaskStateFailed,
+	)
+	if err != nil {
+		t.Fatalf("UpdateTaskStateIfSessionState: %v", err)
+	}
+	if !updated {
+		t.Fatal("expected task state transition")
+	}
+	findPublishedEvent(t, eventBus.GetPublishedEvents(), events.TaskStateChanged)
 }
 
 func TestService_MoveTaskRejectsInvalidWorkflowTargets(t *testing.T) {
@@ -538,13 +574,20 @@ func TestService_MoveTaskPullsNextFeederTaskOnVacate(t *testing.T) {
 	}
 
 	movedEvents := 0
+	queuePromotedEvents := 0
 	for _, event := range eventBus.GetPublishedEvents() {
 		if event.Type == events.TaskMoved {
 			movedEvents++
 		}
+		if event.Type == events.TaskQueuePromoted {
+			queuePromotedEvents++
+		}
 	}
 	if movedEvents != 2 {
 		t.Fatalf("task.moved events = %d, want 2", movedEvents)
+	}
+	if queuePromotedEvents != 0 {
+		t.Fatalf("feeder promotion queue-promoted events = %d, want 0", queuePromotedEvents)
 	}
 }
 

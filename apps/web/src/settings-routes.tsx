@@ -31,6 +31,7 @@ import { WorkspaceRepositoriesClient } from "@/app/settings/workspace/workspace-
 import { WorkspaceWorkflowsClient } from "@/app/settings/workspace/workspace-workflows-client";
 import WorkspacesPage from "@/app/settings/workspace/page";
 import { GitHubIntegrationPage } from "@/components/github/github-settings";
+import Link from "@/components/routing/app-link";
 import { useAppStoreApi } from "@/components/state-provider";
 import { EditorsSettings } from "@/components/settings/editors-settings";
 import {
@@ -46,6 +47,9 @@ import { SecretsSettings } from "@/components/settings/secrets-settings";
 import { SettingsLayoutClient } from "@/components/settings/settings-layout-client";
 import { SpritesSettings } from "@/components/settings/sprites-settings";
 import { AboutCard } from "@/components/settings/system/about-card";
+import { ApiTokens } from "@/components/settings/account/api-tokens";
+import { SecuritySettings } from "@/components/settings/account/security-settings";
+import { UsersTable } from "@/components/settings/system/users-table";
 import { BackupsTable } from "@/components/settings/system/backups-table";
 import { DatabaseStatsCard } from "@/components/settings/system/database-stats-card";
 import { DiskUsageCard } from "@/components/settings/system/disk-usage-card";
@@ -84,7 +88,7 @@ import {
   resolveSettingsActiveWorkspaceId,
 } from "@/lib/routing/route-bootstrap";
 import { mapUserSettingsResponse } from "@/lib/ssr/user-settings";
-import type { AppState } from "@/lib/state/store";
+import type { HydrationState } from "@/lib/state/store";
 import { toAgentProfileOption } from "@/lib/state/slices/settings/types";
 import type {
   ListWorkspacesResponse,
@@ -159,6 +163,30 @@ const SETTINGS_ROUTES: Record<string, RouteRenderer> = {
   "/settings/integrations/sentry": () => renderIntegrationSettingsRoute("sentry"),
   "/settings/integrations/slack": () => renderIntegrationSettingsRoute("slack"),
   "/settings/system": () => <SettingsRedirect to="/settings/system/status" />,
+  "/settings/system/users": () => (
+    <SystemPageShell
+      title="Users"
+      description="Manage accounts, roles, and invite links for this instance."
+    >
+      <UsersTable />
+    </SystemPageShell>
+  ),
+  "/settings/account/security": () => (
+    <SystemPageShell
+      title="Profile & password"
+      description="Change your password and review devices signed in to your account."
+    >
+      <SecuritySettings />
+    </SystemPageShell>
+  ),
+  "/settings/account/tokens": () => (
+    <SystemPageShell
+      title="API tokens"
+      description="Personal access tokens for scripts and CLIs acting as you."
+    >
+      <ApiTokens />
+    </SystemPageShell>
+  ),
   "/settings/system/about": () => (
     <SystemPageShell title="About" description="Version, build metadata, and links.">
       <AboutCard />
@@ -183,7 +211,7 @@ const SETTINGS_ROUTES: Record<string, RouteRenderer> = {
   "/settings/system/feature-toggles": () => (
     <SystemPageShell
       title="Feature Toggles"
-      description="Enable or disable experimental and diagnostic Kandev features."
+      description="Manage Kandev feature and diagnostic switches."
     >
       <FeatureTogglesSettings initialFlags={[]} restartCapability={null} />
     </SystemPageShell>
@@ -275,11 +303,7 @@ function renderDynamicSettingsRoute(pathname: string) {
     // A plugin-authored settings route registered at exactly this path
     // (registry.registerSettingsRoute) wins over the first-party detail
     // page, so a plugin can fully replace its own settings surface.
-    return (
-      renderPluginSettingsRoute(pathname) ?? (
-        <PluginDetailPage params={Promise.resolve({ pluginId })} />
-      )
-    );
+    return renderPluginSettingsRoute(pathname) ?? <PluginDetailPage pluginId={pluginId} />;
   }
 
   const agentProfile = matchDouble(pathname, /^\/settings\/agents\/([^/]+)\/profiles\/([^/]+)$/);
@@ -298,27 +322,27 @@ function renderDynamicSettingsRoute(pathname: string) {
   );
   if (executorProfile) {
     const [id, profileId] = executorProfile;
-    return <ProfileDetailPage params={Promise.resolve({ id, profileId })} />;
+    return <ProfileDetailPage executorId={id} profileId={profileId} />;
   }
 
   const executorId = matchSingle(pathname, /^\/settings\/executor\/([^/]+)$/);
-  if (executorId) {
-    return <ExecutorEditPage params={Promise.resolve({ id: executorId })} />;
+  if (executorId && executorId !== "new") {
+    return <ExecutorEditPage executorId={executorId} />;
   }
 
   const profileId = matchSingle(pathname, /^\/settings\/executors\/([^/]+)$/);
   if (profileId) {
-    return <ProfileEditPage params={Promise.resolve({ profileId })} />;
+    return <ProfileEditPage profileId={profileId} />;
   }
 
   const executorType = matchSingle(pathname, /^\/settings\/executors\/new\/([^/]+)$/);
   if (executorType) {
-    return <CreateProfilePage params={Promise.resolve({ type: executorType })} />;
+    return <CreateProfilePage executorType={executorType} />;
   }
 
   const sshExecutorId = matchSingle(pathname, /^\/settings\/executors\/ssh\/([^/]+)$/);
   if (sshExecutorId) {
-    return <SSHExecutorPage params={Promise.resolve({ executorId: sshExecutorId })} />;
+    return <SSHExecutorPage executorId={sshExecutorId} />;
   }
 
   return null;
@@ -342,9 +366,9 @@ function renderWorkspaceSettingsRoute(pathname: string) {
   if (workspaceAutomation) {
     const [id, automationId] = workspaceAutomation;
     if (automationId === "new") {
-      return <NewAutomationPage params={Promise.resolve({ id })} />;
+      return <NewAutomationPage workspaceId={id} />;
     }
-    return <AutomationEditorPage params={Promise.resolve({ id, automationId })} />;
+    return <AutomationEditorPage workspaceId={id} automationId={automationId} />;
   }
 
   const workspaceSubpage = matchDouble(
@@ -364,7 +388,7 @@ function renderWorkspaceSettingsRoute(pathname: string) {
 
   const workspaceId = matchSingle(pathname, /^\/settings\/workspace\/([^/]+)$/);
   if (workspaceId) {
-    return <WorkspaceEditPage params={Promise.resolve({ id: workspaceId })} />;
+    return <WorkspaceEditPage workspaceId={workspaceId} />;
   }
 
   return null;
@@ -399,6 +423,13 @@ function renderUpdatesRoute() {
       title="Updates"
       description="Current vs latest release plus the full kandev changelog."
     >
+      <p className="text-sm text-muted-foreground">
+        Notification preferences are managed in{" "}
+        <Link className="cursor-pointer underline" href="/settings/general/notifications">
+          Notifications
+        </Link>
+        .
+      </p>
       <UpdatesCard />
     </SystemPageShell>
   );
@@ -440,7 +471,7 @@ function SettingsRouteBootstrap({ pathname }: { pathname: string }) {
   return null;
 }
 
-async function loadSettingsInitialState(): Promise<Partial<AppState>> {
+async function loadSettingsInitialState(): Promise<HydrationState> {
   const [workspaces, executors, agents, discovery, available, userSettingsResponse] =
     await Promise.all([
       listWorkspaces({ cache: "no-store" }).catch(() => ({ workspaces: [] })),
@@ -470,7 +501,7 @@ export function buildSettingsInitialStateForRoute({
   availableAgents,
   availableTools,
   userSettingsResponse,
-}: SettingsInitialStateData): Partial<AppState> {
+}: SettingsInitialStateData): HydrationState {
   const workspaceItems = workspaces.map(mapWorkspaceItem);
   const activeWorkspaceId = resolveSettingsActiveWorkspaceId(
     workspaceItems,

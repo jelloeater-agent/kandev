@@ -7,6 +7,17 @@ import { mergeTaskRepositoryFields } from "@/lib/ws/handlers/task-repositories";
 type KanbanTask = KanbanState["tasks"][number];
 type KanbanStep = KanbanState["steps"][number];
 
+function queueFields(
+  task: KanbanUpdateTask,
+  existing: KanbanTask | undefined,
+): Pick<KanbanTask, "wipAdmitted" | "queuedForStepId" | "queuedAt"> {
+  return {
+    wipAdmitted: task.wip_admitted ?? task.wipAdmitted ?? existing?.wipAdmitted,
+    queuedForStepId: task.queued_for_step_id ?? task.queuedForStepId ?? existing?.queuedForStepId,
+    queuedAt: task.queued_at ?? task.queuedAt ?? existing?.queuedAt,
+  };
+}
+
 type KanbanUpdateTask = {
   id: string;
   workflowStepId: string;
@@ -17,6 +28,12 @@ type KanbanUpdateTask = {
   repository_id?: string;
   repositories?: KanbanTask["repositories"];
   is_ephemeral?: boolean;
+  wip_admitted?: boolean;
+  queued_for_step_id?: string;
+  queued_at?: string;
+  wipAdmitted?: boolean;
+  queuedForStepId?: string;
+  queuedAt?: string;
 };
 
 export function registerKanbanHandlers(store: StoreApi<AppState>): WsHandlers {
@@ -61,6 +78,9 @@ export function registerKanbanHandlers(store: StoreApi<AppState>): WsHandlers {
               primarySessionId: existing?.primarySessionId,
               primarySessionState: existing?.primarySessionState,
               primarySessionPendingAction: existing?.primarySessionPendingAction,
+              taskPendingAction: existing?.taskPendingAction,
+              foregroundActivity: existing?.foregroundActivity,
+              ...queueFields(task, existing),
             };
           });
 
@@ -93,6 +113,14 @@ export function registerKanbanHandlers(store: StoreApi<AppState>): WsHandlers {
                 t.primarySessionPendingAction === undefined
                   ? fallback?.primarySessionPendingAction
                   : t.primarySessionPendingAction,
+              taskPendingAction:
+                t.taskPendingAction === undefined
+                  ? fallback?.taskPendingAction
+                  : t.taskPendingAction,
+              foregroundActivity:
+                t.foregroundActivity === undefined
+                  ? fallback?.foregroundActivity
+                  : t.foregroundActivity,
             };
           });
           return {

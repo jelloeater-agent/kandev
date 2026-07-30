@@ -25,9 +25,10 @@ type QuarantineLister interface {
 type Mutations interface {
 	AdoptGoCache(context.Context, string, string) (StorageMaintenanceSettings, Capabilities, error)
 	Analyze(context.Context) (string, error)
-	RunNow(context.Context, []string) (string, error)
+	RunNow(context.Context, []string, bool) (string, error)
 	RestoreQuarantine(context.Context, string) (QuarantineEntry, error)
 	DeleteQuarantine(context.Context, string, string) (string, error)
+	PurgeQuarantine(context.Context, QuarantinePurgeScope, string) (string, error)
 }
 
 type Capabilities struct {
@@ -55,11 +56,16 @@ type OverviewProvider interface {
 	Capabilities(context.Context, StorageMaintenanceSettings) Capabilities
 }
 
+type OverviewReader interface {
+	Get(context.Context) (OverviewSnapshot, error)
+	Capabilities(context.Context, StorageMaintenanceSettings) Capabilities
+}
+
 type HandlerConfig struct {
 	Settings          SettingsManager
 	Runs              RunLister
 	Quarantine        QuarantineLister
-	Overview          OverviewProvider
+	Overview          OverviewReader
 	Mutations         Mutations
 	OnSettingsChanged func(StorageMaintenanceSettings)
 }
@@ -81,6 +87,7 @@ func RegisterRoutes(group *gin.RouterGroup, handler *Handler) {
 	group.GET("/storage/runs", handler.listRuns)
 	group.GET("/storage/quarantine", handler.listQuarantine)
 	group.POST("/storage/quarantine/:id/restore", handler.restoreQuarantine)
+	group.DELETE("/storage/quarantine", handler.deleteQuarantineBulk)
 	group.DELETE("/storage/quarantine/:id", handler.deleteQuarantine)
 }
 
@@ -124,6 +131,7 @@ func (h *Handler) adoptGoCache(c *gin.Context) {
 
 type runRequest struct {
 	Resources []string `json:"resources"`
+	Force     bool     `json:"force"`
 }
 
 func (h *Handler) analyze(c *gin.Context) {
@@ -139,10 +147,13 @@ func (h *Handler) runNow(c *gin.Context) {
 			return
 		}
 	}
-	id, err := h.config.Mutations.RunNow(c.Request.Context(), request.Resources)
+	id, err := h.config.Mutations.RunNow(c.Request.Context(), request.Resources, request.Force)
 	var busy *BusyError
 	if errors.As(err, &busy) {
-		c.JSON(http.StatusConflict, gin.H{"error": busy.Error(), "busy_resources": busy.Resources})
+		c.JSON(http.StatusConflict, gin.H{
+			"error": busy.Error(), "busy_resources": busy.Resources,
+			"force_available": busy.ForceAvailable,
+		})
 		return
 	}
 	writeAcceptedJob(c, id, err)
@@ -163,11 +174,32 @@ type confirmationRequest struct {
 
 func (h *Handler) deleteQuarantine(c *gin.Context) {
 	var request confirmationRequest
-	if err := c.ShouldBindJSON(&request); err != nil || request.Confirm != "DELETE" {
+	if err := c.ShouldBindJSON(&request); err != nil || request.Confirm != QuarantineConfirmationDelete {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "quarantine deletion requires DELETE confirmation"})
 		return
 	}
 	id, err := h.config.Mutations.DeleteQuarantine(c.Request.Context(), c.Param("id"), request.Confirm)
+	writeAcceptedJob(c, id, err)
+}
+
+type bulkQuarantineRequest struct {
+	Scope   QuarantinePurgeScope `json:"scope" binding:"required"`
+	Confirm string               `json:"confirm" binding:"required"`
+}
+
+func (h *Handler) deleteQuarantineBulk(c *gin.Context) {
+	var request bulkQuarantineRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if (request.Scope == QuarantinePurgeScopeEligible && request.Confirm != QuarantineConfirmationEligible) ||
+		(request.Scope == QuarantinePurgeScopeAll && request.Confirm != QuarantineConfirmationForce) ||
+		(request.Scope != QuarantinePurgeScopeEligible && request.Scope != QuarantinePurgeScopeAll) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quarantine purge scope or confirmation"})
+		return
+	}
+	id, err := h.config.Mutations.PurgeQuarantine(c.Request.Context(), request.Scope, request.Confirm)
 	writeAcceptedJob(c, id, err)
 }
 
@@ -199,7 +231,7 @@ func (h *Handler) getStorage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	summary, err := h.config.Overview.Summary(c.Request.Context())
+	snapshot, err := h.config.Overview.Get(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -215,7 +247,7 @@ func (h *Handler) getStorage(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"settings": settings, "capabilities": h.config.Overview.Capabilities(c.Request.Context(), settings),
-		"summary": summary, "last_run": lastRun,
+		"summary": snapshot.Summary, "analyzed_at": snapshot.AnalyzedAt, "last_run": lastRun,
 	})
 }
 

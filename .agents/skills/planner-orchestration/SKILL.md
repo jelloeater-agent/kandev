@@ -1,109 +1,120 @@
 ---
 name: planner-orchestration
-description: Enforce Kandev's planner-and-worker execution model. Use in the user-started primary session for feature, fix, debug, review, verification, and delivery work; use in delegated sessions to distinguish worker execution from planner coordination.
+description: Enforce Kandev's single-session, user-controlled model workflow for feature, fix, debug, review, verification, and delivery work.
 ---
 
-# Planner Orchestration
+# Single-Session Orchestration
 
-The user-started primary session is the **planner**. A custom subagent launched
-through the current harness's native delegation tool is a **worker**.
+The user-started primary conversation owns durable artifacts, integration
+judgment, and user communication. Platform-provided explorers and other
+predefined subagents may continue to serve the harness's normal investigation
+workflow. This skill governs planned implementation delegation, not the
+platform's general exploration behavior.
 
-## Planner Contract
+## Model Checkpoints
 
-The planner may:
+The user, not the harness, selects the model. Keep each phase in the primary
+conversation so the active model, transcript, and costs are visible in one place.
 
-- Clarify intent and ask the user for decisions.
-- Read repository context needed to create or review a plan.
-- Create and update specs, plans, task files, and ADRs.
-- Decompose work, assign file ownership, and order dependency waves.
-- Spawn workers, monitor results, review diffs and reports, and communicate
-  status to the user.
+1. **Design checkpoint — strong model.** Use the user's strong model for
+   clarification, codebase investigation, specs, plans, task decomposition, and
+   high-risk design decisions. Default Codex guidance is GPT-5.6 Sol/high.
+2. **Implementation checkpoint — user switch.** Once the spec, plan, and task
+   files are ready, summarize their paths and ask the user to switch the main
+   session to the lower-cost implementation model. Default Codex guidance is
+   GPT-5.6 Terra/medium. Do not silently continue on the strong model when the
+   user has asked for a cost-controlled workflow.
+3. **Execution checkpoint — lower-cost model.** In the same conversation, read
+   the approved task file, mark it `in_progress`, implement with `/tdd`, run its
+   exact targeted checks, and mark it `done`. Work sequentially through the
+   plan by default.
+4. **Escalation checkpoint.** Stop and ask the user to switch back to a stronger
+   model before an architectural redesign, a new public contract, a migration or
+   persistence boundary, or a high-impact security decision. Record a durable
+   decision when the `/record` trigger applies.
 
-The planner must not:
+Luna/low is appropriate only for clearly mechanical, read-only work such as
+short status summaries or simple command-output interpretation. It is not the
+default implementation or test model. The active agent must never claim a model
+change occurred based on self-identification; use runtime model-usage metadata
+when such confirmation is needed.
 
-- Edit application code, tests, generated files, package metadata, or CI.
-- Run implementation, test, formatting, lint, build, commit, push, or PR
-  commands.
-- Resolve implementation conflicts or fix worker output directly.
-- Continue as an implementation fallback when delegation is unavailable.
+## Task-File Workflow
 
-If no suitable worker can be launched, stop and tell the user which delegated
-capability is unavailable. Do not silently become the worker.
+Feature work still follows `/spec`, `/plan`, and `/spec-driven-development`:
 
-## Native Delegation Only
+- Store the accepted spec in `docs/specs/<slug>/spec.md`.
+- Store `plan.md` and independently actionable sibling task files in
+  `docs/plans/<slug>/`.
+- Use `pending`, `in_progress`, and `done` task-file status as the durable
+  execution record. The primary agent updates both the current task and the
+  plan's status after each completed task.
+- Keep task files small enough that the same conversation can resume from their
+  acceptance criteria, owned files, and exact verification command after a user
+  switches model.
 
-Delegate through the active coding harness, targeting the registered project
-agent for the work packet:
+Task files are a model-switch handoff and, if the user explicitly asks for
+subagents, a compact work packet. They must include intent, dependencies, owned
+files, acceptance criteria, verification, and risks, but must not name an agent
+role or model tier.
 
-- Claude Code: use the native `Agent` tool and `.claude/agents/<role>.md`.
-- Codex: use native `spawn_agent`, `send_message`/`followup_task`, and
-  `wait_agent` with `.codex/agents/<role>.toml`.
-- Cursor: use Cursor's native custom-subagent invocation and
-  `.cursor/agents/<role>.md`.
-- OpenCode: use the native `Task` tool and `.opencode/agents/<role>.md`.
+## User-Authorized Subagents
 
-Never use Kandev MCP `spawn_session_kandev`, `create_task_kandev`, or
-`message_task_kandev` to create or control implementation workers. Those APIs
-manage Kandev platform entities and may be used only when the user explicitly
-asks to create or manage Kandev tasks or sessions. They are not a delegation
-fallback. If native harness delegation is unavailable, stop and report it.
+Plans may label dependency waves and parallel-safe candidates. That is planning
+information only: execute sequentially unless the user explicitly asks to use
+subagents after selecting the implementation model.
 
-## Worker Contract
+When the user authorizes subagents:
 
-A worker executes exactly one bounded assignment. It follows the assigned
-execution skill, edits only its owned files (including, when applicable, only
-its assigned task file), runs the named verification, and reports results to
-the planner. Shared plan files require explicit ownership and their updates
-must be serialized, never performed by parallel workers. Workers do not spawn
-other workers or broaden their assignment.
+- Use the platform's native delegation tool, never Kandev task/session MCP APIs.
+- Do not recreate project custom-agent files or pin a different worker model.
+  The child must use the active model the user selected in the primary session.
+- Use `fork_turns: "none"` (or the platform equivalent), not a full-history
+  fork. Put the task-file path, owned files, acceptance criteria, exact command,
+  and dependencies in the initial prompt.
+- Launch only tasks explicitly marked parallel-safe with disjoint files and no
+  shared schema, migration, generated contract, lockfile, or package config.
+- Tell each child not to spawn further children. Update shared `plan.md` status
+  serially in the primary session.
+- Confirm model routing from runtime usage metadata, not a model's prose. If it
+  does not show the user-selected model, stop the delegation and report it.
 
-## Work Packet
+If the user does not explicitly authorize delegation, do not infer permission
+from a plan's waves or parallelism labels.
 
-Every delegated assignment must contain:
+The read-only `pr-poller` is a delivery exception, not an implementation
+worker. Launch it only after the user explicitly asks to wait for or monitor PR
+updates; it reports status to the primary conversation and never remediates,
+comments, or spawns children.
 
-```text
-Role: <architect | implementer | test-engineer | qa | code-review | security-auditor |
-       simplify | verify | pr-poller>
-Objective: <one bounded outcome>
-Inputs: <task/spec/plan paths and relevant context>
-Owned files: <specific paths or narrow search targets>
-Forbidden files: <overlapping or out-of-scope paths>
-Acceptance:
-- <observable condition>
-Verification:
-- <exact command>
-Dependencies: <completed task IDs or none>
-Output:
-- Follow the role's exact output contract when it defines one.
-- Otherwise: summary, files changed, commands/results, blockers, risks, divergence.
-Constraints:
-- Follow scoped AGENTS.md and assigned skills.
-- Do not spawn subagents.
-```
+## Task-Driven Validation And PR Review
 
-Workers share a mutable checkout unless the runtime explicitly provides an
-isolated worktree. Run them sequentially by default. Parallelize only when
-their owned files do not overlap and neither worker changes shared schemas,
-generated contracts, migrations, lockfiles, package-wide configuration, or
-shared plan status. Serialize `plan.md` updates even when a work packet
-explicitly assigns shared-plan ownership.
+Each task file owns its TDD requirement and exact unit, integration, or E2E
+commands. Its completed status and recorded command results are the pre-PR
+evidence; do not add a second generic validation pass here.
 
-## Model Tiers
+Do not automatically run `/simplify`, `/qa`, `/code-review`, security review,
+or broad `/verify` before opening a PR. Those duplicate the task validation and
+the two configured PR AI reviewers. Run them only when the user explicitly asks
+or an actionable PR/CI finding requires a focused remediation.
 
-The planner inherits the strong model selected by the user. Platform mirrors
-pin workers by role:
+After the PR opens, the two configured AI reviewers are the semantic-review
+gate. Use `/pr-fixup` only to address a CI failure or actionable reviewer
+finding. A remediation reruns its relevant task-defined checks, not a broad
+local suite unless explicitly requested.
+Treat the OpenCode App as trusted semantic evidence only when `trusted_producer=true` confirms its dedicated producer provenance.
 
-- Balanced workers: implementation, tests, QA, simplification.
-- Cheap workers: polling and mechanical verification where the platform has a
-  suitable lower-cost model.
-- Frontier workers: architecture, security, and deep code review only.
+## Guardrails
 
-Do not omit a worker model when omission inherits the planner's model, except
-for OpenCode where this repository intentionally keeps provider choice
-inherited.
-
-## Completion
-
-The planner accepts a worker result only after checking that its file scope,
-acceptance criteria, and reported verification match the assignment. Any
-follow-up fix is a new worker assignment, not planner execution.
+- Do not treat a plan wave as authorization to launch implementation workers;
+  that decision remains with the user. This does not restrict platform-provided
+  explorers or other harness-managed investigation agents.
+- Do not use Kandev MCP task/session APIs as a worker mechanism. Use them only
+  when the user explicitly asks to manage persistent Kandev tasks or sessions.
+- Do not create worktrees solely to parallelize plan tasks unless the user has
+  explicitly authorized subagents for parallel-safe tasks.
+- Do not continue past a model checkpoint by assuming the user accepted the
+  cost. State the recommended switch and wait when the choice materially
+  affects cost or quality.
+- Do not replace durable specs, plans, task files, tests, or verification with
+  chat-only summaries.

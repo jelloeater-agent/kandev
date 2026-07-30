@@ -9,6 +9,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 
+	"github.com/kandev/kandev/internal/db"
 	"github.com/kandev/kandev/internal/db/dialect"
 	"github.com/kandev/kandev/internal/user/models"
 )
@@ -48,6 +49,9 @@ func (r *sqliteRepository) initSchema() error {
 	CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		email TEXT NOT NULL,
+		display_name TEXT NOT NULL DEFAULT '',
+		role TEXT NOT NULL DEFAULT 'admin',
+		status TEXT NOT NULL DEFAULT 'active',
 		settings TEXT NOT NULL DEFAULT '{}',
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL
@@ -56,8 +60,23 @@ func (r *sqliteRepository) initSchema() error {
 	if _, err := r.db.Exec(schema); err != nil {
 		return err
 	}
+	r.runMigrations()
 
 	return r.ensureDefaultUser()
+}
+
+// runMigrations evolves existing databases. CREATE TABLE IF NOT EXISTS is a
+// no-op on a table that already exists, so every added column must also appear
+// here as an idempotent ADD COLUMN (see apps/backend/CLAUDE.md, ADR 0027).
+func (r *sqliteRepository) runMigrations() {
+	m := db.NewMigrateLogger(r.db, nil)
+	m.Apply("users.display_name", "ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+	// Default 'admin': the pre-auth singleton default-user becomes the admin
+	// when authentication is enabled. Explicit CreateUser calls always set role.
+	m.Apply("users.role", "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+	m.Apply("users.status", "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+	// Safe pre-auth: the table only ever held the single default-user row.
+	m.Apply("users.email_unique", "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
 }
 
 func (r *sqliteRepository) ensureDefaultUser() error {
@@ -69,9 +88,9 @@ func (r *sqliteRepository) ensureDefaultUser() error {
 	if count == 0 {
 		now := time.Now().UTC()
 		_, err := r.db.ExecContext(ctx, r.db.Rebind(`
-			INSERT INTO users (id, email, settings, created_at, updated_at)
-			VALUES (?, ?, '{}', ?, ?)
-		`), DefaultUserID, DefaultUserEmail, now, now)
+			INSERT INTO users (id, email, display_name, role, status, settings, created_at, updated_at)
+			VALUES (?, ?, '', ?, ?, '{}', ?, ?)
+		`), DefaultUserID, DefaultUserEmail, models.RoleAdmin, models.StatusActive, now, now)
 		if err != nil {
 			return err
 		}
@@ -86,9 +105,11 @@ func (r *sqliteRepository) Close() error {
 	return r.db.Close()
 }
 
+const userColumns = "id, email, display_name, role, status, created_at, updated_at"
+
 func (r *sqliteRepository) GetUser(ctx context.Context, id string) (*models.User, error) {
 	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
-		SELECT id, email, created_at, updated_at
+		SELECT `+userColumns+`
 		FROM users WHERE id = ?
 	`), id)
 	return scanUser(row)
@@ -96,6 +117,102 @@ func (r *sqliteRepository) GetUser(ctx context.Context, id string) (*models.User
 
 func (r *sqliteRepository) GetDefaultUser(ctx context.Context) (*models.User, error) {
 	return r.GetUser(ctx, DefaultUserID)
+}
+
+func (r *sqliteRepository) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	row := r.ro.QueryRowContext(ctx, r.ro.Rebind(`
+		SELECT `+userColumns+`
+		FROM users WHERE email = ?
+	`), email)
+	return scanUser(row)
+}
+
+func (r *sqliteRepository) ListUsers(ctx context.Context) ([]*models.User, error) {
+	rows, err := r.ro.QueryContext(ctx, `
+		SELECT `+userColumns+`
+		FROM users ORDER BY created_at ASC, id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	users := []*models.User{}
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func (r *sqliteRepository) DeleteUser(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`DELETE FROM users WHERE id = ?`), id)
+	return err
+}
+
+func (r *sqliteRepository) CreateUser(ctx context.Context, user *models.User) error {
+	now := time.Now().UTC()
+	user.CreatedAt = now
+	user.UpdatedAt = now
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		INSERT INTO users (id, email, display_name, role, status, settings, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, '{}', ?, ?)
+	`), user.ID, user.Email, user.DisplayName, user.Role, user.Status, user.CreatedAt, user.UpdatedAt)
+	return err
+}
+
+// UpdateUserProfile sets identity-facing fields. Used by the setup wizard to
+// promote the pre-auth default-user row into the admin account (preserving the
+// row keeps all existing user settings intact) and by profile edits.
+func (r *sqliteRepository) UpdateUserProfile(ctx context.Context, id, email, displayName, role string) (*models.User, error) {
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE users SET email = ?, display_name = ?, role = ?, updated_at = ?
+		WHERE id = ?
+	`), email, displayName, role, time.Now().UTC(), id)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkUserRowsAffected(result, id); err != nil {
+		return nil, err
+	}
+	return r.getUserFromWriter(ctx, id)
+}
+
+func (r *sqliteRepository) UpdateUserRoleStatus(ctx context.Context, id, role, status string) (*models.User, error) {
+	result, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE users SET role = ?, status = ?, updated_at = ?
+		WHERE id = ?
+	`), role, status, time.Now().UTC(), id)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkUserRowsAffected(result, id); err != nil {
+		return nil, err
+	}
+	return r.getUserFromWriter(ctx, id)
+}
+
+// getUserFromWriter reads through the writer connection so callers observe
+// their own just-committed mutation (the reader pool may lag under WAL).
+func (r *sqliteRepository) getUserFromWriter(ctx context.Context, id string) (*models.User, error) {
+	row := r.db.QueryRowContext(ctx, r.db.Rebind(`
+		SELECT `+userColumns+`
+		FROM users WHERE id = ?
+	`), id)
+	return scanUser(row)
+}
+
+func checkUserRowsAffected(result sqlResult, userID string) error {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("user not found: %s", userID)
+	}
+	return nil
 }
 
 func (r *sqliteRepository) GetUserSettings(ctx context.Context, userID string) (*models.UserSettings, error) {
@@ -331,6 +448,7 @@ func marshalUserSettingsPayload(settings *models.UserSettings) ([]byte, error) {
 		"repository_ids":                  settings.RepositoryIDs,
 		"tasks_list_sort":                 models.NormalizeTasksListSort(settings.TasksListSort),
 		"tasks_list_group":                models.NormalizeTasksListGroup(settings.TasksListGroup),
+		"tasks_list_show_details":         settings.TasksListShowDetails,
 		"initial_setup_complete":          settings.InitialSetupComplete,
 		"preferred_shell":                 settings.PreferredShell,
 		"default_editor_id":               settings.DefaultEditorID,
@@ -339,6 +457,9 @@ func marshalUserSettingsPayload(settings *models.UserSettings) ([]byte, error) {
 		"review_auto_mark_on_scroll":      settings.ReviewAutoMarkOnScroll,
 		"confirm_task_archive":            settings.ConfirmTaskArchive,
 		"mcp_task_agent_profile_default":  models.NormalizeMCPTaskAgentProfileDefault(settings.MCPTaskAgentProfileDefault),
+		"show_anchored_prompt_bar":        settings.ShowAnchoredPromptBar,
+		"show_scroll_to_last_prompt":      settings.ShowScrollToLastPrompt,
+		"show_scroll_to_start":            settings.ShowScrollToStart,
 		"show_release_notification":       settings.ShowReleaseNotification,
 		"release_notes_last_seen_version": settings.ReleaseNotesLastSeenVersion,
 		"lsp_auto_start_languages":        lspAutoStart,
@@ -363,6 +484,7 @@ func marshalUserSettingsPayload(settings *models.UserSettings) ([]byte, error) {
 		"terminal_font_size":              settings.TerminalFontSize,
 		"changes_panel_layout":            settings.ChangesPanelLayout,
 		"system_metrics_display":          settings.SystemMetricsDisplay,
+		"app_status_bar_order":            normalizeAppStatusBarOrder(settings.AppStatusBarOrder),
 		"voice_mode":                      settings.VoiceMode,
 	})
 }
@@ -384,7 +506,7 @@ type sqlResult interface {
 
 func scanUser(scanner interface{ Scan(dest ...any) error }) (*models.User, error) {
 	user := &models.User{}
-	if err := scanner.Scan(&user.ID, &user.Email, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := scanner.Scan(&user.ID, &user.Email, &user.DisplayName, &user.Role, &user.Status, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return user, nil
@@ -457,12 +579,16 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		settings.ReviewAutoMarkOnScroll = true
 		settings.ConfirmTaskArchive = true
 		settings.MCPTaskAgentProfileDefault = models.MCPTaskAgentProfileDefaultCurrentTask
+		settings.ShowAnchoredPromptBar = true
+		settings.ShowScrollToLastPrompt = true
+		settings.ShowScrollToStart = true
 		settings.ChatSubmitKey = "cmd_enter"
 		settings.KeyboardShortcuts = map[string]interface{}{}
 		settings.TerminalLinkBehavior = "new_tab"
 		settings.ChangesPanelLayout = "tree"
 		settings.SidebarViews = []models.SidebarView{}
 		settings.SidebarTaskPrefs = normalizeSidebarTaskPrefs(models.SidebarTaskPrefs{})
+		settings.AppStatusBarOrder = normalizeAppStatusBarOrder(models.AppStatusBarOrder{})
 		settings.VoiceMode = defaultVoiceModeSettings()
 		return settings, nil
 	}
@@ -473,6 +599,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		RepositoryIDs               []string                            `json:"repository_ids"`
 		TasksListSort               string                              `json:"tasks_list_sort"`
 		TasksListGroup              string                              `json:"tasks_list_group"`
+		TasksListShowDetails        bool                                `json:"tasks_list_show_details"`
 		InitialSetupComplete        bool                                `json:"initial_setup_complete"`
 		PreferredShell              string                              `json:"preferred_shell"`
 		DefaultEditorID             string                              `json:"default_editor_id"`
@@ -481,6 +608,9 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		ReviewAutoMarkOnScroll      *bool                               `json:"review_auto_mark_on_scroll"`
 		ConfirmTaskArchive          *bool                               `json:"confirm_task_archive"`
 		MCPTaskAgentProfileDefault  string                              `json:"mcp_task_agent_profile_default"`
+		ShowAnchoredPromptBar       *bool                               `json:"show_anchored_prompt_bar"`
+		ShowScrollToLastPrompt      *bool                               `json:"show_scroll_to_last_prompt"`
+		ShowScrollToStart           *bool                               `json:"show_scroll_to_start"`
 		ShowReleaseNotification     *bool                               `json:"show_release_notification"`
 		ReleaseNotesLastSeenVersion string                              `json:"release_notes_last_seen_version"`
 		LspAutoStartLanguages       []string                            `json:"lsp_auto_start_languages"`
@@ -505,6 +635,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		TerminalFontSize            int                                 `json:"terminal_font_size"`
 		ChangesPanelLayout          string                              `json:"changes_panel_layout"`
 		SystemMetricsDisplay        models.SystemMetricsDisplaySettings `json:"system_metrics_display"`
+		AppStatusBarOrder           models.AppStatusBarOrder            `json:"app_status_bar_order"`
 		VoiceMode                   *storedVoiceMode                    `json:"voice_mode"`
 	}
 	if err := json.Unmarshal([]byte(settingsRaw), &payload); err != nil {
@@ -516,6 +647,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 	settings.RepositoryIDs = payload.RepositoryIDs
 	settings.TasksListSort = models.NormalizeTasksListSort(payload.TasksListSort)
 	settings.TasksListGroup = models.NormalizeTasksListGroup(payload.TasksListGroup)
+	settings.TasksListShowDetails = payload.TasksListShowDetails
 	settings.InitialSetupComplete = payload.InitialSetupComplete
 	settings.PreferredShell = payload.PreferredShell
 	settings.DefaultEditorID = payload.DefaultEditorID
@@ -537,6 +669,21 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 		settings.ConfirmTaskArchive = true
 	}
 	settings.MCPTaskAgentProfileDefault = models.NormalizeMCPTaskAgentProfileDefault(payload.MCPTaskAgentProfileDefault)
+	if payload.ShowAnchoredPromptBar != nil {
+		settings.ShowAnchoredPromptBar = *payload.ShowAnchoredPromptBar
+	} else {
+		settings.ShowAnchoredPromptBar = true
+	}
+	if payload.ShowScrollToLastPrompt != nil {
+		settings.ShowScrollToLastPrompt = *payload.ShowScrollToLastPrompt
+	} else {
+		settings.ShowScrollToLastPrompt = true
+	}
+	if payload.ShowScrollToStart != nil {
+		settings.ShowScrollToStart = *payload.ShowScrollToStart
+	} else {
+		settings.ShowScrollToStart = true
+	}
 	if payload.ShowReleaseNotification != nil {
 		settings.ShowReleaseNotification = *payload.ShowReleaseNotification
 	} else {
@@ -584,6 +731,7 @@ func scanUserSettings(scanner interface{ Scan(dest ...any) error }, userID strin
 	settings.TerminalFontSize = payload.TerminalFontSize
 	settings.VoiceMode = mergeVoiceModeDefaults(payload.VoiceMode)
 	settings.SystemMetricsDisplay = payload.SystemMetricsDisplay
+	settings.AppStatusBarOrder = normalizeAppStatusBarOrder(payload.AppStatusBarOrder)
 	if payload.ChangesPanelLayout == "flat" {
 		settings.ChangesPanelLayout = "flat"
 	} else {
@@ -603,4 +751,14 @@ func normalizeSidebarTaskPrefs(prefs models.SidebarTaskPrefs) models.SidebarTask
 		prefs.SubtaskOrderByParentID = map[string][]string{}
 	}
 	return prefs
+}
+
+func normalizeAppStatusBarOrder(order models.AppStatusBarOrder) models.AppStatusBarOrder {
+	if order.LeftItemIDs == nil {
+		order.LeftItemIDs = []string{}
+	}
+	if order.RightItemIDs == nil {
+		order.RightItemIDs = []string{}
+	}
+	return order
 }

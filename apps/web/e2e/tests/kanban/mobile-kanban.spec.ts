@@ -11,21 +11,21 @@ test.describe("Mobile kanban view", () => {
     });
   });
 
-  test("metrics match the height of the mobile topbar actions", async ({ testPage, apiClient }) => {
+  test("Status drawer replaces a persistent phone metrics footer", async ({
+    testPage,
+    apiClient,
+  }) => {
     await apiClient.rawRequest("PATCH", "/api/v1/user/settings", {
       system_metrics_display: { show_in_topbar: true },
     });
     const mobile = new MobileKanbanPage(testPage);
     await mobile.goto();
 
-    const metrics = testPage.getByTestId("mobile-topbar-metrics");
-    await expect(metrics).toBeVisible();
-    await expect(mobile.mobileSearchToggle).toBeVisible();
-    const metricsBox = await metrics.boundingBox();
-    const actionBox = await mobile.mobileSearchToggle.boundingBox();
-    if (!metricsBox || !actionBox) throw new Error("topbar action has no bounding box");
-
-    expect(metricsBox.height).toBe(actionBox.height);
+    await expect(testPage.getByTestId("app-status-bar")).toHaveCount(0);
+    await testPage.getByRole("button", { name: "Open menu" }).click();
+    await testPage.getByTestId("mobile-home-status-button").click();
+    await expect(testPage.getByTestId("app-status-drawer")).toBeVisible();
+    await expect(testPage.getByTestId("app-status-metrics")).toBeVisible();
   });
 
   test("renders focused mobile layout with step navigation", async ({
@@ -574,7 +574,6 @@ test.describe("Mobile kanban view", () => {
       is_start_step: true,
     });
     await apiClient.createWorkflowStep(workflow.id, "Done", 1);
-    await apiClient.updateWorkflowStep(limitedStep.id, { wip_limit: 1 });
     await apiClient.createTask(seedData.workspaceId, "Mobile WIP One", {
       workflow_id: workflow.id,
       workflow_step_id: limitedStep.id,
@@ -583,6 +582,9 @@ test.describe("Mobile kanban view", () => {
       workflow_id: workflow.id,
       workflow_step_id: limitedStep.id,
     });
+    // Seed a legacy over-limit state by applying the limit after task creation;
+    // creation itself must now reject capacity overflow.
+    await apiClient.updateWorkflowStep(limitedStep.id, { wip_limit: 1 });
     await apiClient.saveUserSettings({
       workspace_id: seedData.workspaceId,
       workflow_filter_id: workflow.id,

@@ -69,3 +69,19 @@ func RowMustBePreserved(running *ExecutorRunning, sessionState TaskSessionState)
 	}
 	return IsResumableSessionState(sessionState)
 }
+
+// SessionArchiveCancelReason and SessionArchiveTreeCancelReason are the
+// TaskSession.ErrorMessage values written when a session is auto-cancelled
+// by archiving — Service.ArchiveTask's CancelActiveTaskSessionsByTaskID call
+// (single-task archive) and HandoffService.cancelActiveRuns (cascade archive)
+// respectively. Distinct reasons keep the cancellation source visible in
+// session history and diagnostics.
+const (
+	SessionArchiveCancelReason     = "task archived"
+	SessionArchiveTreeCancelReason = "task tree archived"
+)
+
+// IsArchiveCancelReason reports whether reason came from an archive path.
+func IsArchiveCancelReason(reason string) bool {
+	return reason == SessionArchiveCancelReason || reason == SessionArchiveTreeCancelReason
+}

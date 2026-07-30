@@ -19,6 +19,7 @@ import {
 import type { KanbanExternalLinkAvailability } from "./kanban-external-link-availability";
 import { TaskGitHubIssueDialog } from "@/components/task/task-github-issue-dialog";
 import { TaskGitHubPRDialog } from "@/components/task/task-github-pr-dialog";
+import { TaskMRLinkDialog } from "@/components/gitlab/task-mr-link-dialog";
 import { useTaskWorkflowMove } from "@/hooks/use-task-workflow-move";
 import { useTaskMultiSelectStore } from "@/hooks/use-task-multi-select";
 import { useDetachTask } from "@/hooks/use-detach-task";
@@ -26,6 +27,7 @@ import { repositorySlug } from "@/lib/repository-slug";
 import { formatUserHomePath } from "@/lib/utils";
 import {
   repositoryId as toRepositoryId,
+  type ForegroundActivity,
   type Repository,
   type TaskPendingAction,
   type TaskState,
@@ -52,6 +54,13 @@ export interface Task {
    */
   primarySessionState?: string | null;
   primarySessionPendingAction?: TaskPendingAction | null;
+  taskPendingAction?: TaskPendingAction | null;
+  /**
+   * Task-level MOST-ACTIVE-WINS activity aggregate;
+   * undefined/null when no session is running. Drives the background-running
+   * affordance on the card status icon.
+   */
+  foregroundActivity?: ForegroundActivity | null;
   reviewStatus?: "pending" | "approved" | "changes_requested" | "rejected" | null;
   primaryExecutorId?: string | null;
   primaryExecutorType?: string | null;
@@ -61,6 +70,10 @@ export interface Task {
   workspaceMode?: "inherit_parent" | "new_workspace" | "shared_group";
   updatedAt?: string;
   createdAt?: string;
+  wipAdmitted?: boolean;
+  queuedForStepId?: string;
+  queuedForStepTitle?: string;
+  queuedAt?: string;
   issueUrl?: string;
   issueNumber?: number;
 }
@@ -206,6 +219,7 @@ function useKanbanCardMenus({
   const [showDetachConfirm, setShowDetachConfirm] = useState(false);
   const [showPRDialog, setShowPRDialog] = useState(false);
   const [showIssueDialog, setShowIssueDialog] = useState(false);
+  const [showMRDialog, setShowMRDialog] = useState(false);
   const [externalLinkProvider, setExternalLinkProvider] = useState<ExternalLinkProvider | null>(
     null,
   );
@@ -240,6 +254,7 @@ function useKanbanCardMenus({
       task.parentTaskId && !actingOnMultiSelection ? () => setShowDetachConfirm(true) : undefined,
     onLinkPullRequest: () => setShowPRDialog(true),
     onLinkIssue: () => setShowIssueDialog(true),
+    onLinkMergeRequest: externalLinkAvailability.gitlab ? () => setShowMRDialog(true) : undefined,
     ...externalLinkHandlers(externalLinkAvailability, setExternalLinkProvider),
   };
 
@@ -266,6 +281,8 @@ function useKanbanCardMenus({
     setShowPRDialog,
     showIssueDialog,
     setShowIssueDialog,
+    showMRDialog,
+    setShowMRDialog,
     externalLinkProvider,
     setExternalLinkProvider,
   };
@@ -321,6 +338,7 @@ function KanbanCardDialogs({
         onConfirm={menu.handleDetachConfirm}
       />
       <TaskGitHubPRDialog
+        workspaceId={workspaceId}
         open={menu.showPRDialog}
         onOpenChange={menu.setShowPRDialog}
         task={task}
@@ -332,6 +350,16 @@ function KanbanCardDialogs({
         task={task}
         repositories={repositories}
       />
+      {workspaceId && (
+        <TaskMRLinkDialog
+          open={menu.showMRDialog}
+          onOpenChange={menu.setShowMRDialog}
+          taskId={task.id}
+          workspaceId={workspaceId}
+          taskRepositories={task.repositories ?? []}
+          repositories={repositories}
+        />
+      )}
       {menu.externalLinkProvider && workspaceId && (
         <TaskExternalLinkDialog
           open={true}

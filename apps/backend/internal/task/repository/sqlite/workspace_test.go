@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/repository/repoerrors"
 )
@@ -71,6 +73,54 @@ func TestDeleteWorkspaceCascadeDeletesWorkspaceChildren(t *testing.T) {
 		t.Fatalf("workspace workflows should be deleted, got %d", len(workflows))
 	}
 	assertNoWorkspaceCascadeDependents(t, repo)
+}
+
+func TestDeleteWorkspaceCascadePurgesLifecycleQueueAndMirror(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepoForHealTests(t)
+	seedWorkspaceCascadeRows(t, repo, "ws-delete")
+
+	persistentRepo, err := messagequeue.NewSQLiteRepository(repo.db, repo.db)
+	if err != nil {
+		t.Fatalf("new persistent lifecycle queue: %v", err)
+	}
+	log, err := logger.NewLogger(logger.LoggingConfig{Level: "error", Format: "console"})
+	if err != nil {
+		t.Fatalf("new queue logger: %v", err)
+	}
+	persistentQueue := messagequeue.NewService(persistentRepo, messagequeue.DefaultMaxPerSession, log)
+	mirrorQueue := messagequeue.NewServiceMemory(log)
+	for _, queue := range []*messagequeue.Service{persistentQueue, mirrorQueue} {
+		_, _, accepted, err := queue.QueueLifecycleMessageWithCoalesceKey(
+			ctx, "session-delete", "task-delete", "merged lifecycle prompt", "", messagequeue.QueuedByWorkflow,
+			false, nil, map[string]interface{}{"origin": "github_pr_automation"}, "github-pr:repo:1:merged", true,
+		)
+		if err != nil || !accepted {
+			t.Fatalf("queue lifecycle prompt: accepted=%v err=%v", accepted, err)
+		}
+	}
+	repo.SetTaskQueuePurger(func(ctx context.Context, taskID string) {
+		if _, err := mirrorQueue.PurgeTask(ctx, taskID); err != nil {
+			t.Fatalf("purge lifecycle mirror: %v", err)
+		}
+	})
+
+	if _, _, err := repo.DeleteWorkspaceCascade(ctx, "ws-delete"); err != nil {
+		t.Fatalf("DeleteWorkspaceCascade: %v", err)
+	}
+	if got := persistentQueue.GetStatus(ctx, "session-delete").Count; got != 0 {
+		t.Fatalf("persistent lifecycle rows after workspace delete = %d, want 0", got)
+	}
+	generation, err := persistentRepo.LifecycleGeneration(ctx, "task-delete")
+	if err != nil {
+		t.Fatalf("read lifecycle generation: %v", err)
+	}
+	if generation != 1 {
+		t.Fatalf("lifecycle generation after workspace delete = %d, want 1", generation)
+	}
+	if got := mirrorQueue.GetStatus(ctx, "session-delete").Count; got != 0 {
+		t.Fatalf("lifecycle mirror rows after workspace delete = %d, want 0", got)
+	}
 }
 
 func TestDeleteWorkspaceCascadeWithNameRejectsMismatchedName(t *testing.T) {

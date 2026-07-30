@@ -1,5 +1,9 @@
+/* eslint-disable max-lines -- HTTP DTO definitions intentionally co-locate protocol shapes. */
+
 import type { ExecutorType } from "./executor";
+import type { ActiveSubagentCountFields, ForegroundActivity } from "./activity";
 import type { UserSettings } from "./http-user-settings";
+import type { TaskRepository, WorkspaceFolder } from "./http-workspace-sources";
 import type {
   AgentProfileId,
   RepositoryId,
@@ -9,19 +13,31 @@ import type {
   WorkspaceId,
 } from "./ids";
 import type { OnEnterActionType, StepEvents } from "./workflow-actions";
+import type { EntityReference } from "./entity-reference";
 
 export type { ExecutorType } from "./executor";
+export type { ActiveSubagentCountFields, ForegroundActivity } from "./activity";
 export type {
   SavedLayout,
   SidebarViewApi,
   SidebarViewDraftApi,
   SidebarTaskPrefsApi,
   TaskCreateLastUsedApi,
+  AppStatusBarOrderApi,
   MCPTaskAgentProfileDefault,
   UserSettings,
   UserSettingsResponse,
   UserSettingsUpdatePayload,
 } from "./http-user-settings";
+export type {
+  AttachTaskWorkspaceSourcesRequest,
+  AttachTaskWorkspaceSourcesResponse,
+  TaskRepository,
+  WorkspaceFolder,
+  WorkspaceFolderSourceRequest,
+  WorkspaceRepositorySourceRequest,
+  WorkspaceSourceRequest,
+} from "./http-workspace-sources";
 export * from "./ids";
 export type {
   MoveToStepConfig,
@@ -155,6 +171,15 @@ export type TaskSessionState =
 
 export type TaskPendingAction = "clarification" | "permission";
 
+/**
+ * Fine-grained busy substate of a session (see ADR-0049). Distinguishes
+ * a foreground turn that is actively generating from one that is idle, held open
+ * only by spawned background work (a subagent task, a run-in-background shell, an
+ * active Monitor). `generating` is meaningful while `state === "RUNNING"`;
+ * `background` may outlive the foreground turn. Delivered live over the
+ * `session.activity_changed` WS event and carried on `session.state_changed`;
+ * absent/`null` is treated as "generating" for a RUNNING session.
+ */
 export type Workflow = {
   id: WorkflowId;
   workspace_id: WorkspaceId;
@@ -206,6 +231,8 @@ export type Repository = {
   provider_host?: string;
   provider_owner: string;
   provider_name: string;
+  /** Canonical credential-free clone URL for provider-backed repositories. */
+  remote_url?: string;
   default_branch: string;
   scripts?: RepositoryScript[];
   worktree_branch_prefix: string;
@@ -255,22 +282,6 @@ export type ProcessInfo = {
   output?: ProcessOutputChunk[];
 };
 
-export type TaskRepository = {
-  id: string;
-  task_id: TaskId;
-  repository_id: RepositoryId;
-  base_branch: string;
-  /**
-   * Optional branch to fetch and check out after worktree creation
-   * (e.g. a PR head branch). Empty when no specific branch is requested.
-   */
-  checkout_branch?: string;
-  position: number;
-  metadata?: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
-};
-
 /**
  * Returns the primary task repository (lowest Position, first by created_at on
  * tie). Returns undefined for repo-less tasks. Consumers that historically
@@ -288,7 +299,7 @@ export function primaryTaskRepository(
   return primary;
 }
 
-export type Task = {
+export type Task = ActiveSubagentCountFields & {
   id: TaskId;
   workspace_id: WorkspaceId;
   workflow_id: WorkflowId;
@@ -298,10 +309,21 @@ export type Task = {
   description: string;
   state: TaskState;
   priority: number;
+  wip_admitted?: boolean;
+  queued_for_step_id?: string;
+  queued_at?: string | null;
   repositories?: TaskRepository[];
+  workspace_folders?: WorkspaceFolder[];
   primary_session_id?: SessionId | null;
   primary_session_state?: TaskSessionState | null;
   primary_session_pending_action?: TaskPendingAction | null;
+  task_pending_action?: TaskPendingAction | null;
+  /**
+   * Task-level MOST-ACTIVE-WINS activity across sessions. "generating" wins,
+   * then "background"; null/absent means none is known. The count is the
+   * corresponding sum of live subagents.
+   */
+  foreground_activity?: ForegroundActivity | null;
   session_count?: number | null;
   review_status?: "pending" | "approved" | "changes_requested" | "rejected" | null;
   primary_executor_id?: string | null;
@@ -379,7 +401,7 @@ export type TaskSessionWorktree = {
   created_at?: string;
 };
 
-export type TaskSession = {
+export type TaskSession = ActiveSubagentCountFields & {
   id: SessionId;
   task_id: TaskId;
   /** Optional user-supplied label shown on the session tab. */
@@ -397,6 +419,8 @@ export type TaskSession = {
   worktrees?: TaskSessionWorktree[];
   task_environment_id?: string;
   state: TaskSessionState;
+  /** Fine-grained busy substate; background may outlive the foreground turn (ADR-0049). */
+  foreground_activity?: ForegroundActivity | null;
   error_message?: string;
   metadata?: Record<string, unknown> | null;
   agent_profile_snapshot?: Record<string, unknown> | null;
@@ -655,6 +679,10 @@ export type MessageType =
   | "script_execution"
   | "agent_plan";
 
+export type MessageMetadata = Record<string, unknown> & {
+  entity_references?: EntityReference[];
+};
+
 export type Message = {
   id: string;
   session_id: SessionId;
@@ -665,7 +693,7 @@ export type Message = {
   content: string;
   raw_content?: string;
   type: MessageType;
-  metadata?: Record<string, unknown>;
+  metadata?: MessageMetadata;
   requests_input?: boolean;
   created_at: string;
   /** Authoritative per-message change signal; advances on every content/metadata update. */
@@ -716,10 +744,7 @@ export type StepPortable = {
   pull_from_step_position?: number;
 };
 
-export type ImportWorkflowsResult = {
-  created: string[];
-  skipped: string[];
-};
+export type ImportWorkflowsResult = { created: string[]; skipped: string[] };
 
 // Helper function to check if a step has a specific on_enter action
 export function stepHasOnEnterAction(

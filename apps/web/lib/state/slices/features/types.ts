@@ -7,6 +7,9 @@
 export type FeatureFlags = {
   office: boolean;
   plugins: boolean;
+  appStatusBar: boolean;
+  auth: boolean;
+  claudeBackgroundPromptHandoff: boolean;
 };
 
 export type FeatureName = keyof FeatureFlags;

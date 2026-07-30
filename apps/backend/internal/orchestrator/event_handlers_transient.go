@@ -113,11 +113,10 @@ func (s *Service) handleTransientFailure(ctx context.Context, data watcher.Agent
 	if data.SessionID == "" || !routingerr.IsTransientProviderError(data.ErrorMessage) {
 		return false
 	}
-	// Genuine office tasks (those with an assignee agent profile) render their
+	// Genuine Office-owned tasks render their
 	// own structured error UI — keep them on the existing path rather than the
-	// kanban-style yellow retry card. Note: we intentionally check the task's
-	// assignee, NOT isOfficeSession (session.AgentProfileID), which is also set
-	// for ordinary kanban tasks started with an agent profile.
+	// kanban-style yellow retry card. The canonical task projection avoids
+	// treating ordinary Kanban tasks with an assigned profile as Office tasks.
 	if s.isOfficeTask(ctx, data.TaskID) {
 		return false
 	}
@@ -240,6 +239,16 @@ func (s *Service) retryTransientPrompt(ctx context.Context, taskID, sessionID, e
 				zap.String("execution_id", execID),
 				zap.Error(err))
 		}
+		// handleAgentFailed terminal-marked this exact execution before the
+		// retry was scheduled, so no later frame may reclaim activity even when
+		// runtime teardown times out. Retirement is safe and idempotent on both
+		// stop outcomes.
+		s.retireExecutionActivityAndPublish(
+			context.WithoutCancel(ctx),
+			taskID,
+			sessionID,
+			execID,
+		)
 	}
 	if ctx.Err() != nil {
 		return
@@ -332,6 +341,16 @@ func (s *Service) cancelAllTransientRetries() {
 // and surfaces the manual recovery banner so they can Resume or Start fresh.
 // Returns true if a retry loop was active.
 func (s *Service) CancelTransientRetry(ctx context.Context, taskID, sessionID string) bool {
+	// Reports "nothing to cancel" on denial: the bool return carries no error
+	// channel, and a foreign session must not be distinguishable from an idle
+	// one. Guard first — resetTransientRetry below mutates retry state.
+	//
+	// Both IDs: taskID is handed to handleRecoverableFailure, which writes
+	// against that task, so the session check alone would leave it free to
+	// point at someone else's.
+	if err := s.authorizeTaskSessionPair(ctx, taskID, sessionID); err != nil {
+		return false
+	}
 	_, active := s.transientRetries.Load(sessionID)
 	s.resetTransientRetry(sessionID)
 	if !active {

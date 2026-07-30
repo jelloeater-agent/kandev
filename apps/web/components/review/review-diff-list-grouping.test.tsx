@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { createRef, type ReactNode } from "react";
 import { TooltipProvider } from "@kandev/ui/tooltip";
 import type { ReviewFile } from "./types";
+
+const mocks = vi.hoisted(() => ({ isMobile: false }));
 
 // FileDiffViewer is heavy and irrelevant to the grouping test — stub it.
 vi.mock("@/components/diff", () => ({
@@ -12,8 +14,24 @@ vi.mock("@/components/diff", () => ({
   DiffErrorBoundary: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
+vi.mock("@/components/task/markdown-preview-content", () => ({
+  MarkdownPreviewRenderer: ({ content }: { content: string }) => <div>{content}</div>,
+}));
+
 vi.mock("@/components/editors/file-actions-dropdown", () => ({
   FileActionsDropdown: () => null,
+  FileActionsMenuItems: () => null,
+}));
+
+// External link resolution is unrelated to grouping and requires a fully
+// hydrated repository store, which this focused test intentionally omits.
+vi.mock("@/components/editors/external-vcs-file-link", () => ({
+  ExternalVcsFileLink: () => null,
+  ExternalVcsFileMenuItem: () => null,
+}));
+
+vi.mock("@/hooks/use-responsive-breakpoint", () => ({
+  useResponsiveBreakpoint: () => ({ isMobile: mocks.isMobile }),
 }));
 
 vi.mock("@/lib/ws/connection", () => ({ getWebSocketClient: () => null }));
@@ -36,7 +54,10 @@ vi.mock("@/components/toast-provider", () => ({
 
 import { ReviewDiffList } from "./review-diff-list";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  mocks.isMobile = false;
+});
 
 function file(path: string, repo?: string): ReviewFile {
   return {
@@ -137,7 +158,41 @@ describe("ReviewDiffList — multi-repo grouping", () => {
 });
 
 describe("ReviewDiffList — file status rendering", () => {
+  it("replaces a Markdown diff in place and preserves reviewed state when restored", () => {
+    const markdownFile = {
+      ...file("guide.md"),
+      status: "added",
+      diff: "@@ -0,0 +1,2 @@\n+# Guide\n+Rendered content.",
+    } as ReviewFile;
+    const refs = new Map([[markdownFile.path, createRef<HTMLDivElement>()]]);
+    render(
+      withTooltips(
+        <ReviewDiffList
+          {...baseProps}
+          files={[markdownFile]}
+          reviewedFiles={new Set([markdownFile.path])}
+          selectedFile={markdownFile.path}
+          fileRefs={refs}
+        />,
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview markdown" }));
+
+    expect(screen.getByTestId("review-markdown-diff-preview").textContent).toContain(
+      "Rendered content.",
+    );
+    expect(screen.queryByTestId("diff-stub")).toBeNull();
+    expect(screen.getByRole("checkbox").getAttribute("data-state")).toBe("checked");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+
+    expect(screen.getByTestId("diff-stub").textContent).toBe("guide.md");
+    expect(screen.getByRole("checkbox").getAttribute("data-state")).toBe("checked");
+  });
+
   it("shows moved status in the mobile header and honest copy for a patchless rename", () => {
+    mocks.isMobile = true;
     const movedFile = {
       ...file("new-name.ts"),
       diff: "",
@@ -147,7 +202,7 @@ describe("ReviewDiffList — file status rendering", () => {
     renderSingleFile(movedFile);
 
     const marker = screen.getByRole("img", { name: "Moved from old-name.ts" });
-    expect(marker.className).toContain("sm:hidden");
+    expect(marker.className).toContain("size-3.5");
     expect(screen.getByText("Moved from old-name.ts; no textual changes")).toBeTruthy();
   });
 

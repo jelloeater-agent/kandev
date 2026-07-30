@@ -16,6 +16,7 @@ import type {
   StorageMaintenanceSettings,
   StorageOverviewResponse,
   StorageQuarantineEntry,
+  StorageQuarantinePurgeScope,
   StorageSettingsResponse,
 } from "@/lib/types/system";
 
@@ -247,6 +248,7 @@ export function analyzeStorage(options?: ApiRequestOptions): Promise<JobAcceptRe
 
 export function runStorageMaintenance(
   resources?: string[],
+  force = false,
   options?: ApiRequestOptions,
 ): Promise<JobAcceptResponse> {
   return fetchJson<JobAcceptResponse>(`${SYSTEM_BASE}/storage/run`, {
@@ -254,7 +256,10 @@ export function runStorageMaintenance(
     init: {
       ...(options?.init ?? {}),
       method: "POST",
-      body: JSON.stringify(resources?.length ? { resources } : {}),
+      body: JSON.stringify({
+        ...(resources?.length ? { resources } : {}),
+        ...(force ? { force: true } : {}),
+      }),
     },
   });
 }
@@ -306,4 +311,21 @@ export function deleteStorageQuarantine(
       },
     },
   );
+}
+
+export function purgeStorageQuarantine(
+  scope: StorageQuarantinePurgeScope,
+  options?: ApiRequestOptions,
+): Promise<JobAcceptResponse> {
+  return fetchJson<JobAcceptResponse>(`${SYSTEM_BASE}/storage/quarantine`, {
+    ...options,
+    init: {
+      ...(options?.init ?? {}),
+      method: "DELETE",
+      body: JSON.stringify({
+        scope,
+        confirm: scope === "eligible" ? "DELETE ELIGIBLE" : "DELETE ALL NOW",
+      }),
+    },
+  });
 }

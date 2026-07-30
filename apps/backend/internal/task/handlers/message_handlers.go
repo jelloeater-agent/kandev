@@ -14,6 +14,7 @@ import (
 
 	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
 	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/entityrefs"
 	"github.com/kandev/kandev/internal/orchestrator"
 	"github.com/kandev/kandev/internal/orchestrator/executor"
 	"github.com/kandev/kandev/internal/sysprompt"
@@ -28,30 +29,51 @@ import (
 type OrchestratorService interface {
 	PromptTask(ctx context.Context, taskID, sessionID, prompt, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool) (*orchestrator.PromptResult, error)
 	ResumeTaskSession(ctx context.Context, taskID, taskSessionID string) error
-	StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment) error
+	StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment, references []v1.EntityReference) error
 	ProcessOnTurnStart(ctx context.Context, taskID, sessionID string) error
 	StepRequiresCompletionSignal(ctx context.Context, taskID string) bool
+	// ForegroundActivity is already filtered by the orchestrator's runtime flag
+	// and persisted provider identity. Background therefore means this exact
+	// session is eligible for the experimental direct-admission path.
+	ForegroundActivity(sessionID string) v1.ForegroundActivity
 }
 
 // MessageHandlers handles WebSocket requests for messages
 type MessageHandlers struct {
-	service      *service.Service
-	orchestrator OrchestratorService
-	logger       *logger.Logger
+	service            *service.Service
+	orchestrator       OrchestratorService
+	logger             *logger.Logger
+	referenceValidator entityrefs.SubmissionValidator
 }
 
 // NewMessageHandlers creates a new MessageHandlers instance
-func NewMessageHandlers(svc *service.Service, orchestrator OrchestratorService, log *logger.Logger) *MessageHandlers {
-	return &MessageHandlers{
+func NewMessageHandlers(
+	svc *service.Service,
+	orchestrator OrchestratorService,
+	log *logger.Logger,
+	validators ...entityrefs.SubmissionValidator,
+) *MessageHandlers {
+	handlers := &MessageHandlers{
 		service:      svc,
 		orchestrator: orchestrator,
 		logger:       log.WithFields(zap.String("component", "task-message-handlers")),
 	}
+	if len(validators) > 0 {
+		handlers.referenceValidator = validators[0]
+	}
+	return handlers
 }
 
 // RegisterMessageRoutes registers message HTTP + WebSocket handlers
-func RegisterMessageRoutes(router *gin.Engine, dispatcher *ws.Dispatcher, svc *service.Service, orchestrator OrchestratorService, log *logger.Logger) {
-	handlers := NewMessageHandlers(svc, orchestrator, log)
+func RegisterMessageRoutes(
+	router *gin.Engine,
+	dispatcher *ws.Dispatcher,
+	svc *service.Service,
+	orchestrator OrchestratorService,
+	log *logger.Logger,
+	validators ...entityrefs.SubmissionValidator,
+) {
+	handlers := NewMessageHandlers(svc, orchestrator, log, validators...)
 	handlers.registerHTTP(router)
 	handlers.registerWS(dispatcher)
 }
@@ -66,12 +88,20 @@ func (h *MessageHandlers) registerHTTP(router *gin.Engine) {
 func (h *MessageHandlers) httpGetShellOutput(c *gin.Context) {
 	message, err := h.service.GetMessage(c.Request.Context(), c.Param("message_id"))
 	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			h.logger.Error("failed to get shell output message", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get shell output"})
+		// A missing row surfaces as bare sql.ErrNoRows, which isNotFound does
+		// not classify (it matches typed sentinels and the "not found" substring,
+		// neither of which covers "sql: no rows in result set") — so keep that
+		// case explicit.
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 			return
 		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+		// Everything else goes through the shared mapper: GetMessage is now
+		// per-user scoped, so a denial arrives as ErrTaskNotFound. Answering 500
+		// for a foreign message while a missing one gets 404 would be an
+		// existence signal, and inconsistent with the 404-everywhere rule the
+		// other session routes follow.
+		handleNotFound(c, h.logger, err, "message not found")
 		return
 	}
 	output, ok := models.ExtractShellExecOutput(message.Metadata)
@@ -213,6 +243,7 @@ type wsAddMessageRequest struct {
 	HasReviewComments bool                   `json:"has_review_comments,omitempty"`
 	Attachments       []v1.MessageAttachment `json:"attachments,omitempty"`
 	ContextFiles      []v1.ContextFileMeta   `json:"context_files,omitempty"`
+	EntityReferences  []v1.EntityReference   `json:"entity_references,omitempty"`
 }
 
 func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
@@ -230,6 +261,21 @@ func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*w
 	sessionResp, wsErr := h.checkSessionStateForMessage(ctx, msg, req.TaskSessionID)
 	if wsErr != nil {
 		return wsErr, nil
+	}
+	if len(req.EntityReferences) > 0 {
+		if sessionResp.Session.IsPassthrough || h.referenceValidator == nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Invalid entity references", nil)
+		}
+		references, err := h.referenceValidator.ValidateForSubmission(
+			ctx,
+			req.TaskSessionID,
+			req.TaskID,
+			req.EntityReferences,
+		)
+		if err != nil {
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Invalid entity references", nil)
+		}
+		req.EntityReferences = references
 	}
 
 	// Transition task from REVIEW → IN_PROGRESS if needed
@@ -263,7 +309,7 @@ func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*w
 		}
 		req.TaskSessionID = sessionResp.Session.ID
 	}
-	if wsErr := h.errorForBlockedMessageSession(msg, sessionResp.Session.State); wsErr != nil {
+	if wsErr := h.errorForBlockedMessageSession(msg, sessionResp.Session.ID, sessionResp.Session.State); wsErr != nil {
 		return wsErr, nil
 	}
 	isCreatedSession := sessionResp.Session.State == models.TaskSessionStateCreated
@@ -273,24 +319,25 @@ func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*w
 		WithPlanMode(req.PlanMode).
 		WithReviewComments(req.HasReviewComments).
 		WithAttachments(req.Attachments).
-		WithContextFiles(req.ContextFiles)
+		WithContextFiles(req.ContextFiles).
+		WithEntityReferences(req.EntityReferences)
 
 	// First message on a CREATED session is the kanban "type in chat to start
 	// the agent" path. Wrap with the Kandev MCP system block before persisting
 	// so the DB row matches what the agent receives (and "Show formatted"
 	// reveals it). The orchestrator's wrap in StartCreatedSession is
-	// idempotent (HasKandevContext guard), so passing the wrapped content
-	// through dispatchPromptAsync does not double-wrap downstream.
-	// NOTE: req.Content is user-controlled — do NOT guard this wrap on
-	// HasKandevContext. A malicious or naive client could craft a body
+	// mode-aware and canonicalizing, so passing the wrapped content through
+	// dispatchPromptAsync does not double-wrap downstream.
+	// NOTE: req.Content is user-controlled. A
+	// malicious or naive client could craft a body
 	// containing a fake "<kandev-system>KANDEV MCP TOOLS</kandev-system>"
 	// block and bypass server-side injection of the canonical task/session/
-	// tool context. Wrap unconditionally; the orchestrator's own guard sees
-	// our wrap downstream and skips its second pass.
+	// tool context. The injector replaces it with server-generated context here
+	// and canonicalizes it again from server state downstream.
 	// Passthrough sessions skip the wrap: the prompt is typed straight into
 	// the agent CLI's TTY and the user sees it verbatim — they don't want a
 	// wall of MCP-tool boilerplate prepended to "hello".
-	storedContent := req.Content
+	storedContent := orchestrator.AppendEntityReferenceContext(req.Content, req.EntityReferences)
 	if isCreatedSession && !sessionResp.Session.IsPassthrough && (req.Content != "" || len(req.Attachments) > 0) {
 		task, err := h.service.GetTask(ctx, req.TaskID)
 		if err != nil {
@@ -299,12 +346,17 @@ func (h *MessageHandlers) wsAddMessage(ctx context.Context, msg *ws.Message) (*w
 		}
 		configMode, _ := sessionResp.Session.Metadata["config_mode"].(bool)
 		requiresSignal := h.orchestrator != nil && h.orchestrator.StepRequiresCompletionSignal(ctx, req.TaskID)
-		storedContent = sysprompt.InjectKandevContextWithOptions(req.TaskID, req.TaskSessionID, req.Content, sysprompt.KandevContextOptions{
-			RequiresCompletionSignal:       requiresSignal,
-			IncludeCoordinatorTaskControls: task.AssigneeAgentProfileID == "" && !configMode,
-		})
-		req.Content = storedContent
+		referenceContext := orchestrator.EntityReferenceContext(req.EntityReferences)
+		if task.IsFromOffice {
+			storedContent = sysprompt.InjectOfficeContext(req.TaskID, req.TaskSessionID, storedContent, referenceContext)
+		} else {
+			storedContent = sysprompt.InjectKandevContextWithOptions(req.TaskID, req.TaskSessionID, storedContent, sysprompt.KandevContextOptions{
+				RequiresCompletionSignal:       requiresSignal,
+				IncludeCoordinatorTaskControls: !configMode,
+			}, referenceContext)
+		}
 	}
+	req.Content = storedContent
 
 	message, err := h.service.CreateMessage(ctx, &service.CreateMessageRequest{
 		TaskSessionID: req.TaskSessionID,
@@ -370,9 +422,13 @@ func (h *MessageHandlers) resolveSessionAfterTurnStart(
 	return &dto.GetTaskSessionResponse{Session: dto.FromTaskSession(primary)}, nil
 }
 
-func (h *MessageHandlers) errorForBlockedMessageSession(msg *ws.Message, state models.TaskSessionState) *ws.Message {
+func (h *MessageHandlers) errorForBlockedMessageSession(msg *ws.Message, sessionID string, state models.TaskSessionState) *ws.Message {
 	switch state {
 	case models.TaskSessionStateRunning:
+		if h.orchestrator != nil &&
+			h.orchestrator.ForegroundActivity(sessionID) == v1.ForegroundActivityBackground {
+			return nil
+		}
 		wsErr, _ := ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "Agent is currently processing. Please wait for the current operation to complete.", nil)
 		return wsErr
 	case models.TaskSessionStateFailed, models.TaskSessionStateCancelled, models.TaskSessionStateCompleted:
@@ -412,7 +468,7 @@ func (h *MessageHandlers) checkSessionStateForMessage(ctx context.Context, msg *
 	}
 	sessionDTO := dto.FromTaskSession(session)
 	resp := &dto.GetTaskSessionResponse{Session: sessionDTO}
-	if wsErr := h.errorForBlockedMessageSession(msg, sessionDTO.State); wsErr != nil {
+	if wsErr := h.errorForBlockedMessageSession(msg, sessionID, sessionDTO.State); wsErr != nil {
 		if sessionDTO.State == models.TaskSessionStateRunning {
 			h.logBlockedRunningSession(sessionID, sessionDTO.State)
 		}
@@ -461,7 +517,10 @@ func (h *MessageHandlers) dispatchPromptAsync(ctx context.Context, req wsAddMess
 	attachments := req.Attachments
 	go func() {
 		promptCtx := context.WithoutCancel(ctx)
-		h.forwardMessageAsPrompt(promptCtx, taskID, sessionID, agentProfileID, content, model, planMode, attachments, isCreatedSession)
+		h.forwardMessageAsPrompt(
+			promptCtx, taskID, sessionID, agentProfileID,
+			content, model, planMode, attachments, req.EntityReferences, isCreatedSession,
+		)
 	}()
 }
 
@@ -473,11 +532,15 @@ func (h *MessageHandlers) forwardMessageAsPrompt(
 	taskID, sessionID, agentProfileID, content, model string,
 	planMode bool,
 	attachments []v1.MessageAttachment,
+	references []v1.EntityReference,
 	startCreated bool,
 ) {
 	// For CREATED sessions, start the agent with this message as the initial prompt
 	if startCreated {
-		if err := h.orchestrator.StartCreatedSession(ctx, taskID, sessionID, agentProfileID, content, true, planMode, false, attachments); err != nil {
+		if err := h.orchestrator.StartCreatedSession(
+			ctx, taskID, sessionID, agentProfileID,
+			content, true, planMode, false, attachments, references,
+		); err != nil {
 			h.logger.Warn("failed to start created session from message",
 				zap.String("task_id", taskID),
 				zap.String("session_id", sessionID),

@@ -8,6 +8,29 @@ import (
 	"testing"
 )
 
+func TestGitHubCredentialBrokerConfigValidation(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.GitHubCredentialBroker.PublicBaseURL = "https://kandev.example.com"
+	if err := validate(cfg); err != nil {
+		t.Fatalf("validate broker-only config: %v", err)
+	}
+	cfg.GitHubCredentialBroker.PublicBaseURL = "http://kandev.example.com"
+	if err := validate(cfg); err == nil || !strings.Contains(err.Error(), "githubCredentialBroker.publicBaseUrl") {
+		t.Fatalf("validate insecure broker URL error = %v", err)
+	}
+}
+
+func TestGitHubCredentialBrokerConfigEnvironmentBinding(t *testing.T) {
+	t.Setenv("KANDEV_GITHUB_CREDENTIAL_BROKER_PUBLIC_BASE_URL", "https://kandev.example.com")
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if got := cfg.GitHubCredentialBroker.PublicBaseURL; got != "https://kandev.example.com" {
+		t.Fatalf("broker public base URL = %q", got)
+	}
+}
+
 // minimalValidConfig returns a Config that passes validate() out of the box.
 // Tests modify a copy to exercise individual validation branches.
 func minimalValidConfig() *Config {
@@ -144,19 +167,15 @@ func TestValidate_PostgresSSLMode(t *testing.T) {
 	})
 }
 
-// TestFeatures_DefaultOff pins the production-safety invariant: every
-// feature flag in FeaturesConfig is false unless the deployment explicitly
-// sets the matching env var. A regression that flips a default to true
-// would ship an in-progress feature to users on the next release.
-// See docs/decisions/0007-runtime-feature-flags.md.
-func TestFeatures_DefaultOff(t *testing.T) {
-	// Force a clean env so KANDEV_FEATURES_* and profile-selector vars
-	// from the host shell can't bleed in and turn a default-off check
-	// into a default-on accident. Clearing the profile selectors ensures
-	// DetectEnvironment returns prod, so FeatureFlagDefaults uses the
-	// prod value ("false") rather than the dev value ("true").
+// TestFeatures_ProductionDefaults pins the production policy: in-progress
+// features remain off, while the shipped app status bar remains on unless a
+// deployment or saved runtime override explicitly disables it.
+func TestFeatures_ProductionDefaults(t *testing.T) {
+	// Force a clean env so KANDEV_FEATURES_* and profile-selector vars from the
+	// host shell cannot change the production-profile defaults under test.
 	t.Setenv("KANDEV_FEATURES_OFFICE", "")
 	t.Setenv("KANDEV_FEATURES_PLUGINS", "")
+	unsetEnv(t, "KANDEV_FEATURES_APP_STATUS_BAR")
 	t.Setenv("KANDEV_DEBUG_DEV_MODE", "")
 	t.Setenv("KANDEV_DEBUG_PPROF_ENABLED", "")
 	t.Setenv("KANDEV_E2E_MOCK", "")
@@ -171,6 +190,9 @@ func TestFeatures_DefaultOff(t *testing.T) {
 	}
 	if cfg.Features.Plugins {
 		t.Errorf("Features.Plugins = true, want false (production default must be off)")
+	}
+	if cfg.Features.AppStatusBar {
+		t.Error("Features.AppStatusBar = true, want false (status surface must remain opt-in by default)")
 	}
 }
 
@@ -204,6 +226,43 @@ func TestFeatures_PluginsEnabledByEnv(t *testing.T) {
 	if !cfg.Features.Plugins {
 		t.Errorf("Features.Plugins = false, want true (KANDEV_FEATURES_PLUGINS=true must flip the flag)")
 	}
+}
+
+func TestFeatures_ClaudeBackgroundPromptHandoffEnabledByEnv(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF", "true")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if !cfg.Features.ClaudeBackgroundPromptHandoff {
+		t.Error("Features.ClaudeBackgroundPromptHandoff = false, want true")
+	}
+}
+
+func TestFeatures_AppStatusBarDisabledByEnv(t *testing.T) {
+	t.Setenv("KANDEV_FEATURES_APP_STATUS_BAR", "false")
+
+	cfg, err := LoadWithPath(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadWithPath: %v", err)
+	}
+	if cfg.Features.AppStatusBar {
+		t.Error("Features.AppStatusBar = true, want false (KANDEV_FEATURES_APP_STATUS_BAR=false must hide it)")
+	}
+}
+
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	value, set := os.LookupEnv(name)
+	_ = os.Unsetenv(name)
+	t.Cleanup(func() {
+		if set {
+			_ = os.Setenv(name, value)
+			return
+		}
+		_ = os.Unsetenv(name)
+	})
 }
 
 func TestServerHostFromEnv(t *testing.T) {
@@ -375,13 +434,18 @@ func TestServerHostsFromConfigWhenHostUnset(t *testing.T) {
 // without a tag) would surface as a capitalized JSON key and break the
 // frontend's case-sensitive read in apps/web/app/actions/features.ts.
 func TestFeaturesConfig_JSONShape(t *testing.T) {
-	cfg := FeaturesConfig{Office: true, Plugins: true}
+	cfg := FeaturesConfig{
+		Office:       true,
+		Plugins:      true,
+		AppStatusBar: true,
+		Auth:         true,
+	}
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatalf("json.Marshal: %v", err)
 	}
 	got := string(raw)
-	want := `{"office":true,"plugins":true}`
+	want := `{"office":true,"plugins":true,"appStatusBar":true,"auth":true,"claudeBackgroundPromptHandoff":false}`
 	if got != want {
 		t.Errorf("FeaturesConfig JSON = %s; want %s — missing or wrong `json:` struct tag", got, want)
 	}

@@ -3,13 +3,40 @@ import {
   buildCoreFields,
   mapUserSettingsResponse,
   parseChangesPanelLayout,
+  parseSystemMetricsDisplay,
   parseVoiceMode,
 } from "./user-settings";
 import { workspaceId as toWorkspaceId } from "@/lib/types/ids";
 
 const UPDATED_AT = "2026-01-01T00:00:00Z";
+const DEFAULT_USER_ID = "default-user";
 
 describe("buildCoreFields", () => {
+  it("normalizes the simplified metrics preference and defaults old rows to detailed", () => {
+    expect(parseSystemMetricsDisplay({ show_in_topbar: true, simplified: true } as never)).toEqual({
+      showInTopbar: true,
+      simplified: true,
+    });
+    expect(parseSystemMetricsDisplay(undefined)).toEqual({
+      showInTopbar: false,
+      simplified: false,
+    });
+  });
+
+  it("maps portable app status bar order", () => {
+    const settings = {
+      app_status_bar_order: {
+        left_item_ids: ["builtin:connection", "plugin:left"],
+        right_item_ids: ["builtin:metrics"],
+      },
+    } as unknown as Parameters<typeof buildCoreFields>[0];
+
+    expect(buildCoreFields(settings).appStatusBarOrder).toEqual({
+      leftItemIds: ["builtin:connection", "plugin:left"],
+      rightItemIds: ["builtin:metrics"],
+    });
+  });
+
   it("maps terminal_font_family to terminalFontFamily", () => {
     const settings = {
       workspace_id: toWorkspaceId(""),
@@ -117,11 +144,34 @@ describe("buildTerminalFields via buildCoreFields", () => {
 });
 
 describe("mapUserSettingsResponse", () => {
+  it("maps the portable task-list details preference and defaults it to false", () => {
+    expect(mapUserSettingsResponse(null).tasksListShowDetails).toBe(false);
+
+    const result = mapUserSettingsResponse({
+      settings: {
+        user_id: DEFAULT_USER_ID,
+        workspace_id: toWorkspaceId(""),
+        repository_ids: [],
+        tasks_list_show_details: true,
+        updated_at: UPDATED_AT,
+      },
+    });
+
+    expect(result.tasksListShowDetails).toBe(true);
+  });
+
+  it("defaults portable app status bar order to empty arrays", () => {
+    expect(mapUserSettingsResponse(null).appStatusBarOrder).toEqual({
+      leftItemIds: [],
+      rightItemIds: [],
+    });
+  });
+
   it("defaults missing and unknown MCP task agent profile preferences", () => {
     const missing = mapUserSettingsResponse(null);
     const unknown = mapUserSettingsResponse({
       settings: {
-        user_id: "default-user",
+        user_id: DEFAULT_USER_ID,
         workspace_id: toWorkspaceId(""),
         repository_ids: [],
         mcp_task_agent_profile_default: "unexpected",
@@ -137,10 +187,18 @@ describe("mapUserSettingsResponse", () => {
     expect(mapUserSettingsResponse(null).confirmTaskArchive).toBe(true);
   });
 
+  it("enables every transcript navigation control when settings are unavailable", () => {
+    const settings = mapUserSettingsResponse(null);
+
+    expect(settings.showAnchoredPromptBar).toBe(true);
+    expect(settings.showScrollToLastPrompt).toBe(true);
+    expect(settings.showScrollToStart).toBe(true);
+  });
+
   it("preserves an explicitly disabled archive confirmation preference", () => {
     const result = mapUserSettingsResponse({
       settings: {
-        user_id: "default-user",
+        user_id: DEFAULT_USER_ID,
         workspace_id: toWorkspaceId(""),
         repository_ids: [],
         confirm_task_archive: false,
@@ -164,7 +222,7 @@ describe("mapUserSettingsResponse", () => {
   it("maps sidebar active view and draft state", () => {
     const result = mapUserSettingsResponse({
       settings: {
-        user_id: "default-user",
+        user_id: DEFAULT_USER_ID,
         workspace_id: toWorkspaceId(""),
         repository_ids: [],
         sidebar_views: [

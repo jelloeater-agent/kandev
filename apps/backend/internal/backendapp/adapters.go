@@ -76,6 +76,17 @@ func (a *taskRepositoryAdapter) UpdateTaskStateIfSessionState(
 	return a.svc.UpdateTaskStateIfSessionState(ctx, taskID, sessionID, expectedSessionState, state)
 }
 
+func (a *taskRepositoryAdapter) UpdateTaskStateIfPrimarySessionState(
+	ctx context.Context,
+	taskID, sessionID string,
+	expectedSessionState models.TaskSessionState,
+	state v1.TaskState,
+) (bool, error) {
+	return a.svc.UpdateTaskStateIfPrimarySessionState(
+		ctx, taskID, sessionID, expectedSessionState, state,
+	)
+}
+
 // lifecycleAdapter adapts the lifecycle manager as an AgentManagerClient
 type lifecycleAdapter struct {
 	mgr      *lifecycle.Manager
@@ -153,6 +164,9 @@ func (a *lifecycleAdapter) LaunchAgent(ctx context.Context, req *executor.Launch
 		RepoName:           req.RepoName,
 		BranchSlug:         req.BranchSlug,
 		BranchIdentitySlug: req.BranchIdentitySlug,
+	}
+	for _, f := range req.WorkspaceFolders {
+		launchReq.WorkspaceFolders = append(launchReq.WorkspaceFolders, lifecycle.WorkspaceFolderSpec{Name: f.Name, LocalPath: f.LocalPath})
 	}
 
 	if req.RouteOverride != nil {
@@ -388,6 +402,17 @@ func (a *lifecycleAdapter) PromptAgent(ctx context.Context, agentInstanceID stri
 	}, nil
 }
 
+func (a *lifecycleAdapter) PromptAgentWithDispatchCallback(ctx context.Context, agentInstanceID string, prompt string, attachments []v1.MessageAttachment, dispatchOnly bool, onDispatched func()) (*executor.PromptResult, error) {
+	result, err := a.mgr.PromptAgentWithDispatchCallback(ctx, agentInstanceID, prompt, attachments, dispatchOnly, onDispatched)
+	if err != nil {
+		return nil, err
+	}
+	return &executor.PromptResult{
+		StopReason:   result.StopReason,
+		AgentMessage: result.AgentMessage,
+	}, nil
+}
+
 // CancelAgent interrupts the current agent turn without terminating the process.
 func (a *lifecycleAdapter) CancelAgent(ctx context.Context, sessionID string) error {
 	return a.mgr.CancelAgentBySessionID(ctx, sessionID)
@@ -594,8 +619,8 @@ func (w *orchestratorWrapper) ResumeTaskSession(ctx context.Context, taskID, tas
 }
 
 // StartCreatedSession forwards to the orchestrator service, discarding the TaskExecution result.
-func (w *orchestratorWrapper) StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment) error {
-	_, err := w.svc.StartCreatedSession(ctx, taskID, sessionID, agentProfileID, prompt, skipMessageRecord, planMode, autoStart, attachments)
+func (w *orchestratorWrapper) StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment, references []v1.EntityReference) error {
+	_, err := w.svc.StartCreatedSession(ctx, taskID, sessionID, agentProfileID, prompt, skipMessageRecord, planMode, autoStart, attachments, references)
 	return err
 }
 
@@ -646,6 +671,11 @@ func (w *orchestratorWrapper) ProcessOnTurnStart(ctx context.Context, taskID, se
 // StepRequiresCompletionSignal forwards to the orchestrator service.
 func (w *orchestratorWrapper) StepRequiresCompletionSignal(ctx context.Context, taskID string) bool {
 	return w.svc.StepRequiresCompletionSignal(ctx, taskID)
+}
+
+// ForegroundActivity forwards to the orchestrator service (ADR-0049).
+func (w *orchestratorWrapper) ForegroundActivity(sessionID string) v1.ForegroundActivity {
+	return w.svc.ForegroundActivity(sessionID)
 }
 
 // messageCreatorAdapter adapts the task service to the orchestrator.MessageCreator interface

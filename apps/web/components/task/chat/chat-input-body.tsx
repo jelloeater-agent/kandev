@@ -10,6 +10,7 @@ import { ChatInputToolbar } from "./chat-input-toolbar";
 import { ContextZone } from "./context-items/context-zone";
 import type { ContextItem } from "@/lib/types/context";
 import type { ContextFile } from "@/lib/state/context-files-store";
+import type { ImagePasteIssue } from "./clipboard-attachments";
 
 export type ChatInputEditorAreaProps = {
   inputRef: React.RefObject<import("./tiptap-input").TipTapInputHandle | null>;
@@ -20,7 +21,6 @@ export type ChatInputEditorAreaProps = {
   isDisabled: boolean;
   submitDisabled: boolean;
   submitDisabledReason?: string;
-  hasClarification: boolean;
   planModeEnabled: boolean;
   planModeAvailable: boolean;
   mcpServers: string[];
@@ -28,10 +28,12 @@ export type ChatInputEditorAreaProps = {
   setIsInputFocused: (focused: boolean) => void;
   sessionId: string | null;
   taskId: string | null;
+  workspaceId?: string | null;
+  entityReferencesEnabled?: boolean;
   onAddContextFile?: (file: ContextFile) => void;
   onToggleContextFile?: (file: ContextFile) => void;
   planContextEnabled: boolean;
-  addFiles: (files: File[]) => Promise<void>;
+  addFiles: (files: File[], issue?: ImagePasteIssue) => Promise<void>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   showRequestChangesTooltip: boolean;
   hideSessionsDropdown?: boolean;
@@ -39,6 +41,7 @@ export type ChatInputEditorAreaProps = {
   hideAgentControls?: boolean;
   hidePlanMode?: boolean;
   isAgentBusy: boolean;
+  canCancelAgent?: boolean;
   onPlanModeChange: (enabled: boolean) => void;
   taskTitle?: string;
   taskDescription: string;
@@ -123,7 +126,7 @@ function FileInput({
 
 export function ChatInputEditorArea(p: ChatInputEditorAreaProps) {
   const { inputRef, value, handleChange, handleSubmitWithReset, inputPlaceholder } = p;
-  const { isDisabled, hasClarification, planModeEnabled, planModeAvailable, mcpServers } = p;
+  const { isDisabled, planModeEnabled, planModeAvailable, mcpServers } = p;
   const { submitKey, setIsInputFocused, sessionId, taskId, planContextEnabled } = p;
   const { onAddContextFile, onToggleContextFile, addFiles, fileInputRef } = p;
   const { showRequestChangesTooltip, isAgentBusy, onPlanModeChange, taskTitle, taskDescription } =
@@ -153,13 +156,15 @@ export function ChatInputEditorArea(p: ChatInputEditorAreaProps) {
           onChange={handleChange}
           onSubmit={wrappedSubmit}
           placeholder={inputPlaceholder}
-          disabled={isDisabled || hasClarification}
+          disabled={isDisabled}
           planModeEnabled={planModeEnabled}
           submitKey={submitKey}
           onFocus={() => setIsInputFocused(true)}
           onBlur={() => setIsInputFocused(false)}
           sessionId={sessionId}
           taskId={taskId}
+          workspaceId={p.workspaceId ?? null}
+          entityReferencesEnabled={p.entityReferencesEnabled ?? false}
           onAddContextFile={onAddContextFile}
           onToggleContextFile={onToggleContextFile}
           planContextEnabled={planContextEnabled}
@@ -178,6 +183,7 @@ export function ChatInputEditorArea(p: ChatInputEditorAreaProps) {
         taskTitle={taskTitle}
         taskDescription={taskDescription}
         isAgentBusy={isAgentBusy}
+        canCancelAgent={p.canCancelAgent}
         hasContent={hasContent}
         isDisabled={p.submitDisabled}
         submitDisabledReason={p.submitDisabledReason}
@@ -237,7 +243,13 @@ export type ChatInputBodyProps = {
   addFiles: (files: File[]) => Promise<void>;
   contextAreaProps: ChatInputContextAreaProps;
   editorAreaProps: ChatInputEditorAreaProps;
+  promptResultRecovery?: React.ReactNode;
 };
+
+function PromptResultRecoveryArea({ children }: { children?: React.ReactNode }) {
+  if (!children) return null;
+  return <div className="mt-2">{children}</div>;
+}
 
 /** Glow class for the outer wrapper. The pulsing glow lives on the wrapper
  * (not the inner box) because the inner box has `overflow-hidden`, which would
@@ -263,6 +275,7 @@ export function ChatInputBody({
   addFiles,
   contextAreaProps,
   editorAreaProps,
+  promptResultRecovery,
 }: ChatInputBodyProps) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -349,6 +362,7 @@ export function ChatInputBody({
           />
         </div>
       </div>
+      <PromptResultRecoveryArea>{promptResultRecovery}</PromptResultRecoveryArea>
     </div>
   );
 }

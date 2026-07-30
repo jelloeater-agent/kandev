@@ -205,9 +205,15 @@ If `intent` is omitted, the backend infers it from those fields. That inference 
 
 A successful response contains `success`, `task_id`, `state`, and usually `session_id`; it can also contain `agent_execution_id`, `worktree_path`, and `worktree_branch`. Session states use uppercase values such as `CREATED`, `STARTING`, `RUNNING`, `WAITING_FOR_INPUT`, `COMPLETED`, `FAILED`, and `CANCELLED`.
 
+### Search work-item references over HTTP
+
+The structured chat composer's `#` search calls `GET /api/v1/workspaces/:workspaceId/mentions/search?q=<plain-text>&limit=<per-source-limit>&exclude_task_id=<optional-task-id>`. `q` is required after trimming and accepts 1–200 Unicode characters. `limit` defaults to 5 and is clamped to 1–10. When supplied, `exclude_task_id` must belong to the requested workspace.
+
+A successful response returns the normalized query and an ordered `groups` array. Each group includes `source`, `provider`, `kind`, `display_name`, `kind_label`, `status`, and `results`. One source can report `not_configured`, `unauthorized`, `rate_limited`, `timeout`, `upstream_error`, or `unsupported_scope` while the request remains HTTP 200 and other groups remain usable. Each result is a versioned `EntityReference` with the fields described below; raw provider errors and credentials are not returned.
+
 ### Send a user turn
 
-`message.add` requires `task_id`, `session_id`, and either non-whitespace `content` or at least one attachment. Optional fields are `author_id`, `model`, `plan_mode`, `has_review_comments`, `attachments`, and `context_files`.
+`message.add` requires `task_id`, `session_id`, and either non-whitespace `content` or at least one attachment. Optional fields are `author_id`, `model`, `plan_mode`, `has_review_comments`, `attachments`, `context_files`, and `entity_references`.
 
 ```json
 {
@@ -221,6 +227,10 @@ A successful response contains `success`, `task_id`, `state`, and usually `sessi
   }
 }
 ```
+
+`entity_references` is the structured companion to work-item Markdown links inserted by the `#` composer. Each version-1 entry carries `ref`, `provider`, `kind`, immutable `id`, optional display `key`, title snapshot, canonical `url`, and provider-connection `scope`. The backend derives the workspace from the persisted session, validates canonical identity and destination through the registered provider, deduplicates by `ref`, and rejects the request when a supplied reference is invalid or unauthorized. CLI-passthrough sessions do not accept structured references.
+
+`message.queue.add` accepts the same optional array. `message.queue.update` also accepts it and treats the array as a replacement: send `[]` after removing every generated reference link so stale metadata is cleared. Queue status and message responses return validated entries under `metadata.entity_references`.
 
 If the agent is busy, use the `message.queue.*` operations rather than retrying `message.add`. Permission prompts are represented in persisted/session message data; answer one with `permission.respond`. Its payload requires `session_id` and `pending_id`, plus `option_id` unless `cancelled:true`; optional `rejected:true` distinguishes an explicit denial from dismissing the prompt.
 
@@ -676,6 +686,7 @@ environment.created
 environment.updated
 environment.deleted
 session.state_changed
+session.activity_changed
 session.turn.started
 session.turn.completed
 session.poll_mode_changed
@@ -690,6 +701,21 @@ system.job.update
 ```
 
 Current lifecycle code broadcasts `session.turn.started` and `session.turn.completed` globally even though their payloads identify a session. `task.subscribe` does not change this global routing.
+
+`session.activity_changed` carries `task_id`, `session_id`,
+`foreground_activity`, and `active_subagent_count`. The activity is
+`generating` while the session is `RUNNING` and otherwise clears with the
+coarse lifecycle by default; background-work accounting does not expose a
+separate activity tier. When
+`KANDEV_FEATURES_CLAUDE_BACKGROUND_PROMPT_HANDOFF=true`, a persisted Claude
+Code session may instead expose `background` while its foreground has yielded
+and adapter-attested async subagent, background shell, or Monitor work remains
+active. Other providers remain coarse. The count is always an integer and is
+zero when no adapter-attested subagent is live for that session. Task lifecycle
+notifications expose the same count aggregated across the task's sessions as
+`active_subagent_count`. Count-only changes may emit
+`session.activity_changed` and `task.updated` even when the coarse lifecycle
+state does not change.
 
 Office workspace notifications are also global; clients filter on `workspace_id`:
 
@@ -748,7 +774,10 @@ File changes are batched for up to 100 ms and flushed immediately at 50 entries.
 | Routing key | Action | Notes |
 |-------------|--------|-------|
 | subscribed user | `user.settings.updated` | Requires `user.subscribe`. |
-| subscribed user | `session.waiting_for_input` | Local user notification with task/session/title/body fields; it is not delivered by `session.subscribe`. |
+| subscribed user | `session.turn_finished` | Local user notification for a completed agent turn, with task/session/occurrence/title/body fields; the turn ID is sent as both the envelope `id` and payload `occurrence_id`. It is not delivered by `session.subscribe`. |
+| subscribed user | `session.clarification_requested` | Local user notification for a structured agent question that needs an answer, with task/session/occurrence/title/body fields; the clarification pending ID is sent as both the envelope `id` and payload `occurrence_id`. It is not delivered by `session.subscribe`. |
+| subscribed user | `system.update_available` | Local user notification for a newer Kandev release. Its payload is `{ "version", "url"?, "title", "body", "occurrence_id" }`; `occurrence_id` is the normalized release version/tag and is also the envelope `id`. Subscribe with `user.subscribe`, not `session.subscribe`. |
+| subscribed user | `office.inbox_item` | Local notification for a selected Office inbox event, with title/body fields. |
 | subscribed run | `run.event.appended` | Future events only; there is no replay cursor. |
 | metrics subscribers | `system.metrics.updated` | Live resource snapshot; collection interest follows subscribers. |
 

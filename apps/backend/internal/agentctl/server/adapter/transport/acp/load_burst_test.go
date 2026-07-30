@@ -5,11 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
+)
+
+const (
+	replayBurstProducerWatchdogTimeout = 20 * time.Second
+	burstProducerCleanupTimeout        = time.Second
+)
+
+var (
+	errReplayBurstProducerStalled            = errors.New("replay burst producer stalled")
+	errReplayBurstProducerBeforeWriteStalled = errors.New("replay burst producer stalled before writer entry")
+	errReplayLoadFailed                      = errors.New("replay load failed")
 )
 
 // burstAgent is a minimal acp.Agent stub used by the load-replay regression
@@ -27,6 +40,10 @@ func (burstAgent) Authenticate(context.Context, acp.AuthenticateRequest) (acp.Au
 func (burstAgent) Cancel(context.Context, acp.CancelNotification) error { return nil }
 func (burstAgent) CloseSession(context.Context, acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	return acp.CloseSessionResponse{}, nil
+}
+
+func (burstAgent) DeleteSession(context.Context, acp.DeleteSessionRequest) (acp.DeleteSessionResponse, error) {
+	return acp.DeleteSessionResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionDelete)
 }
 
 func (burstAgent) ListSessions(context.Context, acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
@@ -54,6 +71,47 @@ func (burstAgent) SetSessionConfigOption(context.Context, acp.SetSessionConfigOp
 
 func (burstAgent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	return acp.SetSessionModeResponse{}, nil
+}
+
+type replayLoadAgent struct {
+	burstAgent
+	conn    *acp.AgentSideConnection
+	loadErr error
+}
+
+func (a *replayLoadAgent) Initialize(_ context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
+	return acp.InitializeResponse{
+		ProtocolVersion: req.ProtocolVersion,
+		AgentCapabilities: acp.AgentCapabilities{
+			LoadSession: true,
+		},
+	}, nil
+}
+
+func (a *replayLoadAgent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+	usage := usageUpdateWithCost(200_000, 100, 1.23, "USD")
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: req.SessionId,
+		Update:    acp.SessionUpdate{UsageUpdate: usage},
+	}); err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: req.SessionId,
+		Update: acp.SessionUpdate{Plan: &acp.SessionUpdatePlan{
+			Entries: []acp.PlanEntry{{Content: "replayed plan", Status: "in_progress"}},
+		}},
+	}); err != nil {
+		return acp.LoadSessionResponse{}, err
+	}
+	if a.loadErr != nil {
+		for i := range 3 {
+			if err := a.conn.SessionUpdate(ctx, makeReplayNotification(string(req.SessionId), i)); err != nil {
+				return acp.LoadSessionResponse{}, err
+			}
+		}
+	}
+	return acp.LoadSessionResponse{}, a.loadErr
 }
 
 // burstClient is a minimal acp.Client stub that forwards SessionUpdate
@@ -99,26 +157,426 @@ func (*burstClient) WaitForTerminalExit(context.Context, acp.WaitForTerminalExit
 	return acp.WaitForTerminalExitResponse{}, errors.New("not implemented")
 }
 
-// newBurstPair wires a real acp.ClientSideConnection / AgentSideConnection
-// pair over in-memory pipes. The client's SessionUpdate forwards to the
-// supplied handler. Cleanup is registered on the test.
-func newBurstPair(t *testing.T, onUpdate func(acp.SessionNotification)) (*acp.ClientSideConnection, *acp.AgentSideConnection) {
+type burstPair struct {
+	clientConn *acp.ClientSideConnection
+	agentConn  *acp.AgentSideConnection
+
+	c2aR *io.PipeReader
+	c2aW *io.PipeWriter
+	a2cR *io.PipeReader
+	a2cW *io.PipeWriter
+
+	agentToClientWriteEntered <-chan struct{}
+	closed                    chan struct{}
+	closeOnce                 sync.Once
+}
+
+func (p *burstPair) Close() {
+	p.closeOnce.Do(func() {
+		_ = p.c2aR.Close()
+		_ = p.c2aW.Close()
+		_ = p.a2cR.Close()
+		_ = p.a2cW.Close()
+		close(p.closed)
+	})
+}
+
+// writeEntrySignalWriter reports immediately before delegating to its writer.
+// When it wraps an unread io.PipeWriter, receiving the signal proves the
+// producer has entered the write that will block until the pipe is closed.
+type writeEntrySignalWriter struct {
+	writer  io.Writer
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (w *writeEntrySignalWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	return w.writer.Write(p)
+}
+
+// newBurstPair wires an AgentSideConnection over in-memory pipes. When
+// onUpdate is supplied, it also creates a ClientSideConnection whose
+// SessionUpdate forwards to that handler. Cleanup is registered on the test.
+func newBurstPair(t *testing.T, onUpdate func(acp.SessionNotification)) *burstPair {
 	t.Helper()
 
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
+	a2cWriteEntered := make(chan struct{})
+	a2cWriteObserver := &writeEntrySignalWriter{writer: a2cW, entered: a2cWriteEntered}
 
-	clientConn := acp.NewClientSideConnection(&burstClient{onUpdate: onUpdate}, c2aW, a2cR)
-	agentConn := acp.NewAgentSideConnection(burstAgent{}, a2cW, c2aR)
+	pair := &burstPair{
+		agentConn:                 acp.NewAgentSideConnection(burstAgent{}, a2cWriteObserver, c2aR),
+		c2aR:                      c2aR,
+		c2aW:                      c2aW,
+		a2cR:                      a2cR,
+		a2cW:                      a2cW,
+		agentToClientWriteEntered: a2cWriteEntered,
+		closed:                    make(chan struct{}),
+	}
+	if onUpdate != nil {
+		pair.clientConn = acp.NewClientSideConnection(
+			&burstClient{onUpdate: onUpdate}, c2aW, a2cR,
+			acp.WithMaxQueuedNotifications(acpNotifQueueCapacity()),
+		)
+	}
+	t.Cleanup(pair.Close)
 
+	return pair
+}
+
+// newStalledBurstPair leaves the agent-to-client pipe unread so writes from
+// AgentSideConnection block until the pair is closed.
+func newStalledBurstPair(t *testing.T) *burstPair {
+	return newBurstPair(t, nil)
+}
+
+// runBurstProducer ensures a stalled synchronous io.Pipe write fails the
+// test promptly. acp-go-sdk's write path cannot observe context cancellation
+// after entering io.Pipe.Write, so the watchdog must close this pair's pipes.
+func runBurstProducer(pair *burstPair, timeout time.Duration, produce func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- produce()
+	}()
+
+	entryTimer := time.NewTimer(timeout)
+	defer entryTimer.Stop()
+
+	// JSON encoding and SDK setup happen before the synchronous io.Pipe write.
+	// Bound that phase separately: it must not prevent the test from cleaning
+	// up a producer which never reaches the instrumented writer.
+	select {
+	case <-pair.agentToClientWriteEntered:
+	case err := <-done:
+		return err
+	case <-entryTimer.C:
+		return stalledBurstProducerError(pair, timeout, done, errReplayBurstProducerBeforeWriteStalled)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return stalledBurstProducerError(pair, timeout, done, errReplayBurstProducerStalled)
+	}
+}
+
+// stalledBurstProducerError owns the failure path for both producer phases.
+// It always reports the timeout that triggered cleanup, even if closing the
+// pipes lets the producer return nil.
+func stalledBurstProducerError(pair *burstPair, timeout time.Duration, done <-chan error, stallErr error) error {
+	pair.Close()
+
+	cleanupTimer := time.NewTimer(burstProducerCleanupTimeout)
+	defer cleanupTimer.Stop()
+	select {
+	case err := <-done:
+		return fmt.Errorf("%w after %s: %v", stallErr, timeout, err)
+	case <-cleanupTimer.C:
+		return fmt.Errorf("%w after %s: pipe cleanup did not release producer", stallErr, timeout)
+	}
+}
+
+func TestBurstProducerWatchdog_ClosesStalledPipes(t *testing.T) {
+	const watchdogTimeout = 100 * time.Millisecond
+
+	pair := newStalledBurstPair(t)
+	producerExited := make(chan struct{})
+	err := runBurstProducer(pair, watchdogTimeout, func() error {
+		defer close(producerExited)
+		return pair.agentConn.SessionUpdate(context.Background(), makeReplayNotification("stalled-session", 1))
+	})
+
+	select {
+	case <-pair.agentToClientWriteEntered:
+	default:
+		t.Fatal("producer did not enter the agent-to-client pipe write")
+	}
+	select {
+	case <-producerExited:
+	default:
+		t.Fatal("watchdog returned before the stalled producer exited")
+	}
+	if !errors.Is(err, errReplayBurstProducerStalled) {
+		t.Fatalf("watchdog error = %v, want stalled producer error", err)
+	}
+}
+
+func TestBurstProducerWatchdog_ClosesPipesBeforeAgentToClientWrite(t *testing.T) {
+	const watchdogTimeout = 100 * time.Millisecond
+
+	pair := newStalledBurstPair(t)
+	producerBlocked := make(chan struct{})
+	producerExited := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runBurstProducer(pair, watchdogTimeout, func() error {
+			close(producerBlocked)
+			<-pair.closed
+			close(producerExited)
+			return nil
+		})
+	}()
+
+	select {
+	case <-producerBlocked:
+	case <-time.After(watchdogTimeout):
+		t.Fatal("producer did not block before SessionUpdate")
+	}
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, errReplayBurstProducerBeforeWriteStalled) {
+			t.Fatalf("watchdog error = %v, want pre-write stalled producer error", err)
+		}
+	case <-time.After(watchdogTimeout + burstProducerCleanupTimeout + time.Second):
+		t.Fatal("writer-entry watchdog did not close pipes and return")
+	}
+
+	select {
+	case <-producerExited:
+	default:
+		t.Fatal("writer-entry watchdog returned before the pre-write producer exited")
+	}
+	select {
+	case <-pair.closed:
+	default:
+		t.Fatal("writer-entry watchdog did not close the owned pipes")
+	}
+	select {
+	case <-pair.agentToClientWriteEntered:
+		t.Fatal("producer entered agent-to-client write before watchdog cleanup")
+	default:
+	}
+}
+
+func TestLoadSession_DrainsBackedUpReplayBeforeClearingSuppression(t *testing.T) {
+	a := newTestAdapter()
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
 	t.Cleanup(func() {
+		_ = a.Close()
 		_ = c2aR.Close()
 		_ = c2aW.Close()
 		_ = a2cR.Close()
 		_ = a2cW.Close()
 	})
+	if err := a.Connect(c2aW, a2cR); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	fake := &replayLoadAgent{}
+	fake.conn = acp.NewAgentSideConnection(fake, a2cW, c2aR)
 
-	return clientConn, agentConn
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	drainEvents(a)
+
+	workerBlocked := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	workerReleased := false
+	defer func() {
+		if !workerReleased {
+			close(releaseWorker)
+		}
+	}()
+	a.dialect.suppressNotification = func(n acp.SessionNotification) bool {
+		if n.Update.UsageUpdate != nil {
+			close(workerBlocked)
+			<-releaseWorker
+		}
+		return false
+	}
+
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- a.LoadSession(ctx, "replay-session", nil) }()
+	select {
+	case <-workerBlocked:
+	case <-ctx.Done():
+		t.Fatal("replay usage did not reach blocked update worker")
+	}
+	select {
+	case err := <-loadDone:
+		t.Fatalf("LoadSession returned before replay queue drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseWorker)
+	workerReleased = true
+	if err := <-loadDone; err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+
+	a.mu.RLock()
+	loading := a.isLoadingSession
+	a.mu.RUnlock()
+	if loading {
+		t.Fatal("load suppression remained active after replay barrier")
+	}
+	if delta, cost := a.consumeUsageDelta("replay-session"); delta != 0 || cost != 0 {
+		t.Fatalf("replay baseline leaked into first turn: delta=%d cost=%d", delta, cost)
+	}
+	a.convertUsageUpdate("replay-session", usageUpdateWithCost(200_000, 120, 1.25, "USD"))
+	if delta, cost := a.consumeUsageDelta("replay-session"); delta != 20 || cost != 200 {
+		t.Fatalf("post-load turn delta = (%d, %d), want (20, 200)", delta, cost)
+	}
+
+	events := drainEvents(a)
+	var replayPlanSeen bool
+	for _, event := range events {
+		if event.Type == streams.EventTypePlan && len(event.PlanEntries) == 1 &&
+			event.PlanEntries[0].Description == "replayed plan" {
+			replayPlanSeen = true
+		}
+	}
+	if !replayPlanSeen {
+		t.Fatal("captured replay plan was not re-emitted after queue drain")
+	}
+}
+
+func TestLoadSession_FailureDrainsReplayBeforeClearingSuppression(t *testing.T) {
+	a, fake, ctx := setupReplayLoadTest(t)
+	fake.loadErr = errReplayLoadFailed
+
+	workerBlocked, releaseWorker := blockReplayWorker(t, a)
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- a.LoadSession(ctx, "failed-replay-session", nil) }()
+
+	select {
+	case <-workerBlocked:
+	case <-ctx.Done():
+		t.Fatal("failed-load replay did not reach blocked update worker")
+	}
+	select {
+	case err := <-loadDone:
+		t.Fatalf("LoadSession returned before failed replay queue drained: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseWorker()
+	err := <-loadDone
+	if err == nil || !strings.Contains(err.Error(), errReplayLoadFailed.Error()) {
+		t.Fatalf("LoadSession error = %v, want original RPC error %v", err, errReplayLoadFailed)
+	}
+
+	a.mu.RLock()
+	loading := a.isLoadingSession
+	replayPlan := a.loadReplayPlan
+	a.mu.RUnlock()
+	if loading {
+		t.Fatal("load suppression remained active after failed-load replay barrier")
+	}
+	if replayPlan != nil {
+		t.Fatal("failed load retained replay plan after queue drain")
+	}
+
+	for _, event := range drainEvents(a) {
+		switch event.Type {
+		case streams.EventTypeMessageChunk, streams.EventTypeToolCall, streams.EventTypePlan:
+			t.Fatalf("failed-load replay leaked as live %q event: %+v", event.Type, event)
+		}
+	}
+}
+
+func TestLoadSession_FailureBarrierUnblocksOnClose(t *testing.T) {
+	a, fake, ctx := setupReplayLoadTest(t)
+	fake.loadErr = errReplayLoadFailed
+
+	workerBlocked, releaseWorker := blockReplayWorker(t, a)
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- a.LoadSession(ctx, "closing-replay-session", nil) }()
+
+	select {
+	case <-workerBlocked:
+	case <-ctx.Done():
+		t.Fatal("failed-load replay did not reach blocked update worker")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- a.Close() }()
+
+	select {
+	case err := <-loadDone:
+		if err == nil || !strings.Contains(err.Error(), errReplayLoadFailed.Error()) {
+			t.Fatalf("LoadSession error = %v, want original RPC error %v", err, errReplayLoadFailed)
+		}
+	case <-ctx.Done():
+		t.Fatal("LoadSession failure barrier did not unblock during Close")
+	}
+
+	a.mu.RLock()
+	loading := a.isLoadingSession
+	replayPlan := a.loadReplayPlan
+	a.mu.RUnlock()
+	if loading || replayPlan != nil {
+		t.Fatalf("failed load state after Close = loading:%t plan:%v, want cleared", loading, replayPlan)
+	}
+
+	releaseWorker()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Close did not finish after blocked worker was released")
+	}
+}
+
+func setupReplayLoadTest(t *testing.T) (*Adapter, *replayLoadAgent, context.Context) {
+	t.Helper()
+
+	a := newTestAdapter()
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = c2aR.Close()
+		_ = c2aW.Close()
+		_ = a2cR.Close()
+		_ = a2cW.Close()
+	})
+	if err := a.Connect(c2aW, a2cR); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	fake := &replayLoadAgent{}
+	fake.conn = acp.NewAgentSideConnection(fake, a2cW, c2aR)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	if err := a.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	drainEvents(a)
+	return a, fake, ctx
+}
+
+func blockReplayWorker(t *testing.T, a *Adapter) (<-chan struct{}, func()) {
+	t.Helper()
+
+	workerBlocked := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseWorker)
+		})
+	}
+	t.Cleanup(release)
+	a.dialect.suppressNotification = func(n acp.SessionNotification) bool {
+		if n.Update.UsageUpdate != nil {
+			close(workerBlocked)
+			<-releaseWorker
+		}
+		return false
+	}
+	return workerBlocked, release
 }
 
 // TestLoadReplayBurst_HandlesLargeReplay is a regression test for the
@@ -157,7 +615,7 @@ func TestLoadReplayBurst_HandlesLargeReplay(t *testing.T) {
 	// just rely on Close to drain it.
 	t.Cleanup(func() { _ = a.Close() })
 
-	clientConn, agentConn := newBurstPair(t, a.enqueueACPUpdate)
+	pair := newBurstPair(t, a.enqueueACPUpdate)
 
 	const sessionID = "burst-session"
 
@@ -167,25 +625,32 @@ func TestLoadReplayBurst_HandlesLargeReplay(t *testing.T) {
 	// Push the burst of replay notifications. These would all be suppressed
 	// by the adapter (AgentMessageChunk + ToolCall + Plan are on the suppress
 	// list) — the point is whether the SDK's 1024-deep queue stays drained.
-	for i := 0; i < notificationBurstSize; i++ {
-		if err := agentConn.SessionUpdate(ctx, makeReplayNotification(sessionID, i)); err != nil {
-			t.Fatalf("SessionUpdate at i=%d failed: %v", i, err)
+	// A stalled SDK pipe write does not honor ctx; bound the producer phase and
+	// close only this pair's pipes if that happens.
+	if err := runBurstProducer(pair, replayBurstProducerWatchdogTimeout, func() error {
+		for i := 0; i < notificationBurstSize; i++ {
+			if err := pair.agentConn.SessionUpdate(ctx, makeReplayNotification(sessionID, i)); err != nil {
+				return fmt.Errorf("SessionUpdate at i=%d: %w", i, err)
+			}
 		}
-	}
 
-	// Sentinel: AvailableCommandsUpdate passes through during load, so it
-	// will land on updatesCh once the consumer drains the queue.
-	if err := agentConn.SessionUpdate(ctx, acp.SessionNotification{
-		SessionId: acp.SessionId(sessionID),
-		Update: acp.SessionUpdate{
-			AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
-				AvailableCommands: []acp.AvailableCommand{
-					{Name: sentinelCmd, Description: "burst sentinel"},
+		// Sentinel: AvailableCommandsUpdate passes through during load, so it
+		// will land on updatesCh once the consumer drains the queue.
+		if err := pair.agentConn.SessionUpdate(ctx, acp.SessionNotification{
+			SessionId: acp.SessionId(sessionID),
+			Update: acp.SessionUpdate{
+				AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+					AvailableCommands: []acp.AvailableCommand{
+						{Name: sentinelCmd, Description: "burst sentinel"},
+					},
 				},
 			},
-		},
+		}); err != nil {
+			return fmt.Errorf("sentinel SessionUpdate: %w", err)
+		}
+		return nil
 	}); err != nil {
-		t.Fatalf("sentinel SessionUpdate failed: %v", err)
+		t.Fatal(err)
 	}
 
 	// The sentinel-wait loop below is the authoritative overflow check: the
@@ -202,7 +667,7 @@ func TestLoadReplayBurst_HandlesLargeReplay(t *testing.T) {
 			if ev.Type == streams.EventTypeAvailableCommands {
 				got = &ev
 			}
-		case <-clientConn.Done():
+		case <-pair.clientConn.Done():
 			t.Fatal("client connection closed while waiting for sentinel — overflow")
 		case <-deadline:
 			t.Fatal("timeout waiting for sentinel AvailableCommands event after replay burst")
@@ -275,7 +740,7 @@ func BenchmarkHandleACPUpdate_LoadSuppressed(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.handleACPUpdate(notes[i%len(notes)])
+		a.handleACPUpdate(notes[i%len(notes)], 0)
 	}
 }
 
@@ -306,7 +771,7 @@ func BenchmarkHandleACPUpdate_NormalPath(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		a.handleACPUpdate(notes[i%len(notes)])
+		a.handleACPUpdate(notes[i%len(notes)], 0)
 	}
 }
 

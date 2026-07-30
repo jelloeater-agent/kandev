@@ -20,6 +20,7 @@ type mockGitHubService struct {
 	taskPR                *github.TaskPR
 	taskPRs               []*github.TaskPR
 	taskPRErr             error
+	taskPRListFunc        func(context.Context, []string) (map[string][]*github.TaskPR, error)
 	triggerPRSyncAllPRs   []*github.TaskPR
 	triggerPRSyncAllErr   error
 	triggerPRSyncAllCalls int
@@ -44,6 +45,8 @@ type mockGitHubService struct {
 	// path landed on primary by accident).
 	lastCreateWatchRepositoryID string
 	lastAssociateRepositoryID   string
+	lastCreateWatchWorkspaceID  string
+	lastAssociateWorkspaceID    string
 
 	// Review PR reservation tracking.
 	reserveCalls   int
@@ -84,14 +87,32 @@ type mockGitHubService struct {
 	mergeErr             error
 	ciErrors             []github.TaskCIPRAutomationState
 	ciExhausted          []github.TaskCIPRAutomationState
+	lifecyclePrompts     []github.TaskPRLifecyclePrompt
+	lifecycleReviewErr   error
+	lifecycleReviewer    string
+	lifecycleRebound     bool
+	lifecycleRequested   bool
+	lifecycleRebindCalls int
 }
 
 func (m *mockGitHubService) Client() github.Client { return m.client }
+
+func (m *mockGitHubService) FindPRByBranchForWorkspace(
+	ctx context.Context, _, owner, repo, branch string,
+) (*github.PR, error) {
+	if m.client == nil {
+		return nil, nil
+	}
+	return m.client.FindPRByBranch(ctx, owner, repo, branch)
+}
 func (m *mockGitHubService) GetTaskPR(_ context.Context, _ string) (*github.TaskPR, error) {
 	m.getTaskPRCalls++
 	return m.taskPR, m.taskPRErr
 }
-func (m *mockGitHubService) ListTaskPRs(_ context.Context, taskIDs []string) (map[string][]*github.TaskPR, error) {
+func (m *mockGitHubService) ListTaskPRs(ctx context.Context, taskIDs []string) (map[string][]*github.TaskPR, error) {
+	if m.taskPRListFunc != nil {
+		return m.taskPRListFunc(ctx, taskIDs)
+	}
 	if m.taskPRErr != nil {
 		return nil, m.taskPRErr
 	}
@@ -197,6 +218,45 @@ func (m *mockGitHubService) MarkTaskCIAutoFixExhausted(_ context.Context, taskID
 func (m *mockGitHubService) ClearTaskCIError(context.Context, string, string, int) error {
 	return nil
 }
+func (m *mockGitHubService) GetTaskPRByRepoAndNumber(_ context.Context, taskID, repositoryID string, prNumber int) (*github.TaskPR, error) {
+	if m.taskPR != nil && m.taskPR.TaskID == taskID && m.taskPR.RepositoryID == repositoryID && m.taskPR.PRNumber == prNumber {
+		return m.taskPR, nil
+	}
+	return nil, nil
+}
+func (m *mockGitHubService) IsReviewRequestedForLogin(context.Context, string, string, string, int, string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lifecycleRequested, m.lifecycleReviewErr
+}
+func (m *mockGitHubService) RebindTaskPRReviewer(context.Context, string) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecycleRebindCalls++
+	return m.lifecycleReviewer, m.lifecycleRebound, m.lifecycleReviewErr
+}
+func (m *mockGitHubService) SetTaskPRReviewRequestState(context.Context, string, string, int, bool) error {
+	return nil
+}
+func (m *mockGitHubService) SetTaskPRObservedState(context.Context, string, string, int, string) error {
+	return nil
+}
+func (m *mockGitHubService) RecordTaskPRLifecyclePrompt(_ context.Context, prompt github.TaskPRLifecyclePrompt) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lifecyclePrompts = append(m.lifecyclePrompts, prompt)
+	return nil
+}
+func (m *mockGitHubService) lifecyclePromptSnapshot() []github.TaskPRLifecyclePrompt {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]github.TaskPRLifecyclePrompt(nil), m.lifecyclePrompts...)
+}
+func (m *mockGitHubService) lifecycleRebindCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lifecycleRebindCalls
+}
 func (m *mockGitHubService) GetPRFeedback(context.Context, string, string, int) (*github.PRFeedback, error) {
 	m.prFeedbackCalls++
 	if m.prFeedback != nil {
@@ -204,14 +264,32 @@ func (m *mockGitHubService) GetPRFeedback(context.Context, string, string, int) 
 	}
 	return &github.PRFeedback{}, nil
 }
+
+func (m *mockGitHubService) GetPRFeedbackForAutomation(
+	ctx context.Context, _, owner, repo string, number int,
+) (*github.PRFeedback, error) {
+	return m.GetPRFeedback(ctx, owner, repo, number)
+}
 func (m *mockGitHubService) MergePR(context.Context, string, string, int, string) error {
 	m.mergeCalls++
 	return m.mergeErr
+}
+
+func (m *mockGitHubService) MergePRForAutomation(
+	ctx context.Context, _, owner, repo string, number int, method string,
+) error {
+	return m.MergePR(ctx, owner, repo, number, method)
 }
 func (m *mockGitHubService) EnsurePRWatch(_ context.Context, _, _, _, _, _, branch string) (*github.PRWatch, error) {
 	m.ensureWatchCalls++
 	m.ensureWatchBranch = branch
 	return &github.PRWatch{}, nil
+}
+
+func (m *mockGitHubService) EnsurePRWatchForWorkspace(
+	ctx context.Context, _, sessionID, taskID, repositoryID, owner, repo, branch string,
+) (*github.PRWatch, error) {
+	return m.EnsurePRWatch(ctx, sessionID, taskID, repositoryID, owner, repo, branch)
 }
 func (m *mockGitHubService) GetPRWatchBySession(_ context.Context, _ string) (*github.PRWatch, error) {
 	return m.prWatch, nil
@@ -228,10 +306,22 @@ func (m *mockGitHubService) CreatePRWatch(_ context.Context, _, _, repositoryID,
 	m.lastCreateWatchRepositoryID = repositoryID
 	return &github.PRWatch{}, nil
 }
+func (m *mockGitHubService) CreatePRWatchForWorkspace(
+	ctx context.Context, workspaceID, sessionID, taskID, repositoryID, owner, repo string, prNumber int, branch string,
+) (*github.PRWatch, error) {
+	m.lastCreateWatchWorkspaceID = workspaceID
+	return m.CreatePRWatch(ctx, sessionID, taskID, repositoryID, owner, repo, prNumber, branch)
+}
 func (m *mockGitHubService) AssociatePRWithTask(_ context.Context, _, repositoryID string, _ *github.PR) (*github.TaskPR, error) {
 	m.associateCalls++
 	m.lastAssociateRepositoryID = repositoryID
 	return &github.TaskPR{}, nil
+}
+func (m *mockGitHubService) AssociatePRWithTaskForWorkspace(
+	ctx context.Context, workspaceID, taskID, repositoryID string, pr *github.PR,
+) (*github.TaskPR, error) {
+	m.lastAssociateWorkspaceID = workspaceID
+	return m.AssociatePRWithTask(ctx, taskID, repositoryID, pr)
 }
 func (m *mockGitHubService) UpdatePRWatchBranchIfSearching(_ context.Context, _, branch string) error {
 	m.updateBranchCalls++
@@ -625,6 +715,12 @@ func TestDetectPushAndAssociatePR(t *testing.T) {
 		if ghSvc.createWatchCalls != 1 {
 			t.Errorf("expected 1 CreatePRWatch call, got %d", ghSvc.createWatchCalls)
 		}
+		if ghSvc.lastCreateWatchWorkspaceID != "ws1" {
+			t.Errorf("CreatePRWatch workspace = %q, want ws1", ghSvc.lastCreateWatchWorkspaceID)
+		}
+		if ghSvc.lastAssociateWorkspaceID != "ws1" {
+			t.Errorf("AssociatePRWithTask workspace = %q, want ws1", ghSvc.lastAssociateWorkspaceID)
+		}
 	})
 
 	t.Run("skips when watch has pr_number > 0", func(t *testing.T) {
@@ -670,6 +766,9 @@ func TestDetectPushAndAssociatePR(t *testing.T) {
 		}
 		if ghSvc.createWatchCalls != 0 {
 			t.Errorf("expected no CreatePRWatch calls (watch already exists), got %d", ghSvc.createWatchCalls)
+		}
+		if ghSvc.lastAssociateWorkspaceID != "ws1" {
+			t.Errorf("AssociatePRWithTask workspace = %q, want ws1", ghSvc.lastAssociateWorkspaceID)
 		}
 	})
 

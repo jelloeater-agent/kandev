@@ -6,10 +6,10 @@ import { useResizableInput } from "@/hooks/use-resizable-input";
 import { useChatInputState } from "./use-chat-input-state";
 import type { TipTapInputHandle } from "./tiptap-input";
 import type { ContextItem } from "@/lib/types/context";
-import type { ContextFile } from "@/lib/state/context-files-store";
 import type { Message } from "@/lib/types/http";
 import type { DiffComment } from "@/lib/diff/types";
 import type {
+  ChatSubmitPayload,
   ChatSubmitResult,
   MessageAttachment,
   ChatInputContainerHandle,
@@ -42,13 +42,7 @@ type UseChatInputContainerParams = {
   hasContextComments: boolean;
   showRequestChangesTooltip: boolean;
   onRequestChangesTooltipDismiss: (() => void) | undefined;
-  onSubmit: (
-    message: string,
-    reviewComments?: DiffComment[],
-    attachments?: MessageAttachment[],
-    inlineMentions?: ContextFile[],
-    inlineTaskMentions?: import("@/hooks/use-inline-mention").TaskMentionData[],
-  ) => ChatSubmitResult;
+  onSubmit: (payload: ChatSubmitPayload) => ChatSubmitResult;
 };
 
 function useInputHandle(
@@ -127,13 +121,12 @@ function computeDerivedState(params: {
   isAgentBusy: boolean;
   hasAgentCommands: boolean;
 }) {
-  // STARTING is included so the editor itself stays uneditable until the
-  // session reaches RUNNING. Without this, the e2e suite's wait-for-
-  // contenteditable would fire mid-STARTING, the test would press Cmd+Enter,
-  // and the backend would reject with "Failed to send message to agent"
-  // before the agent process is ready to receive prompts.
+  const hasClarification = !!(params.pendingClarification && params.onClarificationResolved);
+  // STARTING blocks regular messages until the session reaches RUNNING. An
+  // interactive clarification is different: its queue path is persistence-only,
+  // so it remains safe while stale lifecycle metadata says STARTING.
   const isDisabled =
-    params.isStarting ||
+    (params.isStarting && !hasClarification) ||
     params.isMoving ||
     params.isSending ||
     params.isFailed ||
@@ -144,10 +137,8 @@ function computeDerivedState(params: {
   // container/sandbox is actively bootstrapping. The brief STARTING
   // transition for local quick-chat sessions doesn't deserve its own
   // tooltip — the editor is disabled, that's the signal.
-  const submitDisabledReason = params.isPreparingEnvironment
-    ? "The agent is still being set up."
-    : undefined;
-  const hasClarification = !!(params.pendingClarification && params.onClarificationResolved);
+  const submitDisabledReason =
+    isDisabled && params.isPreparingEnvironment ? "The agent is still being set up." : undefined;
   const hasPendingComments = !!(
     params.pendingCommentsByFile && Object.keys(params.pendingCommentsByFile).length > 0
   );
@@ -162,7 +153,7 @@ function computeDerivedState(params: {
     params.placeholder,
     params.isAgentBusy,
     params.hasAgentCommands,
-    params.isStarting,
+    params.isStarting && !hasClarification,
   );
   return {
     isDisabled,

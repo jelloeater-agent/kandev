@@ -3,7 +3,10 @@ import { getWebSocketClient } from "@/lib/ws/connection";
 import { MessageSendError } from "@/lib/chat/message-send-error";
 import { useAppStoreApi } from "@/components/state-provider";
 import { useQueue } from "./domains/session/use-queue";
-import type { MessageAttachment } from "@/components/task/chat/chat-input-container";
+import type {
+  ChatSubmitPayload,
+  MessageAttachment,
+} from "@/components/task/chat/chat-input-container";
 import type { ActiveDocument } from "@/lib/state/slices/ui/types";
 import type { PlanComment } from "@/lib/state/slices/comments";
 import { toBlockquote } from "@/lib/state/slices/comments/format";
@@ -11,10 +14,15 @@ import type { ContextFile } from "@/lib/state/context-files-store";
 import type { CustomPrompt, Message } from "@/lib/types/http";
 import type { TaskMentionData } from "@/hooks/use-inline-mention";
 import type { AppState } from "@/lib/state/store";
+import type { EntityReference } from "@/lib/types/entity-reference";
 import {
   collectPromptReferenceExpansions,
   formatPromptReferenceExpansions,
 } from "@/lib/prompts/expand-prompt-references";
+import {
+  deriveSessionInputMode,
+  type SessionInputMode,
+} from "./domains/session/session-input-mode";
 
 function buildDocumentContext(
   activeDocument: ActiveDocument | null,
@@ -138,7 +146,7 @@ export interface UseMessageHandlerParams {
   sessionModel: string | null;
   activeModel: string | null;
   planModeEnabled?: boolean;
-  isAgentBusy?: boolean;
+  hasPendingClarification?: boolean;
   activeDocument?: ActiveDocument | null;
   planComments?: PlanComment[];
   contextFiles?: ContextFile[];
@@ -154,6 +162,7 @@ type SendMessagePayload = {
   hasReviewComments?: boolean;
   attachments?: MessageAttachment[];
   contextFilesMeta?: Array<{ path: string; name: string }>;
+  entityReferences?: EntityReference[];
 };
 
 export async function sendMessageRequest(
@@ -176,6 +185,7 @@ export async function sendMessageRequest(
     hasReviewComments,
     attachments,
     contextFilesMeta,
+    entityReferences,
   } = payload;
   const hasAttachments = attachments && attachments.length > 0;
 
@@ -190,9 +200,28 @@ export async function sendMessageRequest(
       ...(hasReviewComments && { has_review_comments: true }),
       ...(hasAttachments && { attachments }),
       ...(contextFilesMeta && { context_files: contextFilesMeta }),
+      ...(entityReferences && { entity_references: entityReferences }),
     },
     hasAttachments ? 30000 : 10000,
   );
+}
+
+const TERMINAL_SESSION_STATES = new Set(["FAILED", "CANCELLED", "COMPLETED"]);
+
+function requireSessionInputMode(state: AppState, selectedSessionId: string): SessionInputMode {
+  const selectedSession = state.taskSessions.items[selectedSessionId] ?? null;
+  const inputMode = deriveSessionInputMode(selectedSession);
+  if (inputMode === "unavailable") {
+    // A terminal session row (agent process has exited) gets the backend's
+    // actionable copy; a missing row keeps the generic message since there is
+    // nothing session-specific to say.
+    const message =
+      selectedSession && TERMINAL_SESSION_STATES.has(selectedSession.state)
+        ? "Session has ended. Please create a new session to continue."
+        : "The selected session is not available for input.";
+    throw new MessageSendError("session-unavailable", message);
+  }
+  return inputMode;
 }
 
 export function useMessageHandler({
@@ -201,7 +230,7 @@ export function useMessageHandler({
   sessionModel,
   activeModel,
   planModeEnabled = false,
-  isAgentBusy = false,
+  hasPendingClarification = false,
   activeDocument = null,
   planComments = [],
   contextFiles = [],
@@ -227,13 +256,7 @@ export function useMessageHandler({
   );
 
   const handleSendMessage = useCallback(
-    async (
-      message: string,
-      attachments?: MessageAttachment[],
-      hasReviewComments?: boolean,
-      inlineMentions?: ContextFile[],
-      inlineTaskMentions?: TaskMentionData[],
-    ) => {
+    async (payload: ChatSubmitPayload) => {
       if (!taskId || !resolvedSessionId) {
         const error = new MessageSendError(
           "no-active-session",
@@ -244,9 +267,9 @@ export function useMessageHandler({
       }
 
       const { finalMessage, allContextFiles } = buildFinalMessage(
-        message,
-        inlineMentions,
-        inlineTaskMentions,
+        payload.message,
+        payload.inlineMentions,
+        payload.inlineTaskMentions,
       );
       const modelToSend = activeModel && activeModel !== sessionModel ? activeModel : undefined;
       const realFiles = allContextFiles.filter(
@@ -255,15 +278,23 @@ export function useMessageHandler({
       const contextFilesMeta =
         realFiles.length > 0 ? realFiles.map((f) => ({ path: f.path, name: f.name })) : undefined;
 
-      if (isAgentBusy) {
-        const queueAttachments = attachments?.map((att) => ({
+      const inputMode = requireSessionInputMode(storeApi.getState(), resolvedSessionId);
+      if (hasPendingClarification || inputMode === "queue") {
+        const queueAttachments = payload.attachments?.map((att) => ({
           type: att.type,
           data: att.data,
           mime_type: att.mime_type,
           name: att.name,
           delivery_mode: att.delivery_mode,
         }));
-        await queue(taskId, finalMessage, modelToSend, planModeEnabled, queueAttachments);
+        await queue({
+          taskId,
+          content: finalMessage,
+          model: modelToSend,
+          planMode: planModeEnabled,
+          attachments: queueAttachments,
+          entityReferences: payload.entityReferences,
+        });
         return;
       }
 
@@ -276,9 +307,10 @@ export function useMessageHandler({
         finalMessage,
         modelToSend,
         planMode: planModeEnabled,
-        hasReviewComments,
-        attachments,
+        hasReviewComments: !!payload.reviewComments?.length,
+        attachments: payload.attachments,
         contextFilesMeta,
+        entityReferences: payload.entityReferences,
       });
       if (created && created.id && created.session_id) {
         storeApi.getState().addMessage(created);
@@ -290,7 +322,7 @@ export function useMessageHandler({
       activeModel,
       sessionModel,
       planModeEnabled,
-      isAgentBusy,
+      hasPendingClarification,
       queue,
       buildFinalMessage,
       storeApi,

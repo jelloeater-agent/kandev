@@ -127,6 +127,24 @@ func TestParseTimePtrValue(t *testing.T) {
 	}
 }
 
+func TestGHSearchParsingPreservesImmutableIdentity(t *testing.T) {
+	prs, err := (&GHClient{}).parseSearchResults(`[{"id":202,"node_id":"PR_kwDOB","number":8,"title":"Fix auth","html_url":"https://github.com/acme/web/pull/8","state":"open","repository_url":"https://api.github.com/repos/acme/web","pull_request":{}}]`)
+	if err != nil {
+		t.Fatalf("parse search results: %v", err)
+	}
+	if len(prs) != 1 || prs[0].ID != 202 || prs[0].NodeID != "PR_kwDOB" {
+		t.Fatalf("PRs = %#v", prs)
+	}
+
+	issues := parseIssueSearchResults([]issueSearchItem{{
+		ID: 303, NodeID: "I_kwDOC", Number: 9, Title: "Broken login",
+		RepositoryURL: "https://api.github.com/repos/acme/web",
+	}})
+	if len(issues) != 1 || issues[0].ID != 303 || issues[0].NodeID != "I_kwDOC" {
+		t.Fatalf("issues = %#v", issues)
+	}
+}
+
 func TestGHClient_ListCheckRuns_PaginatesCheckRuns(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "gh-args.log")
@@ -177,6 +195,29 @@ esac
 	}
 	if strings.Contains(string(logged), "--slurp") {
 		t.Fatalf("ListCheckRuns should not combine gh api --slurp with --jq, got:\n%s", logged)
+	}
+}
+
+func TestGHClient_RequestReviewers_UsesGitHubReviewRequestEndpoint(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh-args.log")
+	ghPath := filepath.Join(binDir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_ARGS_LOG\"\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_ARGS_LOG", logPath)
+
+	if err := NewGHClient().RequestReviewers(context.Background(), "acme", "widget", 42, []string{"octocat"}); err != nil {
+		t.Fatalf("RequestReviewers: %v", err)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	want := "api repos/acme/widget/pulls/42/requested_reviewers -X POST -f reviewers[]=octocat\n"
+	if string(args) != want {
+		t.Fatalf("gh args = %q, want %q", args, want)
 	}
 }
 

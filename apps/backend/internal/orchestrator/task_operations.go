@@ -14,9 +14,11 @@ import (
 
 	"go.uber.org/zap"
 
+	agentruntime "github.com/kandev/kandev/internal/agent/runtime"
 	"github.com/kandev/kandev/internal/agent/runtime/agentctl"
 	"github.com/kandev/kandev/internal/agent/runtime/lifecycle"
 	"github.com/kandev/kandev/internal/agent/runtime/routingerr"
+	"github.com/kandev/kandev/internal/common/constants"
 	"github.com/kandev/kandev/internal/orchestrator/dto"
 	"github.com/kandev/kandev/internal/orchestrator/executor"
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
@@ -58,9 +60,26 @@ const resumeReasonErrorRecovery = "error_recovery"
 // from "agent_not_running" so log filtering can isolate FAILED auto-resumes.
 const resumeReasonFailedSessionResumable = "failed_session_resumable"
 
+// resumeReasonArchiveCancelledResumable is the resume reason returned when a
+// session cancelled by archiving (see models.IsArchiveCancelReason) is
+// resumable once its task is unarchived — the cancellation was a system side
+// effect of Service.ArchiveTask / HandoffService's cascade archive, not an
+// explicit user/coordinator stop, so it must recover like a FAILED session
+// instead of staying stuck on read-only workspace restore.
+const resumeReasonArchiveCancelledResumable = "archive_cancelled_resumable"
+
 var ErrAgentPromptInProgress = errors.New("agent is currently processing a prompt")
 var ErrAgentNotReadyForPrompt = errors.New("agent not ready for prompt")
 var ErrSessionResetInProgress = errors.New("session reset in progress")
+
+type primarySessionTaskStateUpdater interface {
+	UpdateTaskStateIfPrimarySessionState(
+		ctx context.Context,
+		taskID, sessionID string,
+		expectedSessionState models.TaskSessionState,
+		state v1.TaskState,
+	) (bool, error)
+}
 
 // ErrSessionNotPromptable is returned when a session cannot accept a prompt
 // because of its lifecycle state (STARTING, CREATED, FAILED, CANCELLED).
@@ -129,6 +148,20 @@ func isTransientPromptError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "agent stream disconnected") ||
 		strings.Contains(msg, "use of closed network connection")
+}
+
+// isManualRecoveryPromptError identifies a provider error that should retain
+// the queued prompt until the user explicitly resumes the session. It is
+// intentionally separate from isTransientPromptError: exhausted usage does
+// not become available on a short automatic retry, and repeatedly attempting
+// it would consume the queue's retry budget without making progress.
+func isManualRecoveryPromptError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "usagelimitexceeded") ||
+		strings.Contains(message, "you've hit your usage limit")
 }
 
 func isAgentAlreadyRunningError(err error) bool {
@@ -257,6 +290,10 @@ func (s *Service) PrepareTaskSession(ctx context.Context, taskID string, agentPr
 			bgCtx := context.Background()
 			prepExec, launchErr := s.executor.LaunchPreparedSession(bgCtx, task, sessionID, executor.LaunchOptions{AgentProfileID: agentProfileID, ExecutorID: executorID, WorkflowStepID: workflowStepID})
 			if launchErr != nil {
+				// LaunchAgent failures persist FAILED in the executor. Earlier
+				// workspace failures return here and are recorded through the same
+				// session-level recovery claim.
+				launchErr = s.handleSessionLaunchFailure(bgCtx, taskID, sessionID, launchErr)
 				s.logger.Warn("failed to launch workspace for prepared session (file browsing may be unavailable)",
 					zap.String("task_id", taskID),
 					zap.String("session_id", sessionID),
@@ -284,9 +321,17 @@ func (s *Service) PrepareTaskSession(ctx context.Context, taskID string, agentPr
 // autoStart marks the launch as having been triggered by an automated path
 // (only consumed when skipMessageRecord is false — callers that store their
 // own message control its metadata directly).
+// references contains validated entity references whose exact server-generated
+// context block may survive first-turn canonicalization.
 //
-//nolint:cyclop,funlen // existing complexity inherited from main's session-lifecycle handling; signature touched here only to thread autoStart
-func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment) (*executor.TaskExecution, error) {
+//nolint:cyclop,funlen,gocognit // Existing complexity inherited from session-lifecycle handling.
+func (s *Service) StartCreatedSession(
+	ctx context.Context,
+	taskID, sessionID, agentProfileID, prompt string,
+	skipMessageRecord, planMode, autoStart bool,
+	attachments []v1.MessageAttachment,
+	references []v1.EntityReference,
+) (*executor.TaskExecution, error) {
 	s.logger.Debug("starting created session",
 		zap.String("task_id", taskID),
 		zap.String("session_id", sessionID),
@@ -305,6 +350,16 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	// and move the step, which sets the session to WAITING_FOR_INPUT before we get here.
 	if session.State != models.TaskSessionStateCreated && session.State != models.TaskSessionStateWaitingForInput {
 		return nil, fmt.Errorf("session is not in CREATED or WAITING_FOR_INPUT state (current: %s)", session.State)
+	}
+
+	// Office-owned sessions must be started by the scheduler. Reject before
+	// resolving profiles or persisting any caller-derived session metadata.
+	isOfficeTask, err := s.lookupOfficeTask(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine office task status: %w", err)
+	}
+	if isOfficeTask {
+		return nil, errOfficeTaskStartRequiresScheduler
 	}
 
 	// Use agent profile from request, fall back to session's stored value.
@@ -362,15 +417,7 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	}
 
 	// Transition task state: CREATED → SCHEDULING → (IN_PROGRESS via executor).
-	// Office tasks keep their workflow-owned status across run launches.
-	isOfficeTask, err := s.lookupOfficeTask(ctx, taskID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to determine office task status: %w", err)
-	}
-	if isOfficeTask {
-		s.logger.Debug("skipping SCHEDULING transition for office task",
-			zap.String("task_id", taskID))
-	} else if err := s.scheduleTaskForSession(ctx, taskID, sessionID); err != nil {
+	if err := s.scheduleTaskForSession(ctx, taskID, sessionID); err != nil {
 		s.logger.Warn("failed to update task state to SCHEDULING",
 			zap.String("task_id", taskID),
 			zap.Error(err))
@@ -422,7 +469,10 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	if err != nil {
 		return nil, fmt.Errorf("failed to reload task after on_turn_start: %w", err)
 	}
-	effectivePrompt, planModeActive := s.applyWorkflowAndPlanMode(ctx, effectivePrompt, taskID, sessionID, dbTask.WorkflowStepID, planMode, task.IsEphemeral)
+	effectivePrompt, planModeActive, promptReferenceContext := s.applyWorkflowAndPlanMode(
+		ctx, effectivePrompt, taskID, sessionID, dbTask.WorkflowStepID,
+		planMode, task.IsEphemeral, session.IsPassthrough,
+	)
 
 	// Inject config context for config-mode sessions (dedicated settings chat)
 	configMode := false
@@ -433,17 +483,24 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 
 	// Wrap the first prompt with the Kandev MCP system block. See the
 	// matching block in startTask for the rationale (DB stores wrapped form;
-	// Message.ToAPI strips for display). Idempotent — upstream call sites that
-	// record the user message themselves (wsAddMessage on CREATED sessions)
-	// wrap first, and the HasKandevContext guard prevents a second wrap here.
+	// Message.ToAPI strips for display). The injectors canonicalize any upstream
+	// wrap from current server state before launch.
 	// Passthrough profiles skip the wrap: the prompt is typed straight into the
 	// agent CLI's TTY and the user sees it verbatim — they don't want a wall of
 	// MCP-tool boilerplate prepended to "hello".
-	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) && !session.IsPassthrough {
-		effectivePrompt = sysprompt.InjectKandevContextWithOptions(taskID, sessionID, effectivePrompt, sysprompt.KandevContextOptions{
-			RequiresCompletionSignal:       s.WorkflowStepRequiresCompletionSignal(ctx, dbTask.WorkflowStepID),
-			IncludeCoordinatorTaskControls: !isOfficeTask && !configMode,
-		})
+	if (effectivePrompt != "" || len(attachments) > 0) && !session.IsPassthrough {
+		referenceContext := EntityReferenceContext(references)
+		if isOfficeTask {
+			effectivePrompt = sysprompt.InjectOfficeContext(
+				taskID, sessionID, effectivePrompt,
+				referenceContext, promptReferenceContext,
+			)
+		} else {
+			effectivePrompt = sysprompt.InjectKandevContextWithOptions(taskID, sessionID, effectivePrompt, sysprompt.KandevContextOptions{
+				RequiresCompletionSignal:       s.WorkflowStepRequiresCompletionSignal(ctx, dbTask.WorkflowStepID),
+				IncludeCoordinatorTaskControls: !configMode,
+			}, referenceContext, promptReferenceContext)
+		}
 	}
 
 	executorID := session.ExecutorID
@@ -458,7 +515,9 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	}
 	execution, err := s.executor.LaunchPreparedSession(ctx, task, sessionID, executor.LaunchOptions{AgentProfileID: effectiveProfileID, ExecutorID: executorID, Prompt: effectivePrompt, StartAgent: true, McpMode: mcpMode, Attachments: attachments})
 	if err != nil {
-		return nil, err
+		// The executor persists LaunchAgent failures. Cover earlier prepared-session
+		// failures here; the session-level claim makes either completion order safe.
+		return nil, s.handleSessionLaunchFailure(ctx, taskID, sessionID, err)
 	}
 
 	// Record the initial user message and set plan mode metadata after launch.
@@ -472,6 +531,87 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	go s.ensureSessionPRWatch(context.Background(), taskID, execution.SessionID, execution.WorktreeBranch)
 
 	return execution, nil
+}
+
+// handleSessionLaunchFailure covers launch and resume failures that have not
+// already won terminal bookkeeping. The state CAS makes it safe as an
+// idempotent fallback when executor bookkeeping did run.
+func (s *Service) handleSessionLaunchFailure(
+	ctx context.Context,
+	taskID, sessionID string,
+	launchErr error,
+	preloadedSession ...*models.TaskSession,
+) error {
+	failureCtx := context.WithoutCancel(ctx)
+	safeErr := routingerr.SanitizeError(launchErr)
+	s.recordSessionLaunchFailure(
+		failureCtx, taskID, sessionID, safeErr, preloadedSession...,
+	)
+	return safeErr
+}
+
+// recordSessionLaunchFailure transitions a still-active session to FAILED,
+// attaches missing-branch guidance only after that CAS succeeds, and updates
+// the task only while the same failed session still owns it.
+func (s *Service) recordSessionLaunchFailure(ctx context.Context, taskID, sessionID string, launchErr error, preloadedSession ...*models.TaskSession) {
+	_, changed := s.updateTaskSessionStateWithHook(
+		ctx, taskID, sessionID, models.TaskSessionStateFailed, launchErr.Error(), false,
+		func() { s.handleSessionLaunchFailed(ctx, taskID, sessionID, "", launchErr) }, preloadedSession...,
+	)
+	if !changed {
+		// A resume may begin from an already FAILED session. Its state CAS is
+		// intentionally a no-op, but the persisted claim still lets this newly
+		// classified failure publish guidance exactly once. The claim itself is
+		// state-guarded, so a concurrently cancelled/completed session cannot
+		// receive stale recovery UI.
+		if len(preloadedSession) > 0 && preloadedSession[0] != nil && preloadedSession[0].State == models.TaskSessionStateFailed {
+			s.handleSessionLaunchFailed(ctx, taskID, sessionID, "", launchErr)
+		}
+		return
+	}
+	updated, err := s.updateTaskStateForEarlyLaunchFailure(ctx, taskID, sessionID)
+	if err != nil {
+		s.logger.Warn("failed to update task state to FAILED after early launch error",
+			zap.String("task_id", taskID),
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return
+	}
+	if !updated {
+		return
+	}
+	s.processParentChildrenCompletedForTaskState(ctx, taskID, v1.TaskStateFailed)
+}
+
+func (s *Service) updateTaskStateForEarlyLaunchFailure(
+	ctx context.Context,
+	taskID, sessionID string,
+) (bool, error) {
+	if updater, ok := s.taskRepo.(primarySessionTaskStateUpdater); ok {
+		return updater.UpdateTaskStateIfPrimarySessionState(
+			ctx, taskID, sessionID, models.TaskSessionStateFailed, v1.TaskStateFailed,
+		)
+	}
+	// Lightweight test repositories predate the primary-aware extension.
+	return s.taskRepo.UpdateTaskStateIfSessionState(
+		ctx, taskID, sessionID, models.TaskSessionStateFailed, v1.TaskStateFailed,
+	)
+}
+
+func (s *Service) reconcileTaskStateForEarlyLaunchFailure(
+	ctx context.Context,
+	taskID, sessionID string,
+	state v1.TaskState,
+) error {
+	if state != v1.TaskStateFailed {
+		return fmt.Errorf("unsupported early launch task state %q", state)
+	}
+	updated, err := s.updateTaskStateForEarlyLaunchFailure(ctx, taskID, sessionID)
+	if err != nil || !updated {
+		return err
+	}
+	s.processParentChildrenCompletedForTaskState(ctx, taskID, state)
+	return nil
 }
 
 func (s *Service) scheduleTaskForSession(ctx context.Context, taskID, sessionID string) error {
@@ -554,13 +694,26 @@ func (s *Service) postLaunchCreated(ctx context.Context, taskID, sessionID, prom
 // input — the seed prompt is tagged so the github cleanup loop can tell
 // "agent ran on its own" from "user actually engaged".
 func (s *Service) StartTask(ctx context.Context, taskID string, agentProfileID string, executorID string, executorProfileID string, priority string, prompt string, workflowStepID string, planMode, autoStart bool, attachments []v1.MessageAttachment) (*executor.TaskExecution, error) {
-	return s.startTask(ctx, taskID, agentProfileID, executorID, executorProfileID, priority, prompt, workflowStepID, planMode, autoStart, attachments, nil, nil)
+	return s.startTask(ctx, taskID, agentProfileID, executorID, executorProfileID, priority, prompt, workflowStepID, planMode, autoStart, attachments, startTaskOptions{})
 }
 
 // StartTaskWithEnv starts a task and carries launch-scoped environment variables
 // through to the agent runtime. Existing StartTask callers keep the old behavior.
 func (s *Service) StartTaskWithEnv(ctx context.Context, taskID string, agentProfileID string, executorID string, executorProfileID string, priority string, prompt string, workflowStepID string, planMode, autoStart bool, attachments []v1.MessageAttachment, env map[string]string) (*executor.TaskExecution, error) {
-	return s.startTask(ctx, taskID, agentProfileID, executorID, executorProfileID, priority, prompt, workflowStepID, planMode, autoStart, attachments, env, nil)
+	return s.startTask(ctx, taskID, agentProfileID, executorID, executorProfileID, priority, prompt, workflowStepID, planMode, autoStart, attachments, startTaskOptions{Env: env})
+}
+
+// startTaskOptions carries the optional, server-only launch inputs that only
+// some callers supply. Keeping them in one struct avoids growing startTask's
+// already long positional parameter list for every new orthogonal concern.
+type startTaskOptions struct {
+	// Env holds launch-scoped environment variables for the agent runtime.
+	Env map[string]string
+	// Route pins a concrete execution profile chosen by Office provider routing.
+	Route *executor.RouteOverride
+	// SpawnOrigin is set when another agent session spawned this launch; it
+	// produces the spawner-attribution system block on the first turn.
+	SpawnOrigin *SpawnOrigin
 }
 
 // StartTaskWithRoute launches a stable Office identity through a complete
@@ -581,12 +734,13 @@ func (s *Service) StartTaskWithRoute(
 	_, err := s.startTask(ctx, taskID, agentProfileID,
 		launch.ExecutorID, launch.ExecutorProfileID, launch.Priority,
 		launch.Prompt, launch.WorkflowStepID, launch.PlanMode, false,
-		launch.Attachments, launch.Env, &route)
+		launch.Attachments, startTaskOptions{Env: launch.Env, Route: &route})
 	return err
 }
 
-//nolint:cyclop,funlen // launch path threads many orthogonal concerns (workflow-step / agent-profile / office-task / config-mode / route / system-prompt wrapping); splitting it would require shared mutable state across helpers
-func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID string, executorID string, executorProfileID string, priority string, prompt string, workflowStepID string, planMode, autoStart bool, attachments []v1.MessageAttachment, env map[string]string, route *executor.RouteOverride) (*executor.TaskExecution, error) {
+//nolint:cyclop,funlen,gocognit // launch path threads many orthogonal concerns (workflow-step / agent-profile / office-task / config-mode / route / system-prompt wrapping); splitting it would require shared mutable state across helpers
+func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID string, executorID string, executorProfileID string, priority string, prompt string, workflowStepID string, planMode, autoStart bool, attachments []v1.MessageAttachment, opts startTaskOptions) (*executor.TaskExecution, error) {
+	env, route := opts.Env, opts.Route
 	s.logger.Debug("manually starting task",
 		zap.String("task_id", taskID),
 		zap.String("agent_profile_id", agentProfileID),
@@ -601,6 +755,11 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 	isOfficeTask, err := s.lookupOfficeTask(ctx, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine office task status: %w", err)
+	}
+	if isOfficeTask {
+		if err := validateOfficeLaunchEnv(taskID, env); err != nil {
+			return nil, err
+		}
 	}
 
 	// Office tasks do NOT transition through SCHEDULING / IN_PROGRESS on
@@ -683,7 +842,23 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 		s.tagSessionAsWorkflowSwitched(ctx, sessionID)
 	}
 
-	effectivePrompt, planModeActive := s.applyWorkflowAndPlanMode(ctx, effectivePrompt, task.ID, sessionID, workflowStepID, planMode, task.IsEphemeral)
+	// Passthrough sessions skip both the workflow-prompt "@name" expansion below
+	// and the Kandev MCP wrap further down: the prompt is typed straight into
+	// the agent CLI's TTY and the user sees it verbatim — they don't want a
+	// wall of MCP-tool boilerplate or a hidden expansion block prepended to
+	// "hello". Use the session snapshot, not a live profile lookup, so a
+	// mid-run profile edit cannot change wrap behavior. Looked up once here and
+	// reused below so we don't hit GetTaskSession twice for the same fact.
+	// If the lookup fails, resolveIsPassthroughForLaunch fails safe by
+	// treating the session as passthrough: skipping the wrap/expansion is
+	// strictly less harmful than leaking hidden <kandev-system> content into
+	// a real passthrough session's PTY.
+	isPassthrough := s.resolveIsPassthroughForLaunch(ctx, sessionID)
+
+	effectivePrompt, planModeActive, promptReferenceContext := s.applyWorkflowAndPlanMode(
+		ctx, effectivePrompt, task.ID, sessionID, workflowStepID,
+		planMode, task.IsEphemeral, isPassthrough,
+	)
 
 	// Inject config context for config-mode sessions (dedicated settings chat)
 	configMode := false
@@ -700,25 +875,24 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 	// rely on the agent CLI's conversation history retaining it.
 	// Idempotent: upstream call sites (wsAddMessage on CREATED sessions,
 	// recordAutoStartMessage) wrap before recording the user message so the DB
-	// row carries the block; the HasKandevContext guard makes this orchestrator
-	// pass a no-op in those cases instead of double-wrapping.
-	// Passthrough sessions skip the wrap: the prompt is typed straight into the
-	// agent CLI's TTY and the user sees it verbatim — they don't want a wall of
-	// MCP-tool boilerplate prepended to "hello". Use the session snapshot, not a
-	// live profile lookup, so a mid-run profile edit cannot change wrap behavior.
-	skipKandevMCPWrap := false
-	if launchSession, sessErr := s.repo.GetTaskSession(ctx, sessionID); sessErr == nil {
-		skipKandevMCPWrap = launchSession.IsPassthrough
-	}
+	// row carries the block; the mode-aware injector canonicalizes it instead of
+	// double-wrapping.
+	skipKandevMCPWrap := isPassthrough
 	// `task` here is *v1.Task from the scheduler, which does NOT carry the
 	// orchestrator's WorkflowStepID — go through the task-ID variant so the
 	// repo lookup pulls the canonical step. Using the workflowStepID parameter
 	// directly is wrong because it can be empty on manual user-initiated starts
 	// while the task is already bound to a signal-gated step in the DB.
-	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) && !skipKandevMCPWrap {
-		effectivePrompt = sysprompt.InjectKandevContextWithOptions(task.ID, sessionID, effectivePrompt, sysprompt.KandevContextOptions{
-			RequiresCompletionSignal:       s.StepRequiresCompletionSignal(ctx, task.ID),
-			IncludeCoordinatorTaskControls: !isOfficeTask && !configMode,
+	if effectivePrompt != "" || len(attachments) > 0 {
+		effectivePrompt = s.applyLaunchPromptContext(ctx, launchPromptContext{
+			prompt:           effectivePrompt,
+			taskID:           task.ID,
+			sessionID:        sessionID,
+			isOfficeTask:     isOfficeTask,
+			isPassthrough:    skipKandevMCPWrap,
+			configMode:       configMode,
+			referenceContext: promptReferenceContext,
+			spawnOrigin:      opts.SpawnOrigin,
 		})
 	}
 
@@ -747,7 +921,7 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 		RouteOverride:        route,
 	})
 	if err != nil {
-		return nil, err
+		return nil, s.handleSessionLaunchFailure(ctx, taskID, sessionID, err)
 	}
 
 	s.postLaunchStart(ctx, taskID, execution, effectivePrompt, planModeActive || configMode, planModeActive, autoStart, attachments)
@@ -758,8 +932,79 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 	return execution, nil
 }
 
-// isOfficeTask returns true when the task has an assignee agent profile, which
-// identifies it as an office-managed task (as opposed to a kanban / quick-chat task).
+// launchPromptContext carries what the first turn of a launch needs in order to
+// compose its system context.
+type launchPromptContext struct {
+	prompt           string
+	taskID           string
+	sessionID        string
+	isOfficeTask     bool
+	isPassthrough    bool
+	configMode       bool
+	referenceContext string
+	spawnOrigin      *SpawnOrigin
+}
+
+// applyLaunchPromptContext prepends the first-turn system context to a launch
+// prompt: the Kandev (or Office) MCP block, plus spawner attribution when the
+// launch came from spawn_session_kandev.
+//
+// Passthrough profiles get attribution only, as plain text — see
+// applySpawnOriginText for why they skip the MCP block entirely.
+func (s *Service) applyLaunchPromptContext(ctx context.Context, p launchPromptContext) string {
+	if p.isPassthrough {
+		return applySpawnOriginText(p.prompt, p.spawnOrigin)
+	}
+	// Spawner attribution is built here, not by the MCP handler that filled
+	// SpawnOrigin: the injectors below strip every <kandev-system> block they do
+	// not recognize, so the block has to be generated from the same server state
+	// that whitelists it as trusted content.
+	prompt, spawnContext := applySpawnOriginContext(p.prompt, p.spawnOrigin)
+	if p.isOfficeTask {
+		return sysprompt.InjectOfficeContext(
+			p.taskID, p.sessionID, prompt, p.referenceContext, spawnContext,
+		)
+	}
+	return sysprompt.InjectKandevContextWithOptions(p.taskID, p.sessionID, prompt, sysprompt.KandevContextOptions{
+		RequiresCompletionSignal:       s.StepRequiresCompletionSignal(ctx, p.taskID),
+		IncludeCoordinatorTaskControls: !p.configMode,
+	}, p.referenceContext, spawnContext)
+}
+
+// spawnOriginContent renders the spawner-attribution text for a launch requested
+// through spawn_session_kandev, or "" for ordinary launches.
+func spawnOriginContent(origin *SpawnOrigin) string {
+	if origin == nil {
+		return ""
+	}
+	return sysprompt.SpawnedSessionContext(origin.TaskID, origin.SessionID, origin.SessionName)
+}
+
+// applySpawnOriginContext prepends the spawner-attribution system block for a
+// launch requested through spawn_session_kandev and returns the content that
+// the first-turn injector must whitelist so the block is not stripped again as
+// untrusted. Ordinary launches pass through unchanged with empty content.
+func applySpawnOriginContext(prompt string, origin *SpawnOrigin) (string, string) {
+	content := spawnOriginContent(origin)
+	if content == "" {
+		return prompt, ""
+	}
+	return sysprompt.Wrap(content) + "\n\n" + prompt, content
+}
+
+// applySpawnOriginText prepends the same attribution as plain prompt text, for
+// passthrough profiles whose prompt reaches the agent through a TTY the user is
+// watching. There is no injector on that path to whitelist a system block, and
+// wrapping it would only put raw <kandev-system> markup on the terminal.
+func applySpawnOriginText(prompt string, origin *SpawnOrigin) string {
+	content := spawnOriginContent(origin)
+	if content == "" {
+		return prompt
+	}
+	return content + "\n\n" + prompt
+}
+
+// isOfficeTask returns the repository's canonical Office ownership projection.
 func (s *Service) isOfficeTask(ctx context.Context, taskID string) bool {
 	isOfficeTask, err := s.lookupOfficeTask(ctx, taskID)
 	return err == nil && isOfficeTask
@@ -770,7 +1015,61 @@ func (s *Service) lookupOfficeTask(ctx context.Context, taskID string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	return dbTask != nil && dbTask.AssigneeAgentProfileID != "", nil
+	return dbTask != nil && dbTask.IsFromOffice, nil
+}
+
+func validateOfficeRuntimeEnv(env map[string]string) error {
+	required := []string{
+		"KANDEV_CLI",
+		"KANDEV_API_URL",
+		"KANDEV_API_KEY",
+		"KANDEV_AGENT_ID",
+		"KANDEV_WORKSPACE_ID",
+		"KANDEV_RUN_ID",
+		"KANDEV_TASK_ID",
+	}
+	missing := make([]string, 0, len(required))
+	for _, key := range required {
+		if strings.TrimSpace(env[key]) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"office runtime context is incomplete (missing %s); start or wake the task through Office",
+		strings.Join(missing, ", "),
+	)
+}
+
+var (
+	errOfficeTaskStartRequiresScheduler = errors.New(
+		"office tasks must be started through Office; use StartTaskWithEnv with scheduler-injected credentials",
+	)
+	errOfficeTaskResumeRequiresScheduler = errors.New(
+		"office tasks must be resumed through Office; use the Office scheduler to start a fresh run",
+	)
+	errOfficePreparedResumeRequiresScheduler = errors.New(
+		"office tasks must be restarted through Office; prepared-workspace resume is not supported for Office-owned tasks",
+	)
+)
+
+// validateOfficeLaunchEnv requires the scheduler context to be bound to the
+// task being launched. StartTaskWithEnv is only wired to the internal Office
+// scheduler adapter; the task binding still prevents a complete context map
+// from being reused for a different task.
+func validateOfficeLaunchEnv(taskID string, env map[string]string) error {
+	if err := validateOfficeRuntimeEnv(env); err != nil {
+		return err
+	}
+	if env["KANDEV_TASK_ID"] != taskID {
+		return fmt.Errorf(
+			"office runtime context is bound to task %q, not %q; start or wake the task through Office",
+			env["KANDEV_TASK_ID"], taskID,
+		)
+	}
+	return nil
 }
 
 // prepareSessionForStart creates the session for a launch and propagates any
@@ -794,8 +1093,25 @@ func (s *Service) prepareSessionForStart(
 	return sessionID, nil
 }
 
+// resolveIsPassthroughForLaunch reloads the session snapshot to decide
+// whether this launch is a passthrough session (skip the Kandev MCP wrap and
+// the "@name" prompt-reference expansion). If the reload fails, this fails
+// safe by treating the session as passthrough: skipping the wrap/expansion is
+// strictly less harmful than leaking hidden <kandev-system> content into a
+// real passthrough session's PTY.
+func (s *Service) resolveIsPassthroughForLaunch(ctx context.Context, sessionID string) bool {
+	launchSession, sessErr := s.repo.GetTaskSession(ctx, sessionID)
+	if sessErr != nil {
+		s.logger.Warn("failed to reload session for passthrough check; defaulting to passthrough (skip hidden-content injection) as the safer failure mode",
+			zap.String("session_id", sessionID),
+			zap.Error(sessErr))
+		return true
+	}
+	return launchSession.IsPassthrough
+}
+
 // createStartSession picks the right session-creation path for the task:
-// office tasks with an assignee use the per-(task, agent) EnsureSessionForAgent
+// Office tasks with an assignee use the per-(task, agent) EnsureSessionForAgent
 // (so runs reuse one row across turns); kanban / quick-chat fall through to
 // the per-launch PrepareSession used since day one.
 func (s *Service) createStartSession(
@@ -803,7 +1119,7 @@ func (s *Service) createStartSession(
 	agentProfileID, executorID, executorProfileID, workflowStepID string,
 ) (string, error) {
 	dbTask, err := s.repo.GetTask(ctx, task.ID)
-	if err == nil && dbTask != nil && dbTask.AssigneeAgentProfileID != "" {
+	if err == nil && dbTask != nil && dbTask.IsFromOffice && dbTask.AssigneeAgentProfileID != "" {
 		session, ensureErr := s.executor.EnsureSessionForAgent(
 			ctx, task, dbTask.AssigneeAgentProfileID, agentProfileID, executorID, executorProfileID,
 		)
@@ -934,8 +1250,9 @@ func (s *Service) postLaunchStart(ctx context.Context, taskID string, execution 
 // applyWorkflowAndPlanMode applies workflow step configuration and plan mode injection to a prompt.
 // Returns the effective prompt and whether plan mode is active (from either the step or the caller).
 // For ephemeral tasks (quick chat), workflow step processing is skipped since they have no workflow.
-func (s *Service) applyWorkflowAndPlanMode(ctx context.Context, prompt string, taskID string, sessionID string, workflowStepID string, planMode bool, isEphemeral bool) (string, bool) {
+func (s *Service) applyWorkflowAndPlanMode(ctx context.Context, prompt string, taskID string, sessionID string, workflowStepID string, planMode bool, isEphemeral bool, isPassthrough bool) (string, bool, string) {
 	effectivePrompt := prompt
+	promptReferenceContext := ""
 
 	stepHasPlanMode := false
 	// Skip workflow step prompt injection for ephemeral tasks - they don't have workflows
@@ -947,7 +1264,9 @@ func (s *Service) applyWorkflowAndPlanMode(ctx context.Context, prompt string, t
 				zap.Error(err))
 		} else {
 			stepHasPlanMode = step.HasOnEnterAction(wfmodels.OnEnterEnablePlanMode)
-			effectivePrompt = s.buildWorkflowPrompt(effectivePrompt, step, taskID, sessionID)
+			effectivePrompt, promptReferenceContext = s.buildWorkflowPromptWithContext(
+				ctx, effectivePrompt, step, taskID, sessionID, isPassthrough,
+			)
 		}
 	}
 
@@ -958,7 +1277,7 @@ func (s *Service) applyWorkflowAndPlanMode(ctx context.Context, prompt string, t
 		effectivePrompt = strings.Join(parts, "\n\n")
 	}
 
-	return effectivePrompt, planMode || stepHasPlanMode
+	return effectivePrompt, planMode || stepHasPlanMode, promptReferenceContext
 }
 
 // backfillInitialUserMessageIfMissing records the task's description as the
@@ -1009,7 +1328,19 @@ func (s *Service) recordInitialMessage(ctx context.Context, taskID, sessionID, p
 // Otherwise, step.Prompt fully replaces the base prompt.
 // If the step has enable_plan_mode in on_enter events, plan mode prefix is also prepended.
 // Only true internal instructions are wrapped in <kandev-system> tags so they can be stripped from the visible chat.
-func (s *Service) buildWorkflowPrompt(basePrompt string, step *wfmodels.WorkflowStep, taskID string, sessionID string) string {
+func (s *Service) buildWorkflowPrompt(ctx context.Context, basePrompt string, step *wfmodels.WorkflowStep, taskID string, sessionID string, isPassthrough bool) string {
+	prompt, _ := s.buildWorkflowPromptWithContext(ctx, basePrompt, step, taskID, sessionID, isPassthrough)
+	return prompt
+}
+
+func (s *Service) buildWorkflowPromptWithContext(
+	ctx context.Context,
+	basePrompt string,
+	step *wfmodels.WorkflowStep,
+	taskID string,
+	sessionID string,
+	isPassthrough bool,
+) (string, string) {
 	_ = sessionID
 	var parts []string
 
@@ -1029,7 +1360,34 @@ func (s *Service) buildWorkflowPrompt(basePrompt string, step *wfmodels.Workflow
 		parts = append(parts, basePrompt)
 	}
 
-	return strings.Join(parts, "\n\n")
+	joined := strings.Join(parts, "\n\n")
+	return s.expandPromptReferencesWithContext(ctx, joined, isPassthrough)
+}
+
+// expandPromptReferences resolves "@name" saved-prompt references in prompt
+// via the configured PromptReferenceExpander. When no expander is set, prompt
+// is returned unchanged. Passthrough sessions skip expansion entirely: the
+// prompt is written raw to a PTY with no <kandev-system> stripping step, so
+// the expansion's hidden wrapper block would be typed into the terminal
+// verbatim instead of staying hidden.
+func (s *Service) expandPromptReferences(ctx context.Context, prompt string, isPassthrough bool) string {
+	expanded, _ := s.expandPromptReferencesWithContext(ctx, prompt, isPassthrough)
+	return expanded
+}
+
+func (s *Service) expandPromptReferencesWithContext(
+	ctx context.Context,
+	prompt string,
+	isPassthrough bool,
+) (string, string) {
+	if s.promptExpander == nil || isPassthrough {
+		return prompt, ""
+	}
+	var zapLogger *zap.Logger
+	if s.logger != nil {
+		zapLogger = s.logger.Zap()
+	}
+	return s.promptExpander.AppendReferenceExpansionsWithContext(ctx, prompt, zapLogger)
 }
 
 // ResumeTaskSession restarts a specific task session using its stored worktree.
@@ -1064,6 +1422,14 @@ func (s *Service) ResumeTaskSession(ctx context.Context, taskID, sessionID strin
 	// after a failure can invoke RecoverSession with action="fresh_start".
 	if session.State == models.TaskSessionStateCompleted {
 		return nil, fmt.Errorf("session is completed and cannot be resumed; create a new session instead")
+	}
+
+	isOfficeTask, err := s.lookupOfficeTask(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine office task status: %w", err)
+	}
+	if isOfficeTask {
+		return nil, errOfficeTaskResumeRequiresScheduler
 	}
 
 	// Bury any open turns from the previous run before relaunching. Without
@@ -1114,16 +1480,12 @@ func (s *Service) ResumeTaskSession(ctx context.Context, taskID, sessionID strin
 			// away), the SessionStateFailed and TaskStateFailed updates would
 			// themselves fail with "context canceled" and leave the task stuck
 			// looking "running" forever.
-			s.updateTaskSessionState(resumeCtx, taskID, sessionID, models.TaskSessionStateFailed, err.Error(), false, session)
-			if stateErr := s.taskRepo.UpdateTaskState(resumeCtx, taskID, v1.TaskStateFailed); stateErr != nil {
-				s.logger.Warn("failed to update task state to FAILED after resume error",
-					zap.String("task_id", taskID),
-					zap.String("session_id", sessionID),
-					zap.Error(stateErr))
-			} else {
-				s.processParentChildrenCompletedForTaskState(resumeCtx, taskID, v1.TaskStateFailed)
-			}
-			return nil, err
+			// ResumeSession launches the workspace directly rather than through
+			// LaunchPreparedSession. Record this failure with the same state CAS,
+			// persisted recovery claim, and archive-safe task CAS as early launch.
+			return nil, s.handleSessionLaunchFailure(
+				resumeCtx, taskID, sessionID, err, session,
+			)
 		}
 	}
 	if readySession == nil {
@@ -1278,7 +1640,7 @@ func (s *Service) StartSessionForWorkflowStep(ctx context.Context, taskID, sessi
 
 	s.advanceTaskWorkflowStep(ctx, dbTask, workflowStepID, session)
 
-	effectivePrompt := s.buildWorkflowPrompt(dbTask.Description, step, taskID, sessionID)
+	effectivePrompt := s.buildWorkflowPrompt(ctx, dbTask.Description, step, taskID, sessionID, session.IsPassthrough)
 
 	if err := s.ensureSessionRunning(ctx, sessionID, session); err != nil {
 		return err
@@ -1326,12 +1688,20 @@ func (s *Service) advanceTaskWorkflowStep(ctx context.Context, task *models.Task
 // After lazy recovery, a session may be in WAITING_FOR_INPUT with no agent process;
 // this function detects that case and triggers a resume.
 func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, session *models.TaskSession) error {
+	isOfficeTask, err := s.lookupOfficeTask(ctx, session.TaskID)
+	if err != nil {
+		return fmt.Errorf("failed to determine office task status: %w", err)
+	}
+
 	// Check if agent is genuinely running (in-memory execution store, not just DB state)
 	if exec, ok := s.executor.GetExecutionBySession(sessionID); ok && exec != nil {
 		s.recoverAgentPromptStreamIfNeeded(ctx, sessionID)
 		if err := s.waitForAgentPromptReady(ctx, sessionID); err != nil {
 			if !errors.Is(err, ErrAgentNotReadyForPrompt) {
 				return err
+			}
+			if isOfficeTask {
+				return errOfficeTaskResumeRequiresScheduler
 			}
 			recoveryCtx := context.WithoutCancel(ctx)
 			if stopErr := s.reapPromptUnreadyExecution(recoveryCtx, sessionID, err); stopErr != nil {
@@ -1362,6 +1732,9 @@ func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, se
 			return s.startAgentOnPreparedWorkspace(ctx, sessionID, session)
 		}
 	}
+	if isOfficeTask {
+		return errOfficeTaskResumeRequiresScheduler
+	}
 
 	running, err := s.repo.GetExecutorRunningBySessionID(ctx, sessionID)
 	if err != nil || running == nil {
@@ -1385,16 +1758,13 @@ func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, se
 			}
 			return nil
 		}
-		s.updateTaskSessionState(resumeCtx, session.TaskID, sessionID, models.TaskSessionStateFailed, err.Error(), false, session)
-		if stateErr := s.taskRepo.UpdateTaskState(resumeCtx, session.TaskID, v1.TaskStateFailed); stateErr != nil {
-			s.logger.Warn("failed to update task state to FAILED after session ensure resume error",
-				zap.String("task_id", session.TaskID),
-				zap.String("session_id", sessionID),
-				zap.Error(stateErr))
-		} else {
-			s.processParentChildrenCompletedForTaskState(resumeCtx, session.TaskID, v1.TaskStateFailed)
-		}
-		return fmt.Errorf("failed to resume session: %w", err)
+		return s.handleSessionLaunchFailure(
+			resumeCtx,
+			session.TaskID,
+			sessionID,
+			fmt.Errorf("failed to resume session: %w", err),
+			session,
+		)
 	}
 
 	// ResumeSession launches the agent asynchronously. Wait for it to finish
@@ -1406,8 +1776,8 @@ func (s *Service) ensureSessionRunning(ctx context.Context, sessionID string, se
 	// MCP tool-call timeout, etc.) would otherwise still abort these polling
 	// waits early with a misleading "context deadline exceeded" even though the
 	// resume is progressing fine in the background and would succeed within its
-	// own bounded timeouts (waitForSessionReady's 90s, waitForAgentPromptReady's
-	// 30s below).
+	// own bounded timeouts (waitForSessionReady's AgentLaunchTimeout launch
+	// budget, and waitForAgentPromptReady's 30s below).
 	if err := s.waitForSessionReady(resumeCtx, sessionID); err != nil {
 		return fmt.Errorf("session not ready after resume: %w", err)
 	}
@@ -1465,7 +1835,18 @@ func (s *Service) reapPromptUnreadyExecution(ctx context.Context, sessionID stri
 	if err := s.executor.StopExecution(ctx, executionID, promptReadinessRecoveryStopReason, true); err != nil {
 		return err
 	}
+	s.markExecutionFailed(sessionID, executionID)
 	refreshed, err := s.repo.GetTaskSession(ctx, sessionID)
+	taskID := ""
+	if refreshed != nil {
+		taskID = refreshed.TaskID
+	}
+	s.retireExecutionActivityAndPublish(
+		context.WithoutCancel(ctx),
+		taskID,
+		sessionID,
+		executionID,
+	)
 	if err != nil {
 		return fmt.Errorf("reload session after prompt-readiness teardown: %w", err)
 	}
@@ -1521,6 +1902,13 @@ func (s *Service) startAgentOnPreparedWorkspace(ctx context.Context, sessionID s
 	// WAITING_FOR_INPUT — that's what waitForSessionReady polls for. No flag
 	// tracking required here.
 	launchCtx := context.WithoutCancel(ctx)
+	isOfficeTask, err := s.lookupOfficeTask(launchCtx, session.TaskID)
+	if err != nil {
+		return fmt.Errorf("failed to determine office task status: %w", err)
+	}
+	if isOfficeTask {
+		return errOfficePreparedResumeRequiresScheduler
+	}
 	task, err := s.scheduler.GetTask(launchCtx, session.TaskID)
 	if err != nil {
 		return fmt.Errorf("failed to get task for prepared session: %w", err)
@@ -1530,7 +1918,8 @@ func (s *Service) startAgentOnPreparedWorkspace(ctx context.Context, sessionID s
 		ExecutorID:     session.ExecutorID,
 		StartAgent:     true,
 	}); err != nil {
-		return fmt.Errorf("failed to start agent on prepared workspace: %w", err)
+		launchErr := fmt.Errorf("failed to start agent on prepared workspace: %w", err)
+		return s.handleSessionLaunchFailure(launchCtx, session.TaskID, sessionID, launchErr)
 	}
 
 	// Same reasoning as ensureSessionRunning's resume path: use launchCtx
@@ -1550,7 +1939,7 @@ func (s *Service) startAgentOnPreparedWorkspace(ctx context.Context, sessionID s
 func (s *Service) waitForSessionReady(ctx context.Context, sessionID string) error {
 	const (
 		pollInterval = 500 * time.Millisecond
-		maxWait      = 90 * time.Second
+		maxWait      = constants.AgentLaunchTimeout
 	)
 	// Derive a bounded context so the overall wait AND each GetTaskSession query
 	// inside the loop honor maxWait. Callers pass context.WithoutCancel(ctx) so
@@ -1591,6 +1980,11 @@ func (s *Service) waitForSessionReady(ctx context.Context, sessionID string) err
 	}
 }
 
+// sessionNotFoundStatus is the status-response error used for both a missing
+// session and one the caller does not own, so the response cannot be used to
+// tell the two apart.
+const sessionNotFoundStatus = "session not found"
+
 // GetTaskSessionStatus returns the status of a task session including whether it's resumable
 func (s *Service) GetTaskSessionStatus(ctx context.Context, taskID, sessionID string) (dto.TaskSessionStatusResponse, error) {
 	s.logger.Debug("checking task session status",
@@ -1602,10 +1996,17 @@ func (s *Service) GetTaskSessionStatus(ctx context.Context, taskID, sessionID st
 		TaskID:    taskID,
 	}
 
+	// Per-user scoping: a foreign session is indistinguishable from a missing
+	// one, so reuse the same response shape rather than a distinct error.
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		resp.Error = sessionNotFoundStatus
+		return resp, nil
+	}
+
 	// 1. Load session from database
 	session, err := s.repo.GetTaskSession(ctx, sessionID)
 	if err != nil {
-		resp.Error = "session not found"
+		resp.Error = sessionNotFoundStatus
 		return resp, nil
 	}
 
@@ -1671,6 +2072,28 @@ func (s *Service) GetTaskSessionStatus(ctx context.Context, taskID, sessionID st
 			}
 			return out, nil
 		}
+		// A session cancelled by archiving is a system side effect (Service.
+		// ArchiveTask / HandoffService cascade), not an explicit user stop —
+		// it must recover like a FAILED session once the task is unarchived
+		// instead of falling into the terminal-session block below. See
+		// models.IsArchiveCancelReason.
+		if isArchiveCancelledSession(session) {
+			if running != nil && running.Resumable {
+				out := s.validateResumeEligibility(session, resp)
+				if out.NeedsResume {
+					out.ResumeReason = resumeReasonArchiveCancelledResumable
+				}
+				return out, nil
+			}
+			// The persisted token's runtime reports Resumable=false — it isn't
+			// safe to resume with. Route through the same fresh-start result
+			// used when there's no token/running row at all instead of
+			// validateResumeEligibility, which never sets IsResumable and
+			// would return NeedsResume=true with IsResumable=false, a
+			// combination the frontend's auto-resume gate
+			// (needs_resume && is_resumable) can never satisfy.
+			return evaluateFreshStartResume(session, running, runErr, resp), nil
+		}
 		// Don't auto-resume other terminal sessions (CANCELLED stays stopped, COMPLETED is done).
 		if !isActiveSessionState(session.State) {
 			resp.IsAgentRunning = false
@@ -1702,6 +2125,18 @@ func evaluateFreshStartResume(session *models.TaskSession, running *models.Execu
 		resp.IsResumable = true
 		resp.NeedsResume = true
 		resp.ResumeReason = "agent_not_running_fresh_start"
+		return resp
+	}
+	// The archive cleanup (Service.ArchiveTask / HandoffService cascade) tears
+	// down the ExecutorRunning row entirely, so an archive-cancelled session
+	// reaches this function with running == nil — exactly the shape an
+	// unarchive-then-open observes. Treat it as fresh-start resumable rather
+	// than falling through to read-only workspace restore.
+	if isArchiveCancelledSession(session) {
+		resp.IsAgentRunning = false
+		resp.IsResumable = true
+		resp.NeedsResume = true
+		resp.ResumeReason = resumeReasonArchiveCancelledResumable
 		return resp
 	}
 	resp.IsAgentRunning = false
@@ -1812,6 +2247,17 @@ func isErrorRecoveryState(session *models.TaskSession) bool {
 	return session != nil &&
 		session.State == models.TaskSessionStateWaitingForInput &&
 		session.ErrorMessage != ""
+}
+
+// isArchiveCancelledSession reports whether session was cancelled by an
+// archive (Service.ArchiveTask's single-task path or HandoffService's
+// cascade archive) rather than an explicit user/coordinator stop. Such
+// sessions must resume like a FAILED session once the owning task is
+// unarchived — see models.IsArchiveCancelReason and its two constants.
+func isArchiveCancelledSession(session *models.TaskSession) bool {
+	return session != nil &&
+		session.State == models.TaskSessionStateCancelled &&
+		models.IsArchiveCancelReason(session.ErrorMessage)
 }
 
 func shouldHealStuckStartingSession(session *models.TaskSession, running *models.ExecutorRunning) bool {
@@ -2031,6 +2477,10 @@ func (s *Service) CancelTaskExecution(ctx context.Context, taskID string, reason
 
 // StopSession stops agent execution for a specific session
 func (s *Service) StopSession(ctx context.Context, sessionID string, reason string, force bool) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	s.logger.Info("stopping session execution",
 		zap.String("session_id", sessionID),
 		zap.String("reason", reason),
@@ -2040,6 +2490,14 @@ func (s *Service) StopSession(ctx context.Context, sessionID string, reason stri
 
 // DeleteSession deletes a session that is not currently running.
 func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+	lock, release := s.acquireCancelInFlightGuard(sessionID)
+	defer release()
+	lock.Lock()
+	defer lock.Unlock()
+
 	session, err := s.repo.GetTaskSession(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("session not found: %w", err)
@@ -2053,6 +2511,12 @@ func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
 
 	taskID := session.TaskID
 	wasPrimary := session.IsPrimary
+
+	// A settled DB state can still own a workspace execution or detached
+	// background work. Quiesce that runtime boundary before removing the row.
+	if err := s.quiesceSessionExecutionBeforeDeletion(ctx, taskID, sessionID); err != nil {
+		return err
+	}
 
 	s.logger.Info("deleting session",
 		zap.String("session_id", sessionID),
@@ -2072,12 +2536,50 @@ func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
 	// Same reasoning for the push-detection tracker. Multi-repo sessions
 	// accumulate one entry per repo; pushTrackerForget walks them all.
 	s.pushTrackerForget(sessionID)
+	// And the foreground/background turn-activity signal. Execution teardown
+	// normally retires it after the final owner exits; deletion forcibly
+	// invalidates any trailing token so the removed session cannot be recreated
+	// through a stale activity pointer.
+	s.clearTurnActivity(sessionID)
 
 	// Auto-promote another session if we deleted the primary
 	if wasPrimary {
 		s.promoteNextPrimaryAfterRemoval(ctx, taskID, sessionID)
 	}
 
+	return nil
+}
+
+// quiesceSessionExecutionBeforeDeletion stops the in-memory lifecycle
+// execution, if one exists, before a session row is removed. A runtime that
+// explicitly reports the exact execution as absent is already quiesced; other
+// stop failures preserve the row because detaching a possibly-live execution
+// would let trailing frames recreate activity after deletion.
+func (s *Service) quiesceSessionExecutionBeforeDeletion(
+	ctx context.Context,
+	taskID, sessionID string,
+) error {
+	if s.agentManager == nil {
+		return nil
+	}
+	executionID, executionErr := s.agentManager.GetExecutionIDForSession(ctx, sessionID)
+	if executionErr != nil || executionID == "" {
+		return nil
+	}
+	stopErr := s.executor.StopExecution(ctx, executionID, "session deleted", true)
+	if stopErr != nil && !errors.Is(stopErr, agentruntime.ErrNotFound) {
+		return fmt.Errorf("failed to stop session execution before deletion: %w", stopErr)
+	}
+	if stopErr != nil {
+		s.logger.Debug("session execution already absent during deletion",
+			zap.String("session_id", sessionID),
+			zap.String("agent_execution_id", executionID),
+			zap.Error(stopErr))
+	}
+	s.markExecutionFailed(sessionID, executionID)
+	s.retireExecutionActivityAndPublish(
+		context.WithoutCancel(ctx), taskID, sessionID, executionID,
+	)
 	return nil
 }
 
@@ -2117,6 +2619,10 @@ func (s *Service) promoteNextPrimaryAfterRemoval(ctx context.Context, taskID, de
 // SetPrimarySession marks a session as the primary session for its task
 // and broadcasts a task.updated event so the frontend reflects the change.
 func (s *Service) SetPrimarySession(ctx context.Context, sessionID string) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	if err := s.repo.SetSessionPrimary(ctx, sessionID); err != nil {
 		return fmt.Errorf("failed to set session as primary: %w", err)
 	}
@@ -2145,6 +2651,10 @@ const maxSessionNameLength = 120
 // session.state_changed event (same state) so all clients update the tab label.
 // An empty name clears the custom label, falling back to the derived title.
 func (s *Service) RenameSession(ctx context.Context, sessionID, name string) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	name = strings.TrimSpace(name)
 	// Truncate by runes, not bytes — a byte slice could split a multi-byte
 	// UTF-8 sequence and persist an invalid string.
@@ -2447,7 +2957,7 @@ func (s *Service) saveArchiveCommits(ctx context.Context, sessionID string, comm
 // If planMode is true, a plan mode prefix is prepended to the prompt.
 // Attachments (images) are passed through to the agent if provided.
 func (s *Service) PromptTask(ctx context.Context, taskID, sessionID string, prompt string, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool) (*PromptResult, error) {
-	return s.promptTask(ctx, taskID, sessionID, prompt, model, planMode, attachments, dispatchOnly, "")
+	return s.promptTask(ctx, taskID, sessionID, prompt, model, planMode, attachments, dispatchOnly, "", false, nil)
 }
 
 // promptTask is PromptTask's implementation, taking an additional
@@ -2477,37 +2987,20 @@ func (s *Service) PromptTask(ctx context.Context, taskID, sessionID string, prom
 // those are covered by executeQueuedMessage's own deferred cleanup
 // instead (clearQueuedDispatchInFlightIfCurrent), which is safe since
 // none of them block on an agent turn.
-func (s *Service) promptTask(ctx context.Context, taskID, sessionID string, prompt string, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool, claimEntryID string) (*PromptResult, error) {
-	s.logger.Debug("PromptTask called",
-		zap.String("task_id", taskID),
-		zap.String("session_id", sessionID),
-		zap.Int("prompt_length", len(prompt)),
-		zap.String("requested_model", model),
-		zap.Bool("plan_mode", planMode),
-		zap.Int("attachments_count", len(attachments)),
-		zap.Bool("dispatch_only", dispatchOnly))
-	if sessionID == "" {
-		return nil, fmt.Errorf("session_id is required")
-	}
-	if s.isSessionResetInProgress(sessionID) {
-		return nil, ErrSessionResetInProgress
+func (s *Service) promptTask(ctx context.Context, taskID, sessionID string, prompt string, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool, claimEntryID string, lifecyclePrompt bool, afterClaim func() error) (*PromptResult, error) {
+	s.logPromptTaskCall(taskID, sessionID, prompt, model, planMode, attachments, dispatchOnly)
+	if err := s.validatePromptTaskStart(sessionID); err != nil {
+		return nil, err
 	}
 
 	// Only allow prompts when the session is ready for input.
-	// Reject when the agent is still starting, already processing, or in a terminal state.
-	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	session, err := s.loadPromptableSession(ctx, taskID, sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get session: %w", err)
+		return nil, err
 	}
-	if err := s.checkSessionPromptable(taskID, sessionID, session.State); err != nil {
-		if !errors.Is(err, ErrSessionNotPromptable) || session.State != models.TaskSessionStateStarting {
-			return nil, err
-		}
-		readySession, waitErr := s.waitForStartingSessionPromptable(ctx, taskID, sessionID)
-		if waitErr != nil {
-			return nil, waitErr
-		}
-		session = readySession
+	foregroundClaim, err := s.claimForegroundForPrompt(taskID, sessionID, session)
+	if err != nil {
+		return nil, err
 	}
 
 	// Apply config-mode and plan-mode prompt transforms.
@@ -2518,6 +3011,7 @@ func (s *Service) promptTask(ctx context.Context, taskID, sessionID string, prom
 	_, hadExecutionBeforeEnsure := s.executor.GetExecutionBySession(sessionID)
 	resumedForPrompt := !hadExecutionBeforeEnsure
 	if err := s.ensureSessionRunning(ctx, sessionID, session); err != nil {
+		s.releaseForegroundClaimOnFailure(ctx, taskID, sessionID, foregroundClaim)
 		return nil, fmt.Errorf("failed to ensure session is running: %w", err)
 	}
 
@@ -2533,38 +3027,339 @@ func (s *Service) promptTask(ctx context.Context, taskID, sessionID string, prom
 		// Re-apply transforms in case metadata changed during ensureSessionRunning.
 		effectivePrompt = s.effectivePromptForSession(sessionID, prompt, planMode, session)
 	}
-
-	// Check if model switching is requested
-	if result, switched, err := s.trySwitchModel(ctx, taskID, sessionID, model, effectivePrompt, session); switched || err != nil {
-		return result, err
+	activityExecutionID, _ := s.agentManager.GetExecutionIDForSession(ctx, sessionID)
+	foregroundDispatch := s.beginForegroundDispatch(
+		sessionID,
+		foregroundClaim,
+		activityExecutionID,
+	)
+	if foregroundDispatch == nil {
+		s.releaseForegroundClaimOnFailure(ctx, taskID, sessionID, foregroundClaim)
+		return nil, fmt.Errorf("%w, please wait for completion", ErrAgentPromptInProgress)
 	}
 
-	previousSessionState := session.State
+	if result, handled, switchErr := s.trySwitchModelForPrompt(
+		ctx, taskID, sessionID, model, effectivePrompt, session, foregroundDispatch,
+	); handled {
+		return result, switchErr
+	}
 
 	// Cache the raw prompt so a transient-provider-error (529) retry can
 	// re-drive this turn after backoff without the caller's context. Stores
 	// the pre-injection prompt; PromptTask re-applies config/plan transforms.
 	s.rememberTurnPrompt(sessionID, prompt, model, planMode, attachments)
 
-	claimedSession, err := s.claimSessionRunningForPrompt(ctx, taskID, sessionID, claimEntryID, session)
+	session, rollback, err := s.claimPromptDispatch(
+		ctx, taskID, sessionID, claimEntryID, lifecyclePrompt,
+		afterClaim, session, foregroundClaim,
+	)
 	if err != nil {
+		s.rollbackForegroundDispatchOnFailure(ctx, taskID, sessionID, foregroundDispatch)
 		return nil, err
 	}
-	session = claimedSession
-	s.startTurnForSession(ctx, sessionID)
+	// beginForegroundDispatch atomically established foreground-generating
+	// ownership before any cleanup/provider event could interleave. Publish that
+	// flip now that session admission succeeded; claimed RUNNING prompts also need
+	// the broadcast because their earlier atomic claim made the same transition.
+	if foregroundDispatch.yieldedBeforeBegin || foregroundClaim != nil {
+		s.publishForegroundActivityChanged(ctx, taskID, sessionID)
+	}
 
 	// Use context.WithoutCancel to prevent WebSocket request timeout from canceling the prompt.
 	// Prompts can take a long time (minutes) while the WS request may timeout in 15 seconds.
 	// We still want to log and respond, but the prompt should continue regardless.
 	promptCtx := context.WithoutCancel(ctx)
-	result, err := s.executor.Prompt(promptCtx, taskID, sessionID, effectivePrompt, attachments, dispatchOnly, session)
+	result, err := s.executor.PromptWithDispatchCallback(
+		promptCtx, taskID, sessionID, effectivePrompt, attachments, dispatchOnly,
+		func() {
+			if s.acceptForegroundDispatch(foregroundDispatch) {
+				s.publishForegroundActivityChanged(promptCtx, taskID, sessionID)
+			}
+		}, session,
+	)
 	if err != nil {
-		return s.handlePromptDispatchFailure(ctx, taskID, sessionID, prompt, planMode, resumedForPrompt, attachments, previousSessionState, err)
+		s.rollbackForegroundDispatchOnFailure(ctx, taskID, sessionID, foregroundDispatch)
+		return s.handlePromptDispatchFailure(
+			ctx, taskID, sessionID, prompt, planMode, resumedForPrompt,
+			attachments, rollback, lifecyclePrompt, err,
+		)
 	}
 	return &PromptResult{
 		StopReason:   result.StopReason,
 		AgentMessage: result.AgentMessage,
 	}, nil
+}
+
+func (s *Service) validatePromptTaskStart(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session_id is required")
+	}
+	if s.isSessionResetInProgress(sessionID) {
+		return ErrSessionResetInProgress
+	}
+	return nil
+}
+
+func (s *Service) logPromptTaskCall(
+	taskID, sessionID, prompt, model string,
+	planMode bool,
+	attachments []v1.MessageAttachment,
+	dispatchOnly bool,
+) {
+	s.logger.Debug("PromptTask called",
+		zap.String("task_id", taskID),
+		zap.String("session_id", sessionID),
+		zap.Int("prompt_length", len(prompt)),
+		zap.String("requested_model", model),
+		zap.Bool("plan_mode", planMode),
+		zap.Int("attachments_count", len(attachments)),
+		zap.Bool("dispatch_only", dispatchOnly))
+}
+
+func (s *Service) loadPromptableSession(ctx context.Context, taskID, sessionID string) (*models.TaskSession, error) {
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
+	if promptErr := s.checkSessionPromptable(taskID, sessionID, session.State); promptErr != nil {
+		if !errors.Is(promptErr, ErrSessionNotPromptable) || session.State != models.TaskSessionStateStarting {
+			return nil, promptErr
+		}
+		return s.waitForStartingSessionPromptable(ctx, taskID, sessionID)
+	}
+	return session, nil
+}
+
+// claimForegroundForPrompt serializes two callers racing to take the
+// background-idle foreground turn. For non-experiment RUNNING sessions,
+// checkSessionPromptable already rejects the prompt before this helper is reached.
+func (s *Service) claimForegroundForPrompt(taskID, sessionID string, session *models.TaskSession) (*foregroundClaim, error) {
+	if session.State != models.TaskSessionStateRunning {
+		return nil, nil
+	}
+	claim := s.claimForegroundTurn(sessionID)
+	if claim != nil {
+		return claim, nil
+	}
+	s.logger.Warn("rejected prompt: another prompt claimed the background-idle foreground turn first",
+		zap.String("task_id", taskID),
+		zap.String("session_id", sessionID))
+	return nil, fmt.Errorf("%w, please wait for completion", ErrAgentPromptInProgress)
+}
+
+func (s *Service) releaseForegroundClaimOnFailure(ctx context.Context, taskID, sessionID string, claim *foregroundClaim) {
+	if s.releaseForegroundClaim(claim) {
+		s.publishForegroundActivityChanged(ctx, taskID, sessionID)
+	}
+}
+
+func (s *Service) rollbackForegroundDispatchOnFailure(
+	ctx context.Context,
+	taskID, sessionID string,
+	dispatch *foregroundDispatch,
+) {
+	if s.rollbackForegroundDispatch(dispatch) {
+		s.publishForegroundActivityChanged(ctx, taskID, sessionID)
+	}
+}
+
+// trySwitchModelForPrompt keeps foreground admission consistent when a model
+// switch either dispatches the prompt itself or fails before reaching the agent.
+func (s *Service) trySwitchModelForPrompt(ctx context.Context, taskID, sessionID, model, prompt string, session *models.TaskSession, dispatch *foregroundDispatch) (*PromptResult, bool, error) {
+	result, switched, err := s.trySwitchModel(ctx, taskID, sessionID, model, prompt, session)
+	if !switched && err == nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		s.rollbackForegroundDispatchOnFailure(ctx, taskID, sessionID, dispatch)
+		return result, true, err
+	}
+	revealedBackground := s.acceptForegroundDispatch(dispatch)
+	if revealedBackground || dispatch.yieldedBeforeBegin || s.acceptedForegroundDispatchClaim(dispatch) {
+		s.publishForegroundActivityChanged(ctx, taskID, sessionID)
+	}
+	return result, true, nil
+}
+
+type promptClaimRollback struct {
+	previousSessionState models.TaskSessionState
+	previousTaskState    v1.TaskState
+	taskStateClaimed     bool
+	turnID               string
+	createdTurn          bool
+}
+
+func (s *Service) claimPromptDispatch(
+	ctx context.Context,
+	taskID, sessionID, claimEntryID string,
+	lifecyclePrompt bool,
+	afterClaim func() error,
+	session *models.TaskSession,
+	foregroundClaim *foregroundClaim,
+) (*models.TaskSession, promptClaimRollback, error) {
+	if lifecyclePrompt {
+		return s.claimLifecyclePromptDispatch(
+			ctx, taskID, sessionID, claimEntryID, afterClaim,
+		)
+	}
+	rollback := promptClaimRollback{previousSessionState: session.State}
+	claimed, err := s.claimSessionRunningForPrompt(
+		ctx, taskID, sessionID, claimEntryID, session, foregroundClaim,
+	)
+	if err != nil {
+		return nil, promptClaimRollback{}, err
+	}
+	rollback.turnID, rollback.createdTurn = s.startTurnForSessionWithOwnership(ctx, sessionID)
+	return claimed, rollback, nil
+}
+
+func (s *Service) claimLifecyclePromptDispatch(
+	ctx context.Context,
+	taskID, sessionID, claimEntryID string,
+	afterClaim func() error,
+) (*models.TaskSession, promptClaimRollback, error) {
+	session, previousSessionState, err := s.claimLifecycleSessionRunning(
+		ctx, taskID, sessionID, claimEntryID,
+	)
+	if err != nil {
+		return nil, promptClaimRollback{}, err
+	}
+	rollback := promptClaimRollback{previousSessionState: previousSessionState}
+	rollback.previousTaskState, rollback.taskStateClaimed, err = s.reconcileLifecycleClaim(
+		ctx, taskID, sessionID, previousSessionState, session,
+	)
+	if err != nil {
+		return nil, promptClaimRollback{}, err
+	}
+	rollback.turnID, rollback.createdTurn = s.startTurnForSessionWithOwnership(ctx, sessionID)
+	if err := s.acknowledgePromptClaim(ctx, taskID, sessionID, afterClaim, rollback); err != nil {
+		return nil, promptClaimRollback{}, err
+	}
+	return session, rollback, nil
+}
+
+func (s *Service) acknowledgePromptClaim(
+	ctx context.Context,
+	taskID, sessionID string,
+	afterClaim func() error,
+	rollback promptClaimRollback,
+) error {
+	if afterClaim == nil {
+		return nil
+	}
+	if err := afterClaim(); err != nil {
+		s.rollbackPromptClaim(ctx, taskID, sessionID, rollback)
+		if errors.Is(err, errLifecyclePromptReservationSuperseded) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", errLifecyclePromptMessagePersistence, err)
+	}
+	return nil
+}
+
+func (s *Service) rollbackPromptClaim(
+	ctx context.Context,
+	taskID, sessionID string,
+	rollback promptClaimRollback,
+) {
+	s.restoreLifecycleClaim(ctx, taskID, sessionID, rollback.previousSessionState)
+	if rollback.taskStateClaimed {
+		s.restoreLifecycleTaskState(ctx, taskID, rollback.previousTaskState)
+	}
+	if rollback.createdTurn {
+		s.completeTurnIfCurrent(ctx, sessionID, rollback.turnID)
+	}
+}
+
+// reconcileLifecycleClaim makes the atomic SQLite RUNNING claim observable to
+// the task runtime before a lifecycle prompt creates visible work or reaches
+// the executor.
+func (s *Service) reconcileLifecycleClaim(
+	ctx context.Context,
+	taskID, sessionID string,
+	previousState models.TaskSessionState,
+	session *models.TaskSession,
+) (v1.TaskState, bool, error) {
+	previousTaskState, taskStateClaimed, err := s.claimLifecycleTaskState(ctx, taskID, sessionID)
+	if err != nil {
+		s.restoreLifecycleClaim(ctx, taskID, sessionID, previousState)
+		return "", false, fmt.Errorf("%w: reconcile lifecycle task state: %v", errLifecyclePromptClaim, err)
+	}
+	if session == nil || session.State != models.TaskSessionStateRunning {
+		s.restoreLifecycleClaim(ctx, taskID, sessionID, previousState)
+		if taskStateClaimed {
+			s.restoreLifecycleTaskState(ctx, taskID, previousTaskState)
+		}
+		return "", false, fmt.Errorf("%w: lifecycle claim no longer owns running session", errLifecyclePromptClaim)
+	}
+	s.publishTaskSessionStateChanged(
+		ctx, taskID, sessionID, previousState, models.TaskSessionStateRunning,
+		"", &session.UpdatedAt, session,
+	)
+	return previousTaskState, taskStateClaimed, nil
+}
+
+func (s *Service) claimLifecycleTaskState(
+	ctx context.Context,
+	taskID, sessionID string,
+) (v1.TaskState, bool, error) {
+	s.taskRuntimeStateMu.Lock()
+	defer s.taskRuntimeStateMu.Unlock()
+
+	task, err := s.repo.GetTask(ctx, taskID)
+	if err != nil {
+		return "", false, err
+	}
+	if task == nil || taskArchived(task) || task.AssigneeAgentProfileID != "" {
+		return "", false, nil
+	}
+	taskState, err := s.taskRepo.GetTask(ctx, taskID)
+	if err != nil {
+		return "", false, err
+	}
+	previousTaskState := task.State
+	if taskState != nil {
+		previousTaskState = taskState.State
+	}
+	session, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil {
+		return "", false, err
+	}
+	if !runtimeSessionOwnsTaskState(session, v1.TaskStateInProgress) {
+		return previousTaskState, false, nil
+	}
+	updated, err := s.taskRepo.UpdateTaskStateIfSessionState(
+		ctx, taskID, sessionID, session.State, v1.TaskStateInProgress,
+	)
+	if err != nil {
+		return "", false, err
+	}
+	return previousTaskState, updated, nil
+}
+
+func (s *Service) restoreLifecycleTaskState(
+	ctx context.Context,
+	taskID string,
+	previousState v1.TaskState,
+) {
+	if previousState == "" {
+		return
+	}
+	updated, err := s.taskRepo.UpdateTaskStateIfCurrentIn(
+		ctx, taskID, previousState, []v1.TaskState{v1.TaskStateInProgress},
+	)
+	if err != nil {
+		s.logger.Error("failed to restore task state after lifecycle prompt rejection",
+			zap.String("task_id", taskID),
+			zap.String("previous_state", string(previousState)),
+			zap.Error(err))
+		return
+	}
+	if !updated {
+		s.logger.Debug("skipped lifecycle task-state restore after concurrent transition",
+			zap.String("task_id", taskID),
+			zap.String("previous_state", string(previousState)))
+	}
 }
 
 // handlePromptDispatchFailure handles a failed executor.Prompt call from
@@ -2573,18 +3368,32 @@ func (s *Service) promptTask(ctx context.Context, taskID, sessionID string, prom
 // it falls back to a fresh launch instead of surfacing the error to the
 // caller. Otherwise — or if that fallback launch itself fails — it
 // delegates to handlePromptError for the caller-facing result.
-func (s *Service) handlePromptDispatchFailure(ctx context.Context, taskID, sessionID, prompt string, planMode, resumedForPrompt bool, attachments []v1.MessageAttachment, previousSessionState models.TaskSessionState, promptErr error) (*PromptResult, error) {
+func (s *Service) handlePromptDispatchFailure(
+	ctx context.Context,
+	taskID, sessionID, prompt string,
+	planMode, resumedForPrompt bool,
+	attachments []v1.MessageAttachment,
+	rollback promptClaimRollback,
+	lifecyclePrompt bool,
+	promptErr error,
+) (*PromptResult, error) {
 	if resumedForPrompt && errors.Is(promptErr, executor.ErrExecutionNotFound) {
 		s.logger.Warn("prompt after lazy resume hit missing execution; falling back to fresh launch",
 			zap.String("task_id", taskID),
 			zap.String("session_id", sessionID))
-		if freshErr := s.fallbackFreshLaunchOnMissingExecution(ctx, taskID, sessionID, prompt, planMode, nil, attachments); freshErr == nil {
+		if freshErr := s.fallbackFreshLaunchOnMissingExecution(
+			ctx, taskID, sessionID, prompt, planMode, nil, attachments, nil,
+		); freshErr == nil {
 			return &PromptResult{}, nil
 		} else {
 			promptErr = freshErr
 		}
 	}
-	return nil, s.handlePromptError(ctx, taskID, sessionID, previousSessionState, promptErr)
+	if lifecyclePrompt {
+		s.rollbackPromptClaim(ctx, taskID, sessionID, rollback)
+		return nil, promptErr
+	}
+	return nil, s.handlePromptError(ctx, taskID, sessionID, rollback.previousSessionState, promptErr)
 }
 
 // effectivePromptForSession applies promptTask's config-mode and plan-mode
@@ -2603,6 +3412,21 @@ func (s *Service) effectivePromptForSession(sessionID, prompt string, planMode b
 		effectivePrompt = sysprompt.InjectPlanMode(effectivePrompt)
 	}
 	return effectivePrompt
+}
+
+var (
+	errLifecyclePromptInactive              = errors.New("lifecycle prompt task or session is inactive")
+	errLifecyclePromptClaim                 = errors.New("lifecycle prompt claim failed")
+	errLifecyclePromptMessagePersistence    = errors.New("lifecycle prompt message persistence failed")
+	errLifecyclePromptReservationSuperseded = errors.New("lifecycle prompt reservation was superseded")
+)
+
+type lifecyclePromptReselectedError struct {
+	sessionID string
+}
+
+func (e *lifecyclePromptReselectedError) Error() string {
+	return fmt.Sprintf("lifecycle prompt session reselected: %s", e.sessionID)
 }
 
 // claimSessionRunningForPrompt marks sessionID RUNNING immediately before
@@ -2627,7 +3451,12 @@ func (s *Service) effectivePromptForSession(sessionID, prompt string, planMode b
 // call near its top. Reloading the session and re-running
 // checkSessionPromptable here makes "is it actually still safe to mark this
 // session RUNNING right now" an atomic fact, not a stale read.
-func (s *Service) claimSessionRunningForPrompt(ctx context.Context, taskID, sessionID, claimEntryID string, session *models.TaskSession) (*models.TaskSession, error) {
+func (s *Service) claimSessionRunningForPrompt(
+	ctx context.Context,
+	taskID, sessionID, claimEntryID string,
+	session *models.TaskSession,
+	foregroundClaim *foregroundClaim,
+) (*models.TaskSession, error) {
 	lock, release := s.acquireCancelInFlightGuard(sessionID)
 	defer release()
 	lock.Lock()
@@ -2643,7 +3472,9 @@ func (s *Service) claimSessionRunningForPrompt(ctx context.Context, taskID, sess
 	if freshSession == nil {
 		return nil, errQueuedDispatchSuperseded
 	}
-	if promptErr := s.checkSessionPromptable(taskID, sessionID, freshSession.State); promptErr != nil {
+	if promptErr := s.recheckPromptableWithForegroundClaim(
+		taskID, sessionID, freshSession.State, foregroundClaim,
+	); promptErr != nil {
 		return nil, promptErr
 	}
 	s.setSessionRunning(ctx, taskID, sessionID, freshSession)
@@ -2669,6 +3500,98 @@ func (s *Service) claimSessionRunningForPrompt(ctx context.Context, taskID, sess
 	return freshSession, nil
 }
 
+func (s *Service) claimLifecycleSessionRunning(
+	ctx context.Context,
+	taskID, sessionID, claimEntryID string,
+) (*models.TaskSession, models.TaskSessionState, error) {
+	lock, release := s.acquireCancelInFlightGuard(sessionID)
+	defer release()
+	lock.Lock()
+	defer lock.Unlock()
+
+	if claimEntryID != "" && !s.isCurrentQueuedDispatch(sessionID, claimEntryID) {
+		return nil, "", errQueuedDispatchSuperseded
+	}
+	if err := s.validateLifecyclePromptSelection(ctx, taskID, sessionID); err != nil {
+		return nil, "", err
+	}
+	claim, err := s.repo.ClaimPromptableTaskSessionIfActive(ctx, sessionID)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", errLifecyclePromptClaim, err)
+	}
+	switch claim.Status {
+	case models.PromptableTaskSessionInactive:
+		return nil, "", errLifecyclePromptInactive
+	case models.PromptableTaskSessionBusy:
+		return nil, "", fmt.Errorf("%w: lifecycle prompt session is busy", ErrAgentPromptInProgress)
+	}
+	if claimEntryID != "" && !s.isCurrentQueuedDispatch(sessionID, claimEntryID) {
+		s.restoreLifecycleClaim(ctx, taskID, sessionID, claim.PreviousState)
+		return nil, "", errQueuedDispatchSuperseded
+	}
+	if s.isSessionResetInProgress(sessionID) {
+		s.restoreLifecycleClaim(ctx, taskID, sessionID, claim.PreviousState)
+		return nil, "", ErrSessionResetInProgress
+	}
+	freshSession, err := s.repo.GetTaskSession(ctx, sessionID)
+	if err != nil || freshSession == nil {
+		s.restoreLifecycleClaim(ctx, taskID, sessionID, claim.PreviousState)
+		return nil, "", errLifecyclePromptInactive
+	}
+	s.clearQueuedDispatchInFlightIfCurrent(sessionID, claimEntryID)
+	return freshSession, claim.PreviousState, nil
+}
+
+func (s *Service) validateLifecyclePromptSelection(
+	ctx context.Context,
+	taskID, sessionID string,
+) error {
+	selectedSession, err := s.resolveTaskPRAgentSession(ctx, taskID)
+	if err != nil || selectedSession == nil {
+		task, taskErr := s.repo.GetTask(ctx, taskID)
+		if taskErr != nil || task == nil || task.ArchivedAt != nil {
+			return errLifecyclePromptInactive
+		}
+		return fmt.Errorf("%w: no promptable lifecycle session", ErrAgentPromptInProgress)
+	}
+	if selectedSession.ID != sessionID {
+		return &lifecyclePromptReselectedError{sessionID: selectedSession.ID}
+	}
+	return nil
+}
+
+func (s *Service) restoreLifecycleClaim(
+	ctx context.Context,
+	taskID, sessionID string,
+	previousState models.TaskSessionState,
+) {
+	s.updateTaskSessionState(ctx, taskID, sessionID, previousState, "", false)
+}
+
+func (s *Service) recheckPromptableWithForegroundClaim(
+	taskID, sessionID string,
+	state models.TaskSessionState,
+	claim *foregroundClaim,
+) error {
+	if claim == nil {
+		return s.checkSessionPromptable(taskID, sessionID, state)
+	}
+	if state != models.TaskSessionStateRunning {
+		// ensureSessionRunning may resume the agent after this prompt claimed a
+		// background-idle RUNNING session. AgentBootReady advances the durable
+		// state to WAITING_FOR_INPUT before dispatch; keep the valid claim across
+		// that expected transition while still rejecting terminal or otherwise
+		// non-promptable states.
+		if err := s.checkSessionPromptable(taskID, sessionID, state); err != nil {
+			return err
+		}
+	}
+	if !s.isForegroundClaimCurrent(sessionID, claim) {
+		return fmt.Errorf("%w, please wait for completion", ErrAgentPromptInProgress)
+	}
+	return nil
+}
+
 // checkSessionPromptable returns nil when the session's state accepts a new
 // prompt. RUNNING is rejected with ErrAgentPromptInProgress; any other
 // non-acceptable state (STARTING / CREATED / FAILED / CANCELLED) is rejected
@@ -2684,6 +3607,16 @@ func (s *Service) checkSessionPromptable(taskID, sessionID string, state models.
 		models.TaskSessionStateIdle:
 		return nil
 	case models.TaskSessionStateRunning:
+		// The safe default is coarse: every RUNNING session is busy. A
+		// deployment may explicitly opt a persisted Claude Code session into
+		// ADR-0049's adapter-attested background handoff experiment. Every
+		// missing identity and non-Claude provider still fails closed.
+		if s.ForegroundActivity(sessionID) == v1.ForegroundActivityBackground {
+			s.logger.Debug("accepting prompt: enabled Claude foreground handoff is background-idle",
+				zap.String("task_id", taskID),
+				zap.String("session_id", sessionID))
+			return nil
+		}
 		s.logger.Warn("rejected prompt while agent is already running",
 			zap.String("task_id", taskID),
 			zap.String("session_id", sessionID),
@@ -2785,6 +3718,10 @@ func (s *Service) trySwitchModel(ctx context.Context, taskID, sessionID, model, 
 
 // RespondToPermission sends a response to a permission request for a session
 func (s *Service) RespondToPermission(ctx context.Context, sessionID, pendingID, optionID string, cancelled, rejected bool) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	s.logger.Debug("responding to permission request",
 		zap.String("session_id", sessionID),
 		zap.String("pending_id", pendingID),
@@ -2950,6 +3887,10 @@ func (s *Service) isCancelInFlight(sessionID string) bool {
 // turn) so the user can unstick a session whose agent subprocess crashed. Other errors
 // still fail the cancel.
 func (s *Service) CancelAgent(ctx context.Context, sessionID string) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	s.logger.Debug("cancelling agent turn", zap.String("session_id", sessionID))
 
 	// Deduplicate concurrent retries. The UI's cancel button has no in-flight
@@ -3305,6 +4246,10 @@ func (s *Service) CompleteTask(ctx context.Context, taskID string) error {
 // ResetAgentContext resets the agent's conversation context for a session,
 // clearing conversation history while preserving the workspace environment.
 func (s *Service) ResetAgentContext(ctx context.Context, sessionID string) error {
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	session, err := s.repo.GetTaskSession(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("session not found: %w", err)

@@ -550,6 +550,7 @@ func TestParseGitRemoteIdentityPreservesOriginAndFullSubgroupPath(t *testing.T) 
 		{"self-managed HTTPS", "https://gitlab.internal/group/subgroup/project", "https://gitlab.internal", "group/subgroup/project"},
 		{"SSH URL", "ssh://git@gitlab.internal/group/subgroup/project.git", "ssh://gitlab.internal", "group/subgroup/project"},
 		{"SCP SSH", "git@gitlab.internal:group/subgroup/project.git", "ssh://gitlab.internal", "group/subgroup/project"},
+		{"SCP SSH bracketed IPv6", "git@[::1]:group/subgroup/project.git", "ssh://[::1]", "group/subgroup/project"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -677,13 +678,15 @@ func newDiscoveryService(t *testing.T, root string) *Service {
 
 // stubRemoteLister captures the call args and returns canned branches/err.
 type stubRemoteLister struct {
-	branches []Branch
-	err      error
-	calls    int
+	branches    []Branch
+	err         error
+	calls       int
+	workspaceID string
 }
 
-func (s *stubRemoteLister) ListRepoBranches(_ context.Context, _, _ string) ([]Branch, error) {
+func (s *stubRemoteLister) ListRepoBranches(_ context.Context, workspaceID, _, _ string) ([]Branch, error) {
 	s.calls++
+	s.workspaceID = workspaceID
 	return s.branches, s.err
 }
 
@@ -723,6 +726,9 @@ func TestListBranches_RoutesProviderRepoToRemoteLister(t *testing.T) {
 	}
 	if lister.calls != 1 {
 		t.Fatalf("remote lister calls = %d, want 1", lister.calls)
+	}
+	if lister.workspaceID != "ws-1" {
+		t.Fatalf("remote lister workspace = %q, want ws-1", lister.workspaceID)
 	}
 	if len(got) != 2 || got[0].Name != "main" || got[1].Name != "develop" {
 		t.Fatalf("unexpected branches: %+v", got)

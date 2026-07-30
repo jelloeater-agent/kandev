@@ -29,17 +29,30 @@ type ChipURLChange = (
   source: "picker" | "paste",
   metadata?: { provider: "github" | "gitlab"; fullName: string; defaultBranch: string },
 ) => void;
+const PICKER_URL = vi.hoisted(() => "https://github.com/acme/site");
+const REMOTE_REPO_CHIP_TEST_ID = "remote-repo-chip";
+const SELECTED_IDENTITIES_ATTRIBUTE = "data-selected-repository-identities";
 vi.mock("./task-create-dialog-remote-repo-chip", () => ({
+  selectedRemoteRepositoryIdentity: (row: TaskRemoteRepoRow) =>
+    row.provider && row.providerRepoId ? `${row.provider}:id:${row.providerRepoId}` : undefined,
   RemoteRepoChip: ({
     row,
     onRemove,
     onURLChange,
+    onRetry,
+    selectedRepositoryIdentities = [],
   }: {
     row: TaskRemoteRepoRow;
     onRemove: () => void;
     onURLChange: ChipURLChange;
+    onRetry?: () => void;
+    selectedRepositoryIdentities?: string[];
   }) => (
-    <div data-testid="remote-repo-chip" data-url={row.url}>
+    <div
+      data-testid={REMOTE_REPO_CHIP_TEST_ID}
+      data-url={row.url}
+      {...{ [SELECTED_IDENTITIES_ATTRIBUTE]: selectedRepositoryIdentities.join(",") }}
+    >
       <span data-testid="remote-repo-chip-url">{row.url}</span>
       <button type="button" data-testid="remote-chip-remove" onClick={onRemove}>
         x
@@ -48,7 +61,7 @@ vi.mock("./task-create-dialog-remote-repo-chip", () => ({
         type="button"
         data-testid="remote-chip-fire-picker"
         onClick={() =>
-          onURLChange("https://github.com/acme/site", "picker", {
+          onURLChange(PICKER_URL, "picker", {
             provider: "github",
             fullName: "acme/site",
             defaultBranch: "trunk",
@@ -64,6 +77,11 @@ vi.mock("./task-create-dialog-remote-repo-chip", () => ({
       >
         paste
       </button>
+      {onRetry ? (
+        <button type="button" data-testid="remote-chip-retry" onClick={onRetry}>
+          retry
+        </button>
+      ) : null}
     </div>
   ),
 }));
@@ -79,6 +97,7 @@ function makeBranchesByUrl(ensure = vi.fn()) {
   return {
     branches: () => [],
     loading: () => false,
+    error: () => undefined,
     ensure,
     clear: () => undefined,
   };
@@ -88,6 +107,7 @@ function makePrInfoByUrl(ensure = vi.fn()) {
   return {
     info: () => undefined,
     loading: () => false,
+    error: () => undefined,
     ensure,
     clear: () => undefined,
   };
@@ -106,7 +126,148 @@ function renderInProvider(ui: Parameters<typeof render>[0]) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
-describe("RemoteRepoChipsRow", () => {
+// eslint-disable-next-line max-lines-per-function -- groups related identity transitions.
+describe("RemoteRepoChipsRow identity tracking", () => {
+  it("passes another row's provider/id identity to the current chip", () => {
+    const fs = makeFs({
+      remoteRepos: [
+        {
+          key: "remote-0",
+          url: PICKER_URL,
+          branch: "main",
+          source: "picker",
+          provider: "github",
+          providerRepoId: "site-id",
+        },
+        { key: "remote-1", url: "", branch: "", source: "paste" },
+      ],
+    });
+    renderInProvider(
+      <RemoteRepoChipsRow
+        workspaceId="ws-1"
+        fs={fs}
+        onUpdateRow={vi.fn()}
+        onAddRow={vi.fn()}
+        onRemoveRow={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen
+        .getAllByTestId(REMOTE_REPO_CHIP_TEST_ID)[1]
+        ?.getAttribute(SELECTED_IDENTITIES_ATTRIBUTE),
+    ).toBe("github:id:site-id");
+  });
+
+  it("excludes the current row and clears another row's identity after it changes or is removed", () => {
+    const initial = makeFs({
+      remoteRepos: [
+        {
+          key: "remote-0",
+          url: PICKER_URL,
+          branch: "main",
+          source: "picker",
+          provider: "github",
+          providerRepoId: "site-id",
+        },
+        {
+          key: "remote-1",
+          url: "https://github.com/acme/docs",
+          branch: "main",
+          source: "picker",
+          provider: "github",
+          providerRepoId: "docs-id",
+        },
+      ],
+    });
+    const { rerender } = renderInProvider(
+      <RemoteRepoChipsRow
+        workspaceId="ws-1"
+        fs={initial}
+        onUpdateRow={vi.fn()}
+        onAddRow={vi.fn()}
+        onRemoveRow={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen
+        .getAllByTestId(REMOTE_REPO_CHIP_TEST_ID)[0]
+        ?.getAttribute(SELECTED_IDENTITIES_ATTRIBUTE),
+    ).toBe("github:id:docs-id");
+    expect(
+      screen
+        .getAllByTestId(REMOTE_REPO_CHIP_TEST_ID)[1]
+        ?.getAttribute(SELECTED_IDENTITIES_ATTRIBUTE),
+    ).toBe("github:id:site-id");
+
+    rerender(
+      <TooltipProvider>
+        <RemoteRepoChipsRow
+          workspaceId="ws-1"
+          fs={makeFs({
+            remoteRepos: [
+              initial.remoteRepos[0]!,
+              { ...initial.remoteRepos[1]!, providerRepoId: "other-id" },
+            ],
+          })}
+          onUpdateRow={vi.fn()}
+          onAddRow={vi.fn()}
+          onRemoveRow={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    expect(
+      screen
+        .getAllByTestId(REMOTE_REPO_CHIP_TEST_ID)[0]
+        ?.getAttribute(SELECTED_IDENTITIES_ATTRIBUTE),
+    ).toBe("github:id:other-id");
+
+    rerender(
+      <TooltipProvider>
+        <RemoteRepoChipsRow
+          workspaceId="ws-1"
+          fs={makeFs({ remoteRepos: [initial.remoteRepos[0]!] })}
+          onUpdateRow={vi.fn()}
+          onAddRow={vi.fn()}
+          onRemoveRow={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    expect(
+      screen.getByTestId(REMOTE_REPO_CHIP_TEST_ID).getAttribute(SELECTED_IDENTITIES_ATTRIBUTE),
+    ).toBe("");
+  });
+});
+
+describe("RemoteRepoChipsRow controls", () => {
+  it("retries both resolution paths for the failed row", () => {
+    const branchEnsure = vi.fn();
+    const branchClear = vi.fn();
+    const prEnsure = vi.fn();
+    const prClear = vi.fn();
+    const fs = makeFs({
+      remoteRepos: [{ key: "remote-0", url: URL_AB, branch: "main", source: "paste" }],
+      branchesByUrl: {
+        ...makeBranchesByUrl(branchEnsure),
+        error: () => new Error("GitHub failed"),
+        clear: branchClear,
+      },
+      prInfoByUrl: { ...makePrInfoByUrl(prEnsure), clear: prClear },
+    });
+    renderInProvider(
+      <RemoteRepoChipsRow fs={fs} onUpdateRow={vi.fn()} onAddRow={vi.fn()} onRemoveRow={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByTestId("remote-chip-retry"));
+    expect(branchClear).toHaveBeenCalledWith(URL_AB);
+    expect(prClear).toHaveBeenCalledWith(URL_AB);
+    expect(branchEnsure).toHaveBeenLastCalledWith(URL_AB);
+    expect(prEnsure).toHaveBeenLastCalledWith(URL_AB);
+  });
+});
+
+describe("RemoteRepoChipsRow controls", () => {
   it("renders one chip per row in fs.remoteRepos", () => {
     const fs = makeFs({
       remoteRepos: [
@@ -115,15 +276,27 @@ describe("RemoteRepoChipsRow", () => {
       ],
     });
     renderInProvider(
-      <RemoteRepoChipsRow fs={fs} onUpdateRow={vi.fn()} onAddRow={vi.fn()} onRemoveRow={vi.fn()} />,
+      <RemoteRepoChipsRow
+        workspaceId="ws-1"
+        fs={fs}
+        onUpdateRow={vi.fn()}
+        onAddRow={vi.fn()}
+        onRemoveRow={vi.fn()}
+      />,
     );
-    expect(screen.getAllByTestId("remote-repo-chip")).toHaveLength(2);
+    expect(screen.getAllByTestId(REMOTE_REPO_CHIP_TEST_ID)).toHaveLength(2);
   });
 
   it("renders a placeholder chip when remoteRepos is empty", () => {
     const fs = makeFs({ remoteRepos: [] });
     renderInProvider(
-      <RemoteRepoChipsRow fs={fs} onUpdateRow={vi.fn()} onAddRow={vi.fn()} onRemoveRow={vi.fn()} />,
+      <RemoteRepoChipsRow
+        workspaceId="ws-1"
+        fs={fs}
+        onUpdateRow={vi.fn()}
+        onAddRow={vi.fn()}
+        onRemoveRow={vi.fn()}
+      />,
     );
     // Defends against the seed-effect edge case — at minimum, the add button
     // must be available so the user can add a row from nothing.
@@ -134,6 +307,7 @@ describe("RemoteRepoChipsRow", () => {
     const onAddRow = vi.fn();
     renderInProvider(
       <RemoteRepoChipsRow
+        workspaceId="ws-1"
         fs={makeFs({
           remoteRepos: [{ key: "remote-0", url: "", branch: "", source: "paste" }],
         })}
@@ -150,6 +324,7 @@ describe("RemoteRepoChipsRow", () => {
     const onRemoveRow = vi.fn();
     renderInProvider(
       <RemoteRepoChipsRow
+        workspaceId="ws-1"
         fs={makeFs({
           remoteRepos: [
             { key: "remote-0", url: URL_AB, branch: "", source: "paste" },
@@ -176,10 +351,16 @@ describe("RemoteRepoChipsRow", () => {
       branchesByUrl: makeBranchesByUrl(ensure),
     });
     renderInProvider(
-      <RemoteRepoChipsRow fs={fs} onUpdateRow={vi.fn()} onAddRow={vi.fn()} onRemoveRow={vi.fn()} />,
+      <RemoteRepoChipsRow
+        workspaceId="ws-1"
+        fs={fs}
+        onUpdateRow={vi.fn()}
+        onAddRow={vi.fn()}
+        onRemoveRow={vi.fn()}
+      />,
     );
-    expect(ensure).toHaveBeenCalledWith(URL_AB, "");
-    expect(ensure).toHaveBeenCalledWith(URL_CD, "");
+    expect(ensure).toHaveBeenCalledWith(URL_AB);
+    expect(ensure).toHaveBeenCalledWith(URL_CD);
     expect(ensure).not.toHaveBeenCalledWith("");
   });
 });
@@ -189,6 +370,7 @@ describe("RemoteRepoChipsRow — onURLChange wiring", () => {
     const onUpdateRow = vi.fn();
     renderInProvider(
       <RemoteRepoChipsRow
+        workspaceId="ws-1"
         fs={makeFs({
           remoteRepos: [{ key: "remote-0", url: "", branch: "", source: "paste" }],
         })}
@@ -199,7 +381,7 @@ describe("RemoteRepoChipsRow — onURLChange wiring", () => {
     );
     fireEvent.click(screen.getByTestId("remote-chip-fire-picker"));
     expect(onUpdateRow).toHaveBeenCalledWith("remote-0", {
-      url: "https://github.com/acme/site",
+      url: PICKER_URL,
       source: "picker",
       provider: "github",
       fullName: "acme/site",
@@ -211,6 +393,7 @@ describe("RemoteRepoChipsRow — onURLChange wiring", () => {
     const onUpdateRow = vi.fn();
     renderInProvider(
       <RemoteRepoChipsRow
+        workspaceId="ws-1"
         fs={makeFs({
           remoteRepos: [{ key: "remote-0", url: "", branch: "", source: "paste" }],
         })}

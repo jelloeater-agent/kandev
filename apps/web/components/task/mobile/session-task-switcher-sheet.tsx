@@ -17,6 +17,7 @@ import { useSidebarTaskPrefs } from "@/hooks/domains/sidebar/use-sidebar-task-pr
 import { useRepositories } from "@/hooks/domains/workspace/use-repositories";
 import { WorkspaceSwitcher } from "../workspace-switcher";
 import { TaskCreateDialog } from "@/components/task-create-dialog";
+import { NewSubtaskDialog } from "../new-subtask-dialog";
 import { TaskArchiveConfirmDialog } from "../task-archive-confirm-dialog";
 import { TaskDeleteConfirmDialog } from "../task-delete-confirm-dialog";
 import { TaskDetachTargetConfirmDialog } from "../task-detach-confirm-dialog";
@@ -57,11 +58,13 @@ export function MobileTaskList({
   selectedTaskId,
   onSelectTask,
   onRenameTask,
+  onCreateSubtask,
   onArchiveTask,
   onDeleteTask,
   onDetachTask,
   onLinkPullRequest,
   onLinkIssue,
+  onLinkMergeRequest,
   onLinkJiraTicket,
   onLinkLinearIssue,
   onLinkSentryIssue,
@@ -75,11 +78,13 @@ export function MobileTaskList({
   selectedTaskId: string | null;
   onSelectTask: (taskId: string) => void;
   onRenameTask?: (taskId: string, currentTitle: string) => void;
+  onCreateSubtask?: (taskId: string, taskTitle: string) => void;
   onArchiveTask: (taskId: string) => void;
   onDeleteTask: (taskId: string) => Promise<void> | void;
   onDetachTask: (taskId: string) => Promise<void> | void;
   onLinkPullRequest?: (taskId: string, taskTitle?: string) => void;
   onLinkIssue?: (taskId: string, taskTitle?: string) => void;
+  onLinkMergeRequest?: (taskId: string, taskTitle?: string) => void;
   onLinkJiraTicket?: (taskId: string, taskTitle?: string) => void;
   onLinkLinearIssue?: (taskId: string, taskTitle?: string) => void;
   onLinkSentryIssue?: (taskId: string, taskTitle?: string) => void;
@@ -124,11 +129,13 @@ export function MobileTaskList({
       onToggleSubtasks={toggleSubtaskCollapsed}
       onSelectTask={onSelectTask}
       onRenameTask={onRenameTask}
+      onCreateSubtask={onCreateSubtask}
       onArchiveTask={onArchiveTask}
       onDeleteTask={onDeleteTask}
       onDetachTask={onDetachTask}
       onLinkPullRequest={onLinkPullRequest}
       onLinkIssue={onLinkIssue}
+      onLinkMergeRequest={onLinkMergeRequest}
       onLinkJiraTicket={onLinkJiraTicket}
       onLinkLinearIssue={onLinkLinearIssue}
       onLinkSentryIssue={onLinkSentryIssue}
@@ -237,11 +244,31 @@ type TaskSwitcherSurfaceContentProps = {
   onOpenChange: (open: boolean) => void;
   onQuickChat: () => void;
   onNewTask: () => void;
+  onCreateSubtask: (taskId: string, taskTitle: string) => void;
   data: ReturnType<typeof useSheetData>;
   actions: ReturnType<typeof useSheetActions>;
   rename: ReturnType<typeof useMobileTaskRename>;
   linking: ReturnType<typeof useMobileTaskLinking>;
 };
+
+function MobileSubtaskDialog({
+  target,
+  onTargetChange,
+}: {
+  target: { id: string; title: string } | null;
+  onTargetChange: (next: { id: string; title: string } | null) => void;
+}) {
+  return (
+    <NewSubtaskDialog
+      open={target !== null}
+      onOpenChange={(open) => {
+        if (!open) onTargetChange(null);
+      }}
+      parentTaskId={target?.id ?? ""}
+      parentTaskTitle={target?.title ?? ""}
+    />
+  );
+}
 
 function TaskSwitcherSurfaceContent({
   presentation,
@@ -249,6 +276,7 @@ function TaskSwitcherSurfaceContent({
   onOpenChange,
   onQuickChat,
   onNewTask,
+  onCreateSubtask,
   data,
   actions,
   rename,
@@ -276,6 +304,7 @@ function TaskSwitcherSurfaceContent({
           selectedTaskId={data.selectedTaskId}
           onSelectTask={actions.handleSelectTask}
           onRenameTask={surfaceAction(presentation, onOpenChange, rename.handleRenameTask)}
+          onCreateSubtask={onCreateSubtask}
           onArchiveTask={surfaceAction(presentation, onOpenChange, actions.handleArchiveTask)}
           onDeleteTask={surfaceAction(presentation, onOpenChange, actions.handleDeleteTask)}
           onDetachTask={surfaceAction(presentation, onOpenChange, actions.handleDetachTask)}
@@ -288,6 +317,11 @@ function TaskSwitcherSurfaceContent({
             presentation,
             onOpenChange,
             linking.taskListHandlers.onLinkIssue,
+          )}
+          onLinkMergeRequest={surfaceAction(
+            presentation,
+            onOpenChange,
+            linking.taskListHandlers.onLinkMergeRequest,
           )}
           onLinkJiraTicket={surfaceAction(
             presentation,
@@ -321,6 +355,8 @@ function TaskSwitcherDialogs({
   actions,
   rename,
   linking,
+  subtaskTarget,
+  onSubtaskTargetChange,
 }: {
   dialogOpen: boolean;
   onDialogOpenChange: (open: boolean) => void;
@@ -330,6 +366,8 @@ function TaskSwitcherDialogs({
   actions: ReturnType<typeof useSheetActions>;
   rename: ReturnType<typeof useMobileTaskRename>;
   linking: ReturnType<typeof useMobileTaskLinking>;
+  subtaskTarget: { id: string; title: string } | null;
+  onSubtaskTargetChange: (target: { id: string; title: string } | null) => void;
 }) {
   return (
     <>
@@ -343,6 +381,7 @@ function TaskSwitcherDialogs({
         steps={data.dialogSteps}
         onSuccess={actions.handleTaskCreated}
       />
+      <MobileSubtaskDialog target={subtaskTarget} onTargetChange={onSubtaskTargetChange} />
       <TaskArchiveConfirmDialog
         open={actions.archivingTask !== null}
         onOpenChange={(open) => {
@@ -396,6 +435,7 @@ export const SessionTaskSwitcherSheet = memo(function SessionTaskSwitcherSheet({
   presentation = "sheet",
 }: SessionTaskSwitcherSheetProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [subtaskTarget, setSubtaskTarget] = useState<{ id: string; title: string } | null>(null);
   const data = useSheetData(workspaceId);
   const actions = useSheetActions(workspaceId, onOpenChange);
   const rename = useMobileTaskRename();
@@ -405,6 +445,13 @@ export const SessionTaskSwitcherSheet = memo(function SessionTaskSwitcherSheet({
     onOpenChange(false);
     openQuickChat();
   }, [onOpenChange, openQuickChat]);
+  const handleCreateSubtask = useCallback(
+    (taskId: string, taskTitle: string) => {
+      onOpenChange(false);
+      setSubtaskTarget({ id: taskId, title: taskTitle });
+    },
+    [onOpenChange],
+  );
 
   const surfaceContent = (
     <TaskSwitcherSurfaceContent
@@ -412,6 +459,7 @@ export const SessionTaskSwitcherSheet = memo(function SessionTaskSwitcherSheet({
       workspaceId={workspaceId}
       onOpenChange={onOpenChange}
       onQuickChat={handleQuickChat}
+      onCreateSubtask={handleCreateSubtask}
       onNewTask={() => {
         if (presentation === "drawer") onOpenChange(false);
         setDialogOpen(true);
@@ -454,6 +502,8 @@ export const SessionTaskSwitcherSheet = memo(function SessionTaskSwitcherSheet({
         actions={actions}
         rename={rename}
         linking={linking}
+        subtaskTarget={subtaskTarget}
+        onSubtaskTargetChange={setSubtaskTarget}
       />
     </>
   );

@@ -25,6 +25,7 @@ import (
 	"github.com/kandev/kandev/internal/sysprompt"
 	"github.com/kandev/kandev/internal/task/dto"
 	"github.com/kandev/kandev/internal/task/models"
+	taskrepository "github.com/kandev/kandev/internal/task/repository"
 	taskrepo "github.com/kandev/kandev/internal/task/repository/sqlite"
 	"github.com/kandev/kandev/internal/task/service"
 	usermodels "github.com/kandev/kandev/internal/user/models"
@@ -41,6 +42,21 @@ type ClarificationService interface {
 	CreateRequest(req *clarification.Request) (string, bool)
 	WaitForResponse(ctx context.Context, pendingID string) (*clarification.Response, error)
 	CancelRequest(pendingID string) bool
+}
+
+type workspaceSourceJSON struct {
+	Kind           string `json:"kind"`
+	RepositoryID   string `json:"repository_id"`
+	LocalPath      string `json:"local_path"`
+	GitHubURL      string `json:"github_url"`
+	RemoteURL      string `json:"remote_url"`
+	Provider       string `json:"provider"`
+	ProviderRepoID string `json:"provider_repo_id"`
+	ProviderOwner  string `json:"provider_owner"`
+	ProviderName   string `json:"provider_name"`
+	BaseBranch     string `json:"base_branch"`
+	CheckoutBranch string `json:"checkout_branch"`
+	DisplayName    string `json:"display_name"`
 }
 
 // SessionCanceller detaches in-memory clarification waiters while keeping DB
@@ -112,7 +128,7 @@ type EventBus interface {
 type SessionLauncher interface {
 	LaunchSession(ctx context.Context, req *orchestrator.LaunchSessionRequest) (*orchestrator.LaunchSessionResponse, error)
 	PromptTask(ctx context.Context, taskID, sessionID, prompt, model string, planMode bool, attachments []v1.MessageAttachment, dispatchOnly bool) (*orchestrator.PromptResult, error)
-	StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment) (*executor.TaskExecution, error)
+	StartCreatedSession(ctx context.Context, taskID, sessionID, agentProfileID, prompt string, skipMessageRecord, planMode, autoStart bool, attachments []v1.MessageAttachment, references []v1.EntityReference) (*executor.TaskExecution, error)
 	ResumeTaskSession(ctx context.Context, taskID, sessionID string) (*executor.TaskExecution, error)
 	ProcessOnTurnStart(ctx context.Context, taskID, sessionID string) error
 	GetMessageQueue() *messagequeue.Service
@@ -196,6 +212,14 @@ type Handlers struct {
 	// Optional PR lister (set via SetTaskPRLister) used to enrich
 	// task-listing responses with associated pull requests.
 	taskPRLister TaskPRLister
+	// Native code review (optional, set via SetReviewService /
+	// SetReviewRunner). Without them the review actions are simply not
+	// registered — see registerReviewHandlers.
+	reviewService *service.ReviewService
+	reviewRunner  ReviewRunner
+
+	// Optional task-bound GitHub PR automation controls.
+	taskPRAutomation TaskPRAutomationService
 }
 
 // NewHandlers creates new MCP handlers.
@@ -280,7 +304,10 @@ func (h *Handlers) RegisterHandlers(d *ws.Dispatcher) {
 	d.RegisterFunc(ws.ActionMCPListTasks, h.handleListTasks)
 	d.RegisterFunc(ws.ActionMCPCreateTask, h.handleCreateTask)
 	d.RegisterFunc(ws.ActionMCPUpdateTask, h.handleUpdateTask)
+	d.RegisterFunc(ws.ActionMCPGetTaskPRAutomation, h.handleGetTaskPRAutomation)
+	d.RegisterFunc(ws.ActionMCPUpdateTaskPRAutomation, h.handleUpdateTaskPRAutomation)
 	d.RegisterFunc(ws.ActionMCPAddBranchToTask, h.handleAddBranchToTask)
+	d.RegisterFunc(ws.ActionMCPAddWorkspaceSources, h.handleAddWorkspaceSources)
 	d.RegisterFunc(ws.ActionMCPUpdateRepositoryBaseBranch, h.handleUpdateRepositoryBaseBranch)
 	d.RegisterFunc(ws.ActionMCPStepComplete, h.handleStepComplete)
 	d.RegisterFunc(ws.ActionMCPMessageTask, h.handleMessageTask)
@@ -302,6 +329,8 @@ func (h *Handlers) RegisterHandlers(d *ws.Dispatcher) {
 	d.RegisterFunc(ws.ActionTaskWalkthroughDelete, h.handleDeleteWalkthrough)
 	d.RegisterFunc(ws.ActionMCPClarificationTimeout, h.handleClarificationTimeout)
 	count := 25
+	count += h.registerReviewHandlers(d)
+	count += 2 // task PR automation get/update
 
 	// Config-mode handlers (registered when config deps are set)
 	if h.workflowSvc != nil {
@@ -612,6 +641,14 @@ func (h *Handlers) handleCreateTask(ctx context.Context, msg *ws.Message) (*ws.M
 		return ws.NewError(msg.ID, msg.Action, code, err.Error(), nil)
 	}
 	metadata = mergeMCPMetadata(metadata, workspacePolicy.MetadataBlock())
+	var deferredLaunch map[string]interface{}
+	if startAgent {
+		deferredLaunch = map[string]interface{}{
+			"intent": "start", "agent_profile_id": launchConfig.AgentProfileID,
+			"executor_id": launchConfig.ExecutorID, "executor_profile_id": launchConfig.ExecutorProfileID,
+			"prompt": req.Description,
+		}
+	}
 
 	task, err := h.taskSvc.CreateTask(ctx, &service.CreateTaskRequest{
 		ParentID:               req.ParentID,
@@ -624,15 +661,16 @@ func (h *Handlers) handleCreateTask(ctx context.Context, msg *ws.Message) (*ws.M
 		BlockedBy:              req.BlockedBy,
 		AssigneeAgentProfileID: req.AssigneeAgentProfileID,
 		Metadata:               metadata,
+		DeferredLaunch:         deferredLaunch,
 	})
 	if err != nil {
 		h.logger.Error("failed to create task", zap.Error(err))
-		// Defense-in-depth: resolveTaskRepositories already catches this for the
-		// MCP path, but non-MCP callers (UI, internal engine) reach here directly.
-		if errors.Is(err, service.ErrSubtaskDepthExceeded) {
-			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+		code := classifyCreateTaskError(err)
+		message := "Failed to create task"
+		if code != ws.ErrorCodeInternalError {
+			message = err.Error()
 		}
-		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to create task", nil)
+		return ws.NewError(msg.ID, msg.Action, code, message, nil)
 	}
 
 	if h.handoffSvc != nil && workspacePolicy.NeedsAttachment() {
@@ -647,12 +685,25 @@ func (h *Handlers) handleCreateTask(ctx context.Context, msg *ws.Message) (*ws.M
 		}
 	}
 
-	// Auto-start agent session asynchronously only if requested
-	if startAgent && h.sessionLauncher != nil {
+	// Auto-start agent session asynchronously only if requested and admitted.
+	if startAgent && task.QueuedForStepID == "" && h.sessionLauncher != nil {
 		h.launchAutoStartTask(ctx, task, launchConfig)
 	}
 
 	return ws.NewResponse(msg.ID, msg.Action, dto.FromTask(task))
+}
+
+func classifyCreateTaskError(err error) string {
+	switch {
+	case errors.Is(err, service.ErrWIPLimitExceeded):
+		return ws.ErrorCodeConflict
+	case errors.Is(err, service.ErrSubtaskDepthExceeded),
+		errors.Is(err, service.ErrInvalidTaskWorkflow),
+		isMCPWorkflowNotFoundError(err):
+		return ws.ErrorCodeValidation
+	default:
+		return ws.ErrorCodeInternalError
+	}
 }
 
 // taskRepoResult holds the output of resolveTaskRepositories.
@@ -997,11 +1048,6 @@ func (h *Handlers) mcpTaskAgentProfileDefault(ctx context.Context, explicitAgent
 	return usermodels.NormalizeMCPTaskAgentProfileDefault(settings.MCPTaskAgentProfileDefault), nil
 }
 
-func (h *Handlers) resolveWorkflowAgentProfile(ctx context.Context, workflowStepID, workflowID string) string {
-	profileID, _ := h.resolveWorkflowAgentProfileWithError(ctx, workflowStepID, workflowID)
-	return profileID
-}
-
 func (h *Handlers) resolveWorkflowAgentProfileWithError(ctx context.Context, workflowStepID, workflowID string) (string, error) {
 	profileID, resolvedWorkflowID := h.resolveWorkflowControllerAgentProfile(ctx, workflowStepID, workflowID)
 	if profileID != "" {
@@ -1047,11 +1093,6 @@ func (h *Handlers) resolveWorkflowStartStepAgentProfile(ctx context.Context, wor
 		return ""
 	}
 	return startStepAgentProfile(resp.Steps)
-}
-
-func (h *Handlers) workflowDefaultAgentProfile(ctx context.Context, workflowID string) string {
-	profileID, _ := h.workflowDefaultAgentProfileWithError(ctx, workflowID)
-	return profileID
 }
 
 func (h *Handlers) workflowDefaultAgentProfileWithError(ctx context.Context, workflowID string) (string, error) {
@@ -1316,14 +1357,100 @@ func (h *Handlers) handleAddBranchToTask(ctx context.Context, msg *ws.Message) (
 		code := classifyAddBranchError(err)
 		return ws.NewError(msg.ID, msg.Action, code, "Failed to add branch: "+err.Error(), nil)
 	}
+	response := map[string]interface{}{
+		"id":                taskRepo.ID,
+		keyTaskID:           taskRepo.TaskID,
+		keyRepositoryID:     taskRepo.RepositoryID,
+		keyBaseBranch:       taskRepo.BaseBranch,
+		keyCheckoutBranch:   taskRepo.CheckoutBranch,
+		keyPosition:         taskRepo.Position,
+		"agent_cwd_changed": taskRepo.AgentCWDChanged,
+	}
+	if taskRepo.WorktreePath != "" {
+		response["worktree_path"] = taskRepo.WorktreePath
+	}
+	if taskRepo.TaskWorkspacePath != "" {
+		response["task_workspace_path"] = taskRepo.TaskWorkspacePath
+	}
+	return ws.NewResponse(msg.ID, msg.Action, response)
+}
+
+// handleAddWorkspaceSources forwards the documented discriminated source
+// union to the shared attachment service. It deliberately rejects fields from
+// the other variant so callers cannot get a silently ambiguous attachment.
+func (h *Handlers) handleAddWorkspaceSources(ctx context.Context, msg *ws.Message) (*ws.Message, error) {
+	var req struct {
+		TaskID  string            `json:"task_id"`
+		Sources []json.RawMessage `json:"sources"`
+	}
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeBadRequest, "Invalid payload: "+err.Error(), nil)
+	}
+	if req.TaskID == "" || len(req.Sources) == 0 {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id and at least one source are required", nil)
+	}
+	sources, err := parseWorkspaceSources(req.Sources)
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
+	}
+	result, err := h.taskSvc.AttachWorkspaceSources(ctx, service.AttachWorkspaceSourcesRequest{TaskID: req.TaskID, Sources: sources})
+	if err != nil {
+		return ws.NewError(msg.ID, msg.Action, classifyWorkspaceSourceError(err), "Failed to attach workspace sources: "+err.Error(), nil)
+	}
 	return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{
-		"id":              taskRepo.ID,
-		keyTaskID:         taskRepo.TaskID,
-		keyRepositoryID:   taskRepo.RepositoryID,
-		keyBaseBranch:     taskRepo.BaseBranch,
-		keyCheckoutBranch: taskRepo.CheckoutBranch,
-		keyPosition:       taskRepo.Position,
+		"task_id": result.Task.ID, "repositories": result.Task.Repositories, "workspace_folders": result.Task.WorkspaceFolders, "workspace_path": result.WorkspacePath, "session_ids": result.SessionIDs,
 	})
+}
+
+func parseWorkspaceSources(raw []json.RawMessage) ([]service.WorkspaceSourceInput, error) {
+	sources := make([]service.WorkspaceSourceInput, 0, len(raw))
+	for _, item := range raw {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item, &fields); err != nil {
+			return nil, fmt.Errorf("source must be an object")
+		}
+		var kind string
+		if err := json.Unmarshal(fields["kind"], &kind); err != nil {
+			return nil, fmt.Errorf("source kind is required")
+		}
+		allowed := map[string]bool{"kind": true, "local_path": true}
+		switch kind {
+		case string(service.WorkspaceSourceRepository):
+			for _, key := range []string{"repository_id", "remote_url", "github_url", "provider", "provider_repo_id", "provider_owner", "provider_name", "base_branch", "checkout_branch"} {
+				allowed[key] = true
+			}
+		case string(service.WorkspaceSourceFolder):
+			allowed["display_name"] = true
+		default:
+			return nil, fmt.Errorf("unsupported workspace source kind %q", kind)
+		}
+		for key := range fields {
+			if !allowed[key] {
+				return nil, fmt.Errorf("field %q is not allowed for %s source", key, kind)
+			}
+		}
+		var source workspaceSourceJSON
+		if err := json.Unmarshal(item, &source); err != nil {
+			return nil, err
+		}
+		sources = append(sources, service.WorkspaceSourceInput{Kind: service.WorkspaceSourceKind(source.Kind), RepositoryID: source.RepositoryID, LocalPath: source.LocalPath, GitHubURL: source.GitHubURL, RemoteURL: source.RemoteURL, Provider: source.Provider, ProviderRepoID: source.ProviderRepoID, ProviderOwner: source.ProviderOwner, ProviderName: source.ProviderName, BaseBranch: source.BaseBranch, CheckoutBranch: source.CheckoutBranch, DisplayName: source.DisplayName})
+	}
+	return sources, nil
+}
+
+func classifyWorkspaceSourceError(err error) string {
+	switch {
+	case errors.Is(err, service.ErrInvalidWorkspaceSource):
+		return ws.ErrorCodeValidation
+	case errors.Is(err, taskrepo.ErrTaskNotFound), errors.Is(err, taskrepository.ErrRepositoryNotFound), errors.Is(err, service.ErrTaskRepositoryNotFound):
+		return ws.ErrorCodeNotFound
+	case errors.Is(err, service.ErrWorkspaceSourceConflict), errors.Is(err, service.ErrWorkspaceSourceActive):
+		return ws.ErrorCodeConflict
+	case errors.Is(err, service.ErrUnsupportedWorkspaceSource), errors.Is(err, service.ErrWorkspaceSourceMaterialize):
+		return ws.ErrorCodeValidation
+	default:
+		return ws.ErrorCodeInternalError
+	}
 }
 
 // handleUpdateRepositoryBaseBranch updates the base_branch on a single
@@ -1802,6 +1929,12 @@ func (h *Handlers) resolveExplicitTargetSession(ctx context.Context, msg *ws.Mes
 	return session, nil
 }
 
+// appendPromptReferenceExpansionContext expands "@name" saved-prompt
+// references found in prompt via h.promptResolver. The formatting logic
+// lives in promptservice.FormatPromptReferenceExpansions (shared with
+// promptservice.Service.AppendReferenceExpansions) so this stays a thin
+// wiring layer over the resolver interface, which in tests may be a fake
+// that only implements ResolvePromptReferences.
 func (h *Handlers) appendPromptReferenceExpansionContext(ctx context.Context, prompt string) string {
 	if h.promptResolver == nil {
 		return prompt
@@ -1820,21 +1953,10 @@ func (h *Handlers) appendPromptReferenceExpansionContext(ctx context.Context, pr
 	return prompt + "\n\n" + sysprompt.Wrap(formatPromptReferenceExpansions(expansions))
 }
 
+// formatPromptReferenceExpansions delegates to the shared formatter in
+// prompts/service so the rendered block stays byte-identical across callers.
 func formatPromptReferenceExpansions(expansions []promptservice.PromptReferenceExpansion) string {
-	var b strings.Builder
-	b.WriteString("EXPANDED PROMPT REFERENCES: The message above references saved prompts by @name. ")
-	b.WriteString("Use these expansions as hidden context while preserving the original @mentions.")
-	for _, expansion := range expansions {
-		b.WriteString("\n\n### @")
-		b.WriteString(sanitizePromptExpansionSystemText(expansion.Name))
-		b.WriteString("\n")
-		b.WriteString(sanitizePromptExpansionSystemText(expansion.Content))
-	}
-	return b.String()
-}
-
-func sanitizePromptExpansionSystemText(value string) string {
-	return strings.ReplaceAll(value, sysprompt.TagEnd, "")
+	return promptservice.FormatPromptReferenceExpansions(expansions)
 }
 
 // handleGetTaskConversation returns paginated conversation history for a task.
@@ -2144,22 +2266,27 @@ func (r *taskMessageReviewRollback) captureSessions(ctx context.Context, repo Se
 	return nil
 }
 
-func (r *taskMessageReviewRollback) captureQueues(ctx context.Context, queue *messagequeue.Service) {
+func (r *taskMessageReviewRollback) captureQueues(ctx context.Context, queue *messagequeue.Service) error {
 	if !r.changed || queue == nil || len(r.sessions) == 0 {
-		return
+		return nil
 	}
-	r.queues = make(map[string]taskMessageQueueRollback, len(r.sessions))
+	queues := make(map[string]taskMessageQueueRollback, len(r.sessions))
 	for _, session := range r.sessions {
-		status := queue.GetStatus(ctx, session.sessionID)
-		snapshot := taskMessageQueueRollback{
-			entries: cloneTaskMessageQueuedMessages(status.Entries),
+		entries, move, err := queue.SnapshotSession(ctx, session.sessionID)
+		if err != nil {
+			return err
 		}
-		if move, ok := queue.GetPendingMove(ctx, session.sessionID); ok {
+		snapshot := taskMessageQueueRollback{
+			entries: cloneTaskMessageQueuedMessages(entries),
+		}
+		if move != nil {
 			snapshot.hadPendingMove = true
 			snapshot.pendingMove = cloneTaskMessagePendingMove(move)
 		}
-		r.queues[session.sessionID] = snapshot
+		queues[session.sessionID] = snapshot
 	}
+	r.queues = queues
+	return nil
 }
 
 func (r *taskMessageReviewRollback) captureSelectedSession(session *models.TaskSession) {
@@ -2273,7 +2400,10 @@ func (h *Handlers) dispatchTaskMessage(ctx context.Context, taskID string, sessi
 			h.restoreTaskReviewForTaskMessage(ctx, taskID, reviewRollback)
 			return taskMessageDispatchResult{}, err
 		}
-		reviewRollback.captureQueues(ctx, h.sessionLauncher.GetMessageQueue())
+		if err := reviewRollback.captureQueues(ctx, h.sessionLauncher.GetMessageQueue()); err != nil {
+			h.restoreTaskReviewForTaskMessage(ctx, taskID, reviewRollback)
+			return taskMessageDispatchResult{}, err
+		}
 		session, err := h.prepareSessionForTaskMessage(ctx, taskID, session, pinnedTarget)
 		if err != nil {
 			h.restoreTaskReviewForTaskMessage(ctx, taskID, reviewRollback)
@@ -2299,7 +2429,7 @@ func (h *Handlers) dispatchPreparedTaskMessage(ctx context.Context, taskID strin
 			// Record before starting so the message is tied to the turn produced
 			// by launch. If launch fails, delete the row below.
 			recorded := h.recordUserMessage(ctx, taskID, session.ID, prompt, metadata)
-			if _, err := h.sessionLauncher.StartCreatedSession(ctx, taskID, session.ID, session.AgentProfileID, prompt, true, false, true, nil); err != nil {
+			if _, err := h.sessionLauncher.StartCreatedSession(ctx, taskID, session.ID, session.AgentProfileID, prompt, true, false, true, nil, nil); err != nil {
 				h.deleteRecordedUserMessage(ctx, recorded)
 				return taskMessageDispatchResult{}, fmt.Errorf("failed to start session: %w", err)
 			}
@@ -2472,7 +2602,7 @@ func (h *Handlers) ensureTaskInProgressForTaskMessage(ctx context.Context, taskI
 	if task.State != v1.TaskStateReview {
 		return rollback, nil
 	}
-	if task.AssigneeAgentProfileID != "" {
+	if task.IsFromOffice {
 		return rollback, nil
 	}
 	if _, err := h.taskSvc.UpdateTaskState(ctx, taskID, v1.TaskStateInProgress); err != nil {
@@ -2580,7 +2710,9 @@ func (h *Handlers) restoreSelectedTaskMessageSession(ctx context.Context, repo t
 		return errTaskMessageRollbackSuperseded
 	}
 	if primaryID != "" && rollback.selectedID != primaryID {
-		h.clearTaskMessageQueue(ctx, rollback.selectedID)
+		if err := h.restoreTaskMessageQueueOwner(ctx, rollback.selectedID, primaryID); err != nil {
+			return err
+		}
 	}
 	return repo.DeleteTaskSession(ctx, rollback.selectedID)
 }
@@ -2618,17 +2750,12 @@ func (h *Handlers) restoreTaskMessageQueue(ctx context.Context, queue *messagequ
 	return queue.RestoreSession(ctx, sessionID, cloneTaskMessageQueuedMessages(snapshot.entries), pendingMove)
 }
 
-func (h *Handlers) clearTaskMessageQueue(ctx context.Context, sessionID string) {
+func (h *Handlers) restoreTaskMessageQueueOwner(ctx context.Context, selectedID, primaryID string) error {
 	queue := h.sessionLauncher.GetMessageQueue()
 	if queue == nil {
-		return
+		return nil
 	}
-	if _, err := queue.CancelAll(ctx, sessionID); err != nil {
-		h.logger.Warn("failed to clear task message queue during rollback",
-			zap.String("session_id", sessionID),
-			zap.Error(err))
-	}
-	_, _ = queue.TakePendingMove(ctx, sessionID)
+	return queue.TransferSession(ctx, selectedID, primaryID)
 }
 
 func restoreTaskMessageSessionSnapshot(ctx context.Context, repo taskMessageSessionRollbackRepository, rollback taskMessageSessionRollback) error {

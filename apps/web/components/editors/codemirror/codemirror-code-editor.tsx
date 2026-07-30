@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import type { EditorView } from "@codemirror/view";
 import { Button } from "@kandev/ui/button";
@@ -22,8 +22,17 @@ import { vscodeDark } from "@uiw/codemirror-theme-vscode";
 import { EditorCommentPopover } from "@/components/task/editor-comment-popover";
 import { CommentViewPopover } from "@/components/task/comment-view-popover";
 import { PanelHeaderBarSplit } from "@/components/task/panel-primitives";
+import {
+  ExternalVcsFileLink,
+  useExternalVcsFileStatus,
+} from "@/components/editors/external-vcs-file-link";
+import { registerCodeMirrorCursorRevealer } from "@/hooks/file-editor-cursor";
 import { useCodeMirrorEditorState } from "./use-codemirror-editor-state";
 import { useCodeMirrorWalkthroughRange } from "./use-codemirror-walkthrough-range";
+import {
+  revealCodeMirrorCursor,
+  revealPendingCodeMirrorCursor,
+} from "./codemirror-cursor-navigation";
 
 const SAVE_SHORTCUT =
   typeof navigator !== "undefined" && navigator.platform.includes("Mac") ? "\u2318" : "Ctrl";
@@ -37,6 +46,8 @@ type FileEditorContentProps = {
   vcsDiff?: string;
   isSaving: boolean;
   sessionId?: string;
+  taskId?: string | null;
+  repositoryId?: string | null;
   worktreePath?: string;
   repo?: string;
   enableComments?: boolean;
@@ -133,7 +144,7 @@ function CodeMirrorDeleteButton({ onDelete }: { onDelete?: () => void }) {
           size="sm"
           variant="ghost"
           onClick={onDelete}
-          className="h-8 w-8 p-0 cursor-pointer text-muted-foreground hover:text-destructive"
+          className="h-8 w-8 p-0 cursor-pointer hover:text-destructive"
         >
           <IconTrash className="h-4 w-4" />
         </Button>
@@ -184,7 +195,7 @@ function CodeMirrorMarkdownPreviewButton({ onToggle }: { onToggle: () => void })
           size="sm"
           variant="ghost"
           onClick={onToggle}
-          className="h-8 w-8 p-0 cursor-pointer text-muted-foreground"
+          className="h-8 w-8 p-0 cursor-pointer"
           data-testid="markdown-preview-toggle"
         >
           <IconEye className="h-4 w-4" />
@@ -205,6 +216,9 @@ function CodeMirrorToolbar({
   wrapEnabled,
   enableComments,
   sessionId,
+  taskId,
+  repositoryId,
+  repositoryName,
   commentCount,
   hasRemoteUpdate,
   onToggleWrap,
@@ -221,6 +235,9 @@ function CodeMirrorToolbar({
   wrapEnabled: boolean;
   enableComments: boolean;
   sessionId?: string;
+  taskId?: string | null;
+  repositoryId?: string | null;
+  repositoryName?: string;
   commentCount: number;
   hasRemoteUpdate?: boolean;
   onToggleWrap: () => void;
@@ -229,6 +246,7 @@ function CodeMirrorToolbar({
   onDelete?: () => void;
   onToggleMarkdownPreview?: () => void;
 }) {
+  const fileStatus = useExternalVcsFileStatus(path, sessionId, repositoryName);
   return (
     <PanelHeaderBarSplit
       left={
@@ -257,6 +275,16 @@ function CodeMirrorToolbar({
           <CodeMirrorReloadButton
             hasRemoteUpdate={hasRemoteUpdate}
             onReloadFromAgent={onReloadFromAgent}
+          />
+          <ExternalVcsFileLink
+            filePath={path}
+            previousPath={fileStatus?.old_path}
+            status={fileStatus?.status}
+            taskId={taskId}
+            sessionId={sessionId}
+            repositoryId={repositoryName ? undefined : repositoryId}
+            repositoryName={repositoryName}
+            size="sm"
           />
           <CodeMirrorDeleteButton onDelete={onDelete} />
           <CodeMirrorSaveButton isDirty={isDirty} isSaving={isSaving} onSave={onSave} />
@@ -307,23 +335,9 @@ function CodeMirrorOverlays({ state }: { state: CodeMirrorEditorState }) {
   );
 }
 
-export function CodeMirrorCodeEditor({
-  path,
-  content,
-  originalContent,
-  isDirty,
-  hasRemoteUpdate = false,
-  isSaving,
-  sessionId,
-  worktreePath,
-  repo,
-  enableComments = false,
-  onToggleMarkdownPreview,
-  onChange,
-  onSave,
-  onReloadFromAgent,
-  onDelete,
-}: FileEditorContentProps) {
+function useCodeMirrorCodeEditorSetup(props: FileEditorContentProps) {
+  const { path, content, originalContent, isDirty, isSaving, sessionId, repo, enableComments } =
+    props;
   const wrapperRef = useRef<HTMLDivElement>(null);
   const editorAreaRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<ReactCodeMirrorRef>(null);
@@ -335,9 +349,9 @@ export function CodeMirrorCodeEditor({
     isDirty,
     isSaving,
     sessionId,
-    enableComments,
-    onChange,
-    onSave,
+    enableComments: enableComments ?? false,
+    onChange: props.onChange,
+    onSave: props.onSave,
     wrapperRef,
     editorRef,
   });
@@ -347,9 +361,39 @@ export function CodeMirrorCodeEditor({
     path,
     repo,
   });
-  const handleCreateEditor = useCallback((view: EditorView) => {
-    setEditorView(view);
-  }, []);
+  useEffect(() => {
+    if (editorView) revealPendingCodeMirrorCursor(editorView, path, repo);
+  });
+  useEffect(() => {
+    if (!editorView) return;
+    return registerCodeMirrorCursorRevealer(path, repo, (line, column) =>
+      revealCodeMirrorCursor(editorView, line, column),
+    );
+  }, [editorView, path, repo]);
+  const handleCreateEditor = useCallback((view: EditorView) => setEditorView(view), []);
+  return { wrapperRef, editorAreaRef, editorRef, state, walkthroughRange, handleCreateEditor };
+}
+
+export function CodeMirrorCodeEditor(props: FileEditorContentProps) {
+  const {
+    path,
+    content,
+    isDirty,
+    hasRemoteUpdate = false,
+    isSaving,
+    sessionId,
+    taskId,
+    repositoryId,
+    worktreePath,
+    repo,
+    enableComments = false,
+    onToggleMarkdownPreview,
+    onSave,
+    onReloadFromAgent,
+    onDelete,
+  } = props;
+  const { wrapperRef, editorAreaRef, editorRef, state, walkthroughRange, handleCreateEditor } =
+    useCodeMirrorCodeEditorSetup(props);
 
   return (
     <div ref={wrapperRef} className="flex h-full flex-col rounded-lg">
@@ -362,6 +406,9 @@ export function CodeMirrorCodeEditor({
         wrapEnabled={state.wrapEnabled}
         enableComments={enableComments}
         sessionId={sessionId}
+        taskId={taskId}
+        repositoryId={repositoryId}
+        repositoryName={repo}
         commentCount={state.comments.length}
         hasRemoteUpdate={hasRemoteUpdate}
         onToggleWrap={() => state.setWrapEnabled(!state.wrapEnabled)}

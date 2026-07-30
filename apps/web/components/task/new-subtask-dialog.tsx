@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { RefObject } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@kandev/ui/dialog";
 import { useAppStore } from "@/components/state-provider";
 import { useToast } from "@/components/toast-provider";
@@ -29,6 +30,8 @@ import {
 import { PromptZone, SubtaskFormBody } from "./new-subtask-form-parts";
 import { applySummarizeSessionResult, type SummaryToastFn } from "./session-context-summary";
 import { useSubtaskPromptZone, useSubtaskSubmit } from "./use-subtask-submit";
+import type { KanbanState } from "@/lib/state/slices/kanban/types";
+import type { Message, TaskSession } from "@/lib/types/http";
 
 type NewSubtaskDialogProps = {
   open: boolean;
@@ -37,43 +40,131 @@ type NewSubtaskDialogProps = {
   parentTaskTitle: string;
 };
 
-function useSubtaskDialogState() {
+type ParentTaskContext = {
+  task: KanbanState["tasks"][number] | null;
+  session: TaskSession | null;
+  worktreeBranch: string | null;
+  initialPrompt: string | null;
+  parentRepositoryId: string | null;
+  baseBranch: string | null;
+};
+
+export function resolveSubtaskParentContext({
+  task,
+  sessionsById,
+  sessionsByTaskId,
+  worktreeIdsBySessionId,
+  worktrees,
+  messagesBySession,
+}: {
+  task: KanbanState["tasks"][number] | null;
+  sessionsById: Record<string, TaskSession>;
+  sessionsByTaskId: Record<string, TaskSession[]>;
+  worktreeIdsBySessionId: Record<string, string[]>;
+  worktrees: Record<string, { branch?: string }>;
+  messagesBySession: Record<string, Message[]>;
+}): ParentTaskContext {
+  const session = resolveParentSession(task, sessionsById, sessionsByTaskId);
+  const primaryRepository = resolvePrimaryRepository(task);
+
+  return {
+    task,
+    session,
+    worktreeBranch: resolveWorktreeBranch(session, worktreeIdsBySessionId, worktrees),
+    initialPrompt: resolveInitialPrompt(session, messagesBySession),
+    parentRepositoryId: primaryRepository?.repository_id ?? session?.repository_id ?? null,
+    baseBranch: primaryRepository?.base_branch ?? session?.base_branch ?? null,
+  };
+}
+
+function resolveParentSession(
+  task: KanbanState["tasks"][number] | null,
+  sessionsById: Record<string, TaskSession>,
+  sessionsByTaskId: Record<string, TaskSession[]>,
+) {
+  const taskSessions = task ? (sessionsByTaskId[task.id] ?? []) : [];
+  const sessionId = task?.primarySessionId ?? taskSessions.find((s) => s.is_primary)?.id;
+  return sessionId
+    ? (sessionsById[sessionId] ?? taskSessions.find((s) => s.id === sessionId) ?? null)
+    : null;
+}
+
+function resolvePrimaryRepository(task: KanbanState["tasks"][number] | null) {
+  const repositories = task?.repositories ?? [];
+  if (repositories.length === 0) return undefined;
+  return repositories.reduce((current, repository) =>
+    !current || repository.position < current.position ? repository : current,
+  );
+}
+
+function resolveWorktreeBranch(
+  session: TaskSession | null,
+  worktreeIdsBySessionId: Record<string, string[]>,
+  worktrees: Record<string, { branch?: string }>,
+) {
+  if (!session) return null;
+  const worktreeBranch = (worktreeIdsBySessionId[session.id] ?? [])
+    .map((id) => worktrees[id]?.branch)
+    .find((branch): branch is string => Boolean(branch));
+  return worktreeBranch ?? session.worktree_branch ?? null;
+}
+
+function resolveInitialPrompt(
+  session: TaskSession | null,
+  messagesBySession: Record<string, Message[]>,
+) {
+  if (!session) return null;
+  return (
+    messagesBySession[session.id]?.find((message) => message.author_type === "user")?.content ??
+    null
+  );
+}
+
+function useSubtaskDialogState(parentTaskId: string, parentSessions: TaskSession[]) {
   const agentProfiles = useAppStore((s) => s.agentProfiles.items);
-  const activeSessionId = useAppStore((s) => s.tasks.activeSessionId);
   const workspaceId = useAppStore((s) => s.workspaces.activeId);
   const workflowId = useAppStore((s) => s.kanban.workflowId);
   const executors = useAppStore((s) => s.executors.items);
-
-  const currentSession = useAppStore((s) =>
-    activeSessionId ? (s.taskSessions.items[activeSessionId] ?? null) : null,
+  const parentTask = useAppStore(
+    (s) => s.kanban.tasks.find((task) => task.id === parentTaskId) ?? null,
   );
-
-  const worktreeBranch = useAppStore((s) => {
-    if (!activeSessionId) return null;
-    const wtIds = s.sessionWorktreesBySessionId.itemsBySessionId[activeSessionId];
-    if (wtIds?.length) {
-      const wt = s.worktrees.items[wtIds[0]];
-      if (wt?.branch) return wt.branch;
-    }
-    return currentSession?.worktree_branch ?? null;
-  });
-
-  const initialPrompt = useAppStore((s) => {
-    if (!activeSessionId) return null;
-    const msgs = s.messages.bySession[activeSessionId];
-    if (!msgs?.length) return null;
-    const first = msgs.find((m: { author_type?: string }) => m.author_type === "user");
-    return first ? ((first as { content?: string }).content ?? null) : null;
-  });
+  const sessionsById = useAppStore((s) => s.taskSessions.items);
+  const sessionsByTaskId = useAppStore((s) => s.taskSessionsByTask.itemsByTaskId);
+  const worktreeIdsBySessionId = useAppStore((s) => s.sessionWorktreesBySessionId.itemsBySessionId);
+  const worktrees = useAppStore((s) => s.worktrees.items);
+  const messagesBySession = useAppStore((s) => s.messages.bySession);
+  const parentContext = useMemo(
+    () =>
+      resolveSubtaskParentContext({
+        task: parentTask,
+        sessionsById,
+        sessionsByTaskId: {
+          ...sessionsByTaskId,
+          [parentTaskId]: parentSessions.length
+            ? parentSessions
+            : (sessionsByTaskId[parentTaskId] ?? []),
+        },
+        worktreeIdsBySessionId,
+        worktrees,
+        messagesBySession,
+      }),
+    [
+      messagesBySession,
+      parentTask,
+      parentSessions,
+      sessionsById,
+      sessionsByTaskId,
+      worktreeIdsBySessionId,
+      worktrees,
+    ],
+  );
 
   return {
     agentProfiles,
     workspaceId,
     workflowId,
     executors,
-    currentSession,
-    worktreeBranch,
-    initialPrompt,
+    ...parentContext,
   };
 }
 
@@ -169,33 +260,70 @@ function useContextChangeHandler(opts: {
   setContextValue: (v: string) => void;
   setHasPrompt: (v: boolean) => void;
   promptRef: React.RefObject<HTMLTextAreaElement | null>;
+  promptValue: string;
+  setPromptValue: (value: string) => void;
   initialPrompt: string | null;
   summarize: (sessionId: string) => Promise<SummarizeSessionResult>;
   toast: SummaryToastFn;
 }) {
-  const { setContextValue, setHasPrompt, promptRef, initialPrompt, summarize, toast } = opts;
+  const {
+    setContextValue,
+    setHasPrompt,
+    promptRef,
+    promptValue,
+    setPromptValue,
+    initialPrompt,
+    summarize,
+    toast,
+  } = opts;
   return useCallback(
     async (value: string) => {
       if (!value) return;
       setContextValue(value);
-      const ta = promptRef.current;
-      if (!ta) return;
+      if (!promptRef.current) return;
       if (value === "copy_prompt" && initialPrompt) {
-        ta.value = initialPrompt;
+        setPromptValue(initialPrompt);
         setHasPrompt(true);
         return;
       }
       if (value === "blank") {
-        ta.value = "";
+        setPromptValue("");
         setHasPrompt(false);
         return;
       }
       if (value.startsWith("summarize:")) {
+        const controlledPromptRef: RefObject<HTMLTextAreaElement | null> = {
+          current: promptRef.current
+            ? ({
+                get value() {
+                  return promptValue;
+                },
+                set value(value: string) {
+                  setPromptValue(value);
+                },
+              } as HTMLTextAreaElement)
+            : null,
+        };
         const result = await summarize(value.slice("summarize:".length));
-        applySummarizeSessionResult({ result, promptRef, setContextValue, setHasPrompt, toast });
+        applySummarizeSessionResult({
+          result,
+          promptRef: controlledPromptRef,
+          setContextValue,
+          setHasPrompt,
+          toast,
+        });
       }
     },
-    [setContextValue, setHasPrompt, promptRef, initialPrompt, summarize, toast],
+    [
+      initialPrompt,
+      promptRef,
+      promptValue,
+      setContextValue,
+      setHasPrompt,
+      setPromptValue,
+      summarize,
+      toast,
+    ],
   );
 }
 
@@ -219,6 +347,7 @@ type SubtaskFormProps = {
   onClose: () => void;
 };
 
+// eslint-disable-next-line max-lines-per-function
 function NewSubtaskForm({
   parentTaskId,
   defaultTitle,
@@ -241,12 +370,13 @@ function NewSubtaskForm({
   const [isCreating, setIsCreating] = useState(false);
   const [title, setTitle] = useState(defaultTitle);
   const [hasPrompt, setHasPrompt] = useState(false);
+  const [promptValue, setPromptValue] = useState("");
   const [contextValue, setContextValue] = useState("blank");
   const [workspaceMode, setWorkspaceMode] = useState<SubtaskWorkspaceMode>(() =>
     defaultSubtaskWorkspaceMode(worktreeBranch),
   );
   // Shim DialogFormState shared with the create-task dialog.
-  const fs = useSubtaskFormState();
+  const fs = useSubtaskFormState(workspaceId);
   useSeedParentRepository(fs, parentRepositoryId, baseBranch);
   useSeedAgentProfileId(fs, defaultProfileId);
   const handlers = useDialogHandlers(fs, availableRepositories);
@@ -258,16 +388,21 @@ function NewSubtaskForm({
   const executorProfileOptions = useExecutorProfileOptions(allExecutorProfiles);
   useExecutorDefault(allExecutorProfiles, fs.executorProfileId, fs.setExecutorProfileId);
   const promptZone = useSubtaskPromptZone({
+    parentTaskId,
     taskTitle: title,
     inputDisabled: isCreating || isSummarizing,
     contextValue,
     initialPrompt,
+    promptValue,
+    setPromptValue,
     setHasPrompt,
   });
   const handleContextChange = useContextChangeHandler({
     setContextValue,
     setHasPrompt,
     promptRef: promptZone.promptRef,
+    promptValue,
+    setPromptValue,
     initialPrompt,
     summarize,
     toast,
@@ -306,10 +441,16 @@ function NewSubtaskForm({
     sessionOptions: isUtilityConfigured ? sessionOptions : [],
     promptZoneProps: {
       ...promptZone,
+      promptValue,
       isCreating,
       isSummarizing,
       isUtilityConfigured,
-      setHasPrompt,
+      onPromptChange: (value: string) => {
+        setPromptValue(value);
+        setHasPrompt(value.trim().length > 0);
+      },
+      onApplyPending: promptZone.applyPending,
+      onCopyPending: promptZone.copyPending,
       onSubmitShortcut: handleSubmit,
     },
     isCreating,
@@ -335,15 +476,18 @@ export function NewSubtaskDialog({
   parentTaskId,
   parentTaskTitle,
 }: NewSubtaskDialogProps) {
+  const { sessions: parentSessions } = useTaskSessions(parentTaskId);
   const {
     agentProfiles,
     workspaceId,
     workflowId,
     executors,
-    currentSession,
+    session: parentSession,
     worktreeBranch,
     initialPrompt,
-  } = useSubtaskDialogState();
+    parentRepositoryId,
+    baseBranch,
+  } = useSubtaskDialogState(parentTaskId, parentSessions);
 
   // Ensure executor/agent data is loaded when dialog opens
   useSettingsData(open);
@@ -371,18 +515,18 @@ export function NewSubtaskDialog({
           </DialogTitle>
         </DialogHeader>
         <NewSubtaskForm
-          key={`${open}`}
+          key={`${parentTaskId}-${open}`}
           parentTaskId={parentTaskId}
           defaultTitle={defaultTitle}
-          defaultProfileId={currentSession?.agent_profile_id ?? ""}
+          defaultProfileId={parentSession?.agent_profile_id ?? ""}
           worktreeBranch={worktreeBranch}
           initialPrompt={initialPrompt}
           agentProfiles={agentProfiles}
           executors={executors}
           workspaceId={workspaceId}
           workflowId={workflowId}
-          parentRepositoryId={currentSession?.repository_id ?? null}
-          baseBranch={currentSession?.base_branch ?? null}
+          parentRepositoryId={parentRepositoryId}
+          baseBranch={baseBranch}
           availableRepositories={availableRepositories}
           isOpen={open}
           onClose={() => onOpenChange(false)}

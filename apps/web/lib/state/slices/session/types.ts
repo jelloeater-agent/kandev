@@ -6,6 +6,7 @@ import type {
   TaskPlanRevision,
   TaskWalkthrough,
 } from "@/lib/types/http";
+import type { EntityReference } from "@/lib/types/entity-reference";
 
 export type MessagesState = {
   bySession: Record<string, Message[]>;
@@ -100,6 +101,7 @@ export type WalkthroughsState = {
 };
 
 export type QueuedMessageMetadata = Record<string, unknown> & {
+  entity_references?: EntityReference[];
   workflow_message?: boolean;
   workflow_auto_start?: boolean;
   workflow_step_id?: string;
@@ -204,6 +206,8 @@ export type SessionSliceActions = {
     metadata?: Record<string, unknown>,
   ) => void;
   setActiveTurn: (sessionId: string, turnId: string | null) => void;
+  /** Source adoption is an authoritative idle boundary for the listed sessions. */
+  reconcileWorkspaceSourcesAdopted: (sessionIds: string[]) => void;
   setTaskSession: (session: TaskSession) => void;
   removeTaskSession: (taskId: string, sessionId: string) => void;
   setTaskSessionsForTask: (taskId: string, sessions: TaskSession[]) => void;

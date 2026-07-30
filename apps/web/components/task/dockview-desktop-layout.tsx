@@ -48,10 +48,8 @@ import {
 } from "./dockview-desktop-layout-hooks";
 import { renderPanel } from "./dockview-panel-content";
 import { PreviewController } from "./preview-controller";
-import { WalkthroughOverlay } from "@/components/review/walkthrough-overlay";
 import { BottomTerminalPanel } from "./bottom-terminal-panel";
-import { DockviewReviewDialog } from "./dockview-review-dialog";
-import { useReviewDialog } from "./use-review-dialog";
+import { TaskReviewDialogMount } from "./dockview-review-dialog";
 
 import type { Repository, RepositoryScript } from "@/lib/types/http";
 import type { Terminal } from "@/hooks/domains/session/use-terminals";
@@ -61,6 +59,7 @@ import { PanelPortalHost, usePortalSlot } from "@/lib/layout/panel-portal-host";
 import { ENV_SCOPED_DOCKVIEW_COMPONENTS } from "@/lib/state/dockview-env-scoped-components";
 import { resolveEffectiveDefaultLayout } from "@/lib/layout/layout-profiles";
 import type { LayoutState } from "@/lib/state/layout-manager";
+import { registerDockviewRoot, unregisterDockviewRoot } from "@/lib/state/dockview-measure";
 
 // ---------------------------------------------------------------------------
 // PORTAL SLOT — generic dockview component that adopts a persistent portal
@@ -277,6 +276,7 @@ type ReadyDockviewRefs = {
   readyDisposersRef: React.MutableRefObject<Array<() => void>>;
   saveTimerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
   setApi: (api: DockviewReadyEvent["api"] | null) => void;
+  layoutRootRef: React.MutableRefObject<HTMLDivElement | null>;
 };
 
 type ReadyDockviewSetup = {
@@ -291,6 +291,11 @@ function setupReadyDockview({ api, appStore, layout, refs }: ReadyDockviewSetup)
   // settings. Seed the store before exposing the API or building a cold layout.
   useDockviewStore.getState().setUserDefaultLayout(layout.userDefaultLayout);
   refs.setApi(api);
+  const layoutRoot = refs.layoutRootRef.current;
+  if (layoutRoot) {
+    registerDockviewRoot(api, layoutRoot);
+    refs.readyDisposersRef.current.push(() => unregisterDockviewRoot(api));
+  }
 
   const currentEnvId = refs.envIdRef.current;
   const restored =
@@ -369,8 +374,6 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
   const envIdRef = useRef<string | null>(effectiveEnvId);
   const hasDevScript = Boolean(repository?.dev_script?.trim());
 
-  const review = useReviewDialog(effectiveSessionId);
-
   const userDefaultLayout = useSyncUserDefaultLayout();
   useLspFileOpener();
   useEditorKeybinds();
@@ -394,7 +397,7 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
         api: event.api,
         appStore,
         layout: { buildDefaultLayout, compact, initialLayout, userDefaultLayout },
-        refs: { envIdRef, readyDisposersRef, saveTimerRef, setApi },
+        refs: { envIdRef, readyDisposersRef, saveTimerRef, setApi, layoutRootRef },
       });
     },
     [setApi, buildDefaultLayout, initialLayout, compact, userDefaultLayout, appStore],
@@ -436,12 +439,7 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
       />
       <BottomTerminalPanel />
       <PanelPortalHost renderPanel={renderPanel} />
-      <DockviewReviewDialog sessionId={effectiveSessionId} review={review} />
-      <WalkthroughOverlay
-        taskId={activeTaskId}
-        sessionId={effectiveSessionId}
-        onSelectFile={review.reviewOpenFile}
-      />
+      <TaskReviewDialogMount taskId={activeTaskId} sessionId={effectiveSessionId} />
     </div>
   );
 });

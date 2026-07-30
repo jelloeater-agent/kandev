@@ -1,20 +1,60 @@
-import { StrictMode } from "react";
+import { StrictMode, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import "@/app/globals.css";
-import { StateProvider } from "@/components/state-provider";
+import { setOnUnauthorized } from "@/lib/api/client";
+import { PluginModalHost } from "@/components/plugins/plugin-modal-host";
+import { useAppStoreApi, StateProvider } from "@/components/state-provider";
 import { PluginBootBridge } from "@/lib/plugins/plugin-boot-bridge";
 import { AppShell } from "./app-shell";
+import { AuthGatedScreen, useAuthGateDecision } from "./auth-gate";
 import { loadBootPayload } from "./boot-payload";
 import type { BootPayload } from "./boot-payload";
+import { RootErrorBoundary, RouteErrorBoundary } from "./app-error-boundary";
 import { SpaRoutes } from "./spa-routes";
+import { installVitePreloadRecovery } from "./vite-preload-recovery";
+
+installVitePreloadRecovery();
+
+const AUTH_ROUTE_PATHS = new Set(["/login", "/setup", "/invite"]);
+
+/** Registers the 401 handler once: clear the auth slice and bounce to
+ * /login, guarding against redirect loops when already on an auth page. */
+function useUnauthorizedRedirect() {
+  const store = useAppStoreApi();
+  useEffect(() => {
+    setOnUnauthorized(() => {
+      store.getState().clearAuthenticated();
+      if (!AUTH_ROUTE_PATHS.has(window.location.pathname)) {
+        window.location.assign("/login");
+      }
+    });
+    return () => setOnUnauthorized(null);
+  }, [store]);
+}
+
+function AppBody({ payload }: { payload: BootPayload }) {
+  useUnauthorizedRedirect();
+  const decision = useAuthGateDecision();
+  if (decision !== "app") {
+    return <AuthGatedScreen decision={decision} />;
+  }
+  return (
+    <>
+      <PluginBootBridge plugins={payload.plugins} />
+      <PluginModalHost />
+      <AppShell>
+        <RouteErrorBoundary>
+          <SpaRoutes routeData={payload.routeData} />
+        </RouteErrorBoundary>
+      </AppShell>
+    </>
+  );
+}
 
 function App({ payload }: { payload: BootPayload }) {
   return (
     <StateProvider initialState={payload.initialState ?? {}}>
-      <PluginBootBridge plugins={payload.plugins} />
-      <AppShell>
-        <SpaRoutes routeData={payload.routeData} />
-      </AppShell>
+      <AppBody payload={payload} />
     </StateProvider>
   );
 }
@@ -28,7 +68,9 @@ if (!root) {
 void loadBootPayload().then((payload) => {
   createRoot(root).render(
     <StrictMode>
-      <App payload={payload} />
+      <RootErrorBoundary>
+        <App payload={payload} />
+      </RootErrorBoundary>
     </StrictMode>,
   );
 });

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { getWebSocketClient } from "@/lib/ws/connection";
+import { useForegroundRefresh } from "@/hooks/use-foreground-refresh";
 import { useAppStore, useAppStoreApi } from "@/components/state-provider";
 import type { TaskSessionState, Message } from "@/lib/types/http";
 import { listTaskSessionMessages } from "@/lib/api";
@@ -183,7 +184,6 @@ async function fetchAndStoreMessages(
     limit: INITIAL_FETCH_LIMIT,
     sort: "desc" as const,
   };
-  debug("message.list request", requestParams);
   const response = await client.request<MessageListResponse>("message.list", requestParams, 10000);
   const fetched = [...(response.messages ?? [])].reverse();
   logFetchSummary(sessionId, fetched, response, requestParams.limit);
@@ -382,13 +382,9 @@ export function useVisibilityBackfill(
   taskSessionId: string | null,
   store: ReturnType<typeof useAppStoreApi>,
 ) {
-  useEffect(() => {
-    if (!taskSessionId) {
-      debug("visibilityBackfill: skipped attaching (no sessionId)");
-      return;
-    }
-    debug("visibilityBackfill: attached", { sessionId: taskSessionId });
-    const onVisible = () => {
+  useForegroundRefresh(
+    () => {
+      if (!taskSessionId) return;
       const visibilityState = document.visibilityState;
       const state = store.getState();
       const existingCount = state.messages.bySession[taskSessionId]?.length ?? 0;
@@ -401,7 +397,6 @@ export function useVisibilityBackfill(
         existingCount,
         newestBefore,
       });
-      if (visibilityState !== "visible") return;
       fetchAndStoreMessages(taskSessionId, store)
         .then(() => {
           const afterCount = store.getState().messages.bySession[taskSessionId]?.length ?? 0;
@@ -417,13 +412,10 @@ export function useVisibilityBackfill(
         .catch((err) => {
           debug("visibilityBackfill: refetch failed", { sessionId: taskSessionId, err });
         });
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisible);
-      debug("visibilityBackfill: detached", { sessionId: taskSessionId });
-    };
-  }, [taskSessionId, store]);
+    },
+    Boolean(taskSessionId),
+    taskSessionId,
+  );
 }
 
 function useSessionSubscription(

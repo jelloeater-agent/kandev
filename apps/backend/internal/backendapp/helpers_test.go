@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -469,6 +470,26 @@ func TestBootInitialStateHomeIncludesKanbanFirstPaintState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateMessage: %v", err)
 	}
+	if err := harness.taskRepo.CreateTaskSession(ctx, &models.TaskSession{
+		ID: "boot-session-secondary", TaskID: task.ID, State: models.TaskSessionStateWaitingForInput,
+		StartedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateTaskSession secondary: %v", err)
+	}
+	if err := harness.taskRepo.CreateTurn(ctx, &models.Turn{
+		ID: "boot-turn-secondary", TaskID: task.ID, TaskSessionID: "boot-session-secondary",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateTurn secondary: %v", err)
+	}
+	if err := harness.taskRepo.CreateMessage(ctx, &models.Message{
+		ID: "boot-permission", TaskID: task.ID, TaskSessionID: "boot-session-secondary",
+		TurnID: "boot-turn-secondary", AuthorType: models.MessageAuthorAgent,
+		Type: models.MessageTypePermissionRequest, Content: "Allow?",
+		Metadata: map[string]interface{}{"status": "pending"}, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateMessage secondary: %v", err)
+	}
 
 	state := bootInitialState(
 		ctx,
@@ -512,6 +533,7 @@ func TestBootInitialStateHomeIncludesKanbanFirstPaintState(t *testing.T) {
 					WorkflowStepID              string  `json:"workflowStepId"`
 					PrimarySessionState         *string `json:"primarySessionState"`
 					PrimarySessionPendingAction *string `json:"primarySessionPendingAction"`
+					TaskPendingAction           *string `json:"taskPendingAction"`
 				} `json:"tasks"`
 			} `json:"snapshots"`
 			IsLoading bool `json:"isLoading"`
@@ -527,6 +549,7 @@ func TestBootInitialStateHomeIncludesKanbanFirstPaintState(t *testing.T) {
 				WorkflowStepID              string  `json:"workflowStepId"`
 				PrimarySessionState         *string `json:"primarySessionState"`
 				PrimarySessionPendingAction *string `json:"primarySessionPendingAction"`
+				TaskPendingAction           *string `json:"taskPendingAction"`
 			} `json:"tasks"`
 			IsLoading bool `json:"isLoading"`
 		} `json:"kanban"`
@@ -554,6 +577,9 @@ func TestBootInitialStateHomeIncludesKanbanFirstPaintState(t *testing.T) {
 			snapshotTask.PrimarySessionPendingAction,
 		)
 	}
+	if snapshotTask.TaskPendingAction == nil || *snapshotTask.TaskPendingAction != "permission" {
+		t.Fatalf("snapshot taskPendingAction = %#v, want permission", snapshotTask.TaskPendingAction)
+	}
 	if decoded.Kanban.WorkflowID != workflows[0].ID {
 		t.Fatalf("active kanban workflow = %q, want %q", decoded.Kanban.WorkflowID, workflows[0].ID)
 	}
@@ -564,8 +590,28 @@ func TestBootInitialStateHomeIncludesKanbanFirstPaintState(t *testing.T) {
 			activeTask.PrimarySessionPendingAction,
 		)
 	}
+	if activeTask.TaskPendingAction == nil || *activeTask.TaskPendingAction != "permission" {
+		t.Fatalf("active taskPendingAction = %#v, want permission", activeTask.TaskPendingAction)
+	}
 	if decoded.KanbanMulti.IsLoading || decoded.Kanban.IsLoading {
 		t.Fatal("boot payload should mark kanban data loaded")
+	}
+}
+
+func TestBootTaskPendingActionExcludesStartingAndTerminalSessions(t *testing.T) {
+	sessions := []*models.TaskSession{
+		{ID: "starting", State: models.TaskSessionStateStarting},
+		{ID: "completed", State: models.TaskSessionStateCompleted},
+		{ID: "failed", State: models.TaskSessionStateFailed},
+	}
+	actions := map[string]models.TaskPendingAction{
+		"starting":  models.TaskPendingActionPermission,
+		"completed": models.TaskPendingActionPermission,
+		"failed":    models.TaskPendingActionClarification,
+	}
+
+	if got := bootTaskPendingActionPtr(sessions, actions); got != nil {
+		t.Fatalf("bootTaskPendingActionPtr() = %q, want nil for stale sessions", *got)
 	}
 }
 
@@ -1107,6 +1153,27 @@ func TestBootPayloadIncludesDebugRuntimeWhenDevMode(t *testing.T) {
 	}
 }
 
+func TestBootPayloadIncludesBackendHostOS(t *testing.T) {
+	t.Parallel()
+
+	payload := bootPayload(context.Background(), nil, routeParams{}, webapp.ClassifyRoute("/"))
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	var decoded struct {
+		Runtime struct {
+			HostOS string `json:"hostOS"`
+		} `json:"runtime"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal payload: %v", err)
+	}
+	if decoded.Runtime.HostOS != runtime.GOOS {
+		t.Fatalf("runtime.hostOS = %q, want %q", decoded.Runtime.HostOS, runtime.GOOS)
+	}
+}
+
 func TestBootPayloadRestoresQuickChatSessions(t *testing.T) {
 	harness := newBootStateTestHarness(t)
 	ctx := context.Background()
@@ -1642,6 +1709,7 @@ func newBootStateTestHarness(t *testing.T) bootStateTestHarness {
 		taskservice.RepositoryDiscoveryConfig{},
 	)
 	taskSvc.SetWorkflowStepCreator(workflowSvc)
+	taskSvc.SetWorkspaceBootstrapper(taskRepo)
 	taskSvc.SetWorkflowStepGetter(&workflowStepGetterAdapter{svc: workflowSvc})
 	taskSvc.SetStartStepResolver(&startStepResolverAdapter{svc: workflowSvc})
 	workflowSvc.SetWorkflowProvider(&workflowProviderAdapter{svc: taskSvc})
@@ -1777,7 +1845,9 @@ func TestExternalMCPOpenMiddleware_AllowsLoopbackAndRemote(t *testing.T) {
 func setupExternalMCPAccessRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(externalMCPOpenMiddleware())
+	// nil auth service = auth feature absent = open (disabled-mode behavior).
+	// PAT enforcement when auth is enabled is covered by internal/auth tests.
+	r.Use(externalMCPAuthMiddleware(nil))
 	r.GET("/mcp", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})

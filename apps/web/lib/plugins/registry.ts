@@ -25,6 +25,13 @@ interface Owned<T> {
   value: T;
 }
 
+/** A handler bound via `PluginRegistry.registerKeybinding`. */
+export interface PluginKeybindingHandler {
+  /** Plugin-local keybinding id (matches `ui.keybindings[].id`). */
+  id: string;
+  handler: (event: KeyboardEvent) => void;
+}
+
 export interface RouteRegistration {
   path: string;
   Component: ComponentType;
@@ -37,7 +44,17 @@ export interface PluginRouteRegistration extends RouteRegistration {
 }
 
 interface SlotRegistration {
+  registrationId: string;
+  orderingId: string;
   slot: string;
+  Component: SlotComponent;
+}
+
+/** Slot component plus its stable registry identity and owning plugin. */
+export interface PluginSlotRegistration {
+  registrationId: string;
+  orderingId: string;
+  pluginId: string;
   Component: SlotComponent;
 }
 
@@ -56,8 +73,18 @@ class PluginRegistryStore {
   private navItems: Owned<NavItem>[] = [];
   private slotComponents: Owned<SlotRegistration>[] = [];
   private wsHandlers: Owned<WsHandlerRegistration>[] = [];
+  private keybindingHandlers: Owned<PluginKeybindingHandler>[] = [];
+  private nextSlotRegistrationId = 0;
   /** Display names from the boot payload, used for derived page-chrome titles. */
   private pluginNames = new Map<string, string>();
+  /**
+   * Keybinding ids declared in each plugin's `ui.keybindings` manifest,
+   * synced by the shortcut dispatcher (`hooks/use-plugin-shortcuts.ts`) from
+   * the plugin records store. Used only to warn on `registerKeybinding`
+   * calls for an id the manifest never declared — an empty/missing entry
+   * (descriptors not loaded yet) skips the check rather than false-warning.
+   */
+  private declaredKeybindingIds = new Map<string, Set<string>>();
   private listeners = new Set<() => void>();
   private version = 0;
 
@@ -91,13 +118,44 @@ class PluginRegistryStore {
   }
 
   registerComponent(pluginId: string, slot: string, Component: SlotComponent): void {
-    this.slotComponents.push({ pluginId, value: { slot, Component } });
+    const ordinal = this.slotComponents.filter(
+      (entry) => entry.pluginId === pluginId && entry.value.slot === slot,
+    ).length;
+    this.slotComponents.push({
+      pluginId,
+      value: {
+        registrationId: `slot-registration-${this.nextSlotRegistrationId++}`,
+        orderingId: pluginSlotOrderingId(pluginId, slot, ordinal),
+        slot,
+        Component,
+      },
+    });
     this.notify();
   }
 
   registerWsHandler(pluginId: string, action: string, handler: WsHandler): void {
     this.wsHandlers.push({ pluginId, value: { action, handler } });
     this.notify();
+  }
+
+  registerKeybinding(pluginId: string, id: string, handler: (event: KeyboardEvent) => void): void {
+    const declared = this.declaredKeybindingIds.get(pluginId);
+    if (declared && !declared.has(id)) {
+      console.warn(
+        `[plugins] "${pluginId}" registered a keybinding handler for id "${id}", which is not declared in its ui.keybindings manifest`,
+      );
+    }
+    this.keybindingHandlers.push({ pluginId, value: { id, handler } });
+    this.notify();
+  }
+
+  /**
+   * Records the keybinding ids declared in `pluginId`'s `ui.keybindings`
+   * manifest, so `registerKeybinding` can warn on an undeclared id. Safe to
+   * call repeatedly (e.g. every time the plugin records store refreshes).
+   */
+  setDeclaredKeybindingIds(pluginId: string, ids: string[]): void {
+    this.declaredKeybindingIds.set(pluginId, new Set(ids));
   }
 
   /** Bulk-revoke every registration owned by `pluginId` (disable/uninstall). */
@@ -108,7 +166,9 @@ class PluginRegistryStore {
     this.navItems = removeByPlugin(this.navItems, pluginId);
     this.slotComponents = removeByPlugin(this.slotComponents, pluginId);
     this.wsHandlers = removeByPlugin(this.wsHandlers, pluginId);
+    this.keybindingHandlers = removeByPlugin(this.keybindingHandlers, pluginId);
     this.pluginNames.delete(pluginId);
+    this.declaredKeybindingIds.delete(pluginId);
     if (this.totalCount() !== before) this.notify();
   }
 
@@ -130,9 +190,19 @@ class PluginRegistryStore {
   }
 
   getSlotComponents(slot: string): SlotComponent[] {
+    return this.getSlotRegistrations(slot).map((registration) => registration.Component);
+  }
+
+  /** Stable, plugin-owned slot registrations for host render boundaries. */
+  getSlotRegistrations(slot: string): PluginSlotRegistration[] {
     return this.slotComponents
       .filter((entry) => entry.value.slot === slot)
-      .map((entry) => entry.value.Component);
+      .map((entry) => ({
+        registrationId: entry.value.registrationId,
+        orderingId: entry.value.orderingId,
+        pluginId: entry.pluginId,
+        Component: entry.value.Component,
+      }));
   }
 
   /**
@@ -153,6 +223,23 @@ class PluginRegistryStore {
       .map((entry) => entry.value.handler);
   }
 
+  /**
+   * All registered keybinding handlers plus their owning pluginId, in
+   * registration order. Registration order is the dispatch-order tiebreaker
+   * when two plugins bind the same effective combo (see
+   * `hooks/use-plugin-shortcuts.ts`).
+   */
+  getKeybindingHandlers(): (PluginKeybindingHandler & { pluginId: string })[] {
+    return this.keybindingHandlers.map((entry) => ({ ...entry.value, pluginId: entry.pluginId }));
+  }
+
+  /** The `pluginId`'s bound handler for `id`, if any (first match wins). */
+  getKeybindingHandler(pluginId: string, id: string): ((event: KeyboardEvent) => void) | undefined {
+    return this.keybindingHandlers.find(
+      (entry) => entry.pluginId === pluginId && entry.value.id === id,
+    )?.value.handler;
+  }
+
   /** Registry view scoped to one plugin — matches the frozen `PluginRegistry` contract. */
   forPlugin(pluginId: string, pluginName?: string): PluginRegistry {
     if (pluginName) this.pluginNames.set(pluginId, pluginName);
@@ -164,6 +251,7 @@ class PluginRegistryStore {
         this.registerSettingsRoute(pluginId, path, Component),
       registerComponent: (slot, Component) => this.registerComponent(pluginId, slot, Component),
       registerWsHandler: (action, handler) => this.registerWsHandler(pluginId, action, handler),
+      registerKeybinding: (id, handler) => this.registerKeybinding(pluginId, id, handler),
     };
   }
 
@@ -173,7 +261,8 @@ class PluginRegistryStore {
       this.settingsRoutes.length +
       this.navItems.length +
       this.slotComponents.length +
-      this.wsHandlers.length
+      this.wsHandlers.length +
+      this.keybindingHandlers.length
     );
   }
 
@@ -181,6 +270,10 @@ class PluginRegistryStore {
     this.version += 1;
     this.listeners.forEach((listener) => listener());
   }
+}
+
+function pluginSlotOrderingId(pluginId: string, slot: string, ordinal: number): string {
+  return `plugin:${encodeURIComponent(pluginId)}:${encodeURIComponent(slot)}:${ordinal}`;
 }
 
 export const pluginRegistry = new PluginRegistryStore();

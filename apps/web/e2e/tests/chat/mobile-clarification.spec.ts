@@ -10,6 +10,34 @@ import { seedClarificationSession } from "../../helpers/clarification";
 test.describe("Mobile clarification multiline answer", () => {
   test.describe.configure({ retries: 1, timeout: 120_000 });
 
+  test("keeps a pending question open while typing a digit in the inline composer", async ({
+    testPage,
+    apiClient,
+    seedData,
+  }) => {
+    const session = await seedClarificationSession(
+      testPage,
+      apiClient,
+      seedData,
+      "Mobile Clarify Composer Queue",
+      { scenario: "clarification" },
+    );
+
+    await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
+    const composer = session.activeChat().getByTestId("chat-input-editor");
+    await expect(composer).toHaveAttribute("contenteditable", "true", { timeout: 30_000 });
+    await composer.pressSequentially("Queue this from phone 1", { timeout: 30_000 });
+    await expect(composer).toContainText("Queue this from phone 1");
+    await expect(session.clarificationOverlay()).toBeVisible();
+    await testPage.getByTestId("submit-message-button").tap();
+
+    await expect(testPage.getByTestId("queue-chip")).toBeVisible({ timeout: 10_000 });
+    await expect(session.clarificationOverlay()).toBeVisible();
+    await testPage.getByTestId("queue-chip").tap();
+    await expect(testPage.getByTestId("queued-ghost-list")).toBeVisible();
+    await expect(testPage.getByTestId("queue-drain-next")).not.toBeVisible();
+  });
+
   test("Enter inserts a newline and the Send button submits the multiline answer", async ({
     testPage,
     apiClient,
@@ -28,7 +56,10 @@ test.describe("Mobile clarification multiline answer", () => {
     await expect(session.clarificationOverlay()).toBeVisible({ timeout: 30_000 });
 
     const input = session.clarificationInput();
-    await input.click();
+    // Tap the apparent row surface, outside the textarea itself. The whole row
+    // is the mobile touch target and should transfer focus into the textarea.
+    await session.clarificationCustomInput().tap({ position: { x: 4, y: 4 } });
+    await expect(input).toBeFocused();
     await input.pressSequentially("first line");
     // On touch, Enter inserts a newline rather than submitting.
     await input.press("Enter");

@@ -2,6 +2,7 @@
 
 import { cloneElement, isValidElement, useState } from "react";
 import {
+  IconBrandGitlab,
   IconBrandSentry,
   IconCopy,
   IconCircleDot,
@@ -27,9 +28,15 @@ import {
   TaskMoveContextMenuItems,
   type TaskMoveWorkflow,
 } from "@/components/task/task-move-context-menu";
+import { TaskNestContextMenuItems } from "@/components/task/task-nest-context-menu";
 import { useTaskWorkflowMove } from "@/hooks/use-task-workflow-move";
 import { TaskColorMenu } from "./task-switcher-color-menu";
-import { TaskArchiveItem, TaskDeleteItem, TaskDetachItem } from "./task-switcher-action-items";
+import {
+  TaskArchiveItem,
+  TaskCreateSubtaskItem,
+  TaskDeleteItem,
+  TaskDetachItem,
+} from "./task-switcher-action-items";
 import type { TaskSwitcherItem } from "./task-switcher";
 
 export type StepDef = {
@@ -47,10 +54,12 @@ type ContextMenuProps = {
   children: React.ReactElement<{ menuOpen?: boolean }>;
   onRenameTask?: (taskId: string, currentTitle: string) => void;
   onArchiveTask?: (taskId: string) => void;
+  onCreateSubtask?: (taskId: string, taskTitle: string) => void;
   onDeleteTask?: (taskId: string) => void;
   onDetachTask?: (taskId: string) => void;
   onLinkPullRequest?: (taskId: string, taskTitle?: string) => void;
   onLinkIssue?: (taskId: string, taskTitle?: string) => void;
+  onLinkMergeRequest?: (taskId: string, taskTitle?: string) => void;
   onLinkJiraTicket?: (taskId: string, taskTitle?: string) => void;
   onLinkLinearIssue?: (taskId: string, taskTitle?: string) => void;
   onLinkSentryIssue?: (taskId: string, taskTitle?: string) => void;
@@ -78,10 +87,12 @@ export function TaskItemWithContextMenu({
   children,
   onRenameTask,
   onArchiveTask,
+  onCreateSubtask,
   onDeleteTask,
   onDetachTask,
   onLinkPullRequest,
   onLinkIssue,
+  onLinkMergeRequest,
   onLinkJiraTicket,
   onLinkLinearIssue,
   onLinkSentryIssue,
@@ -119,10 +130,12 @@ export function TaskItemWithContextMenu({
           steps={steps}
           onRenameTask={onRenameTask}
           onArchiveTask={onArchiveTask}
+          onCreateSubtask={onCreateSubtask}
           onDeleteTask={onDeleteTask}
           onDetachTask={onDetachTask}
           onLinkPullRequest={onLinkPullRequest}
           onLinkIssue={onLinkIssue}
+          onLinkMergeRequest={onLinkMergeRequest}
           onLinkJiraTicket={onLinkJiraTicket}
           onLinkLinearIssue={onLinkLinearIssue}
           onLinkSentryIssue={onLinkSentryIssue}
@@ -159,6 +172,7 @@ function TaskContextMenuItems(props: TaskContextMenuItemsProps) {
     steps,
     onRenameTask,
     onArchiveTask,
+    onCreateSubtask,
     onDeleteTask,
     onDetachTask,
     onMoveToStep,
@@ -225,6 +239,7 @@ function TaskContextMenuItems(props: TaskContextMenuItemsProps) {
         onTogglePin={withClear(onTogglePin)}
       />
       <TaskRenameItem task={task} disabled={isDeleting} onRenameTask={onRenameTask} />
+      <TaskCreateSubtaskItem task={task} disabled={isDeleting} onCreateSubtask={onCreateSubtask} />
       <ContextMenuItem disabled>
         <IconCopy className="mr-2 h-4 w-4" />
         Duplicate
@@ -238,6 +253,7 @@ function TaskContextMenuItems(props: TaskContextMenuItemsProps) {
         onBulkArchive={onBulkArchive}
       />
       <TaskColorMenu taskId={task.id} disabled={isDeleting} />
+      <TaskNestContextMenuItems task={task} disabled={isDeleting} />
       <TaskLinkMenu disabled={isDeleting} {...selectTaskLinkActions(task, closeMenu, props)} />
       <TaskMoveItems
         task={task}
@@ -357,6 +373,7 @@ function selectTaskLinkActions(
     ContextMenuProps,
     | "onLinkPullRequest"
     | "onLinkIssue"
+    | "onLinkMergeRequest"
     | "onLinkJiraTicket"
     | "onLinkLinearIssue"
     | "onLinkSentryIssue"
@@ -365,6 +382,7 @@ function selectTaskLinkActions(
   return {
     onLinkPullRequest: createTaskLinkSelectAction(task, handlers.onLinkPullRequest, closeMenu),
     onLinkIssue: createTaskLinkSelectAction(task, handlers.onLinkIssue, closeMenu),
+    onLinkMergeRequest: createTaskLinkSelectAction(task, handlers.onLinkMergeRequest, closeMenu),
     onLinkJiraTicket: createTaskLinkSelectAction(task, handlers.onLinkJiraTicket, closeMenu),
     onLinkLinearIssue: createTaskLinkSelectAction(task, handlers.onLinkLinearIssue, closeMenu),
     onLinkSentryIssue: createTaskLinkSelectAction(task, handlers.onLinkSentryIssue, closeMenu),
@@ -504,6 +522,7 @@ function TaskLinkMenu({
   disabled,
   onLinkPullRequest,
   onLinkIssue,
+  onLinkMergeRequest,
   onLinkJiraTicket,
   onLinkLinearIssue,
   onLinkSentryIssue,
@@ -511,6 +530,7 @@ function TaskLinkMenu({
   disabled?: boolean;
   onLinkPullRequest?: () => void;
   onLinkIssue?: () => void;
+  onLinkMergeRequest?: () => void;
   onLinkJiraTicket?: () => void;
   onLinkLinearIssue?: () => void;
   onLinkSentryIssue?: () => void;
@@ -518,6 +538,7 @@ function TaskLinkMenu({
   if (
     !onLinkPullRequest &&
     !onLinkIssue &&
+    !onLinkMergeRequest &&
     !onLinkJiraTicket &&
     !onLinkLinearIssue &&
     !onLinkSentryIssue
@@ -541,6 +562,16 @@ function TaskLinkMenu({
           <ContextMenuItem disabled={disabled} onSelect={onLinkIssue}>
             <IconCircleDot className="mr-2 h-4 w-4" />
             GitHub Issue
+          </ContextMenuItem>
+        )}
+        {onLinkMergeRequest && (
+          <ContextMenuItem
+            className="min-h-12! sm:min-h-7!"
+            disabled={disabled}
+            onSelect={onLinkMergeRequest}
+          >
+            <IconBrandGitlab className="mr-2 h-4 w-4" />
+            GitLab Merge Request
           </ContextMenuItem>
         )}
         {onLinkJiraTicket && (

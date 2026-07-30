@@ -108,6 +108,53 @@ func TestConvertPatPR_Merged(t *testing.T) {
 	}
 }
 
+func TestPATClientSearchPreservesImmutableIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/search/issues" {
+			t.Errorf("path = %q, want /search/issues", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"total_count":1,"items":[{"id":101,"node_id":"PR_kwDOA","number":7,"title":"Fix auth","html_url":"https://github.com/acme/web/pull/7","state":"open","repository_url":"https://api.github.com/repos/acme/web","pull_request":{}}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := newPATClientPointingAt(t, srv.URL)
+	page, err := client.SearchPRsPaged(context.Background(), "", "auth", 1, 5)
+	if err != nil {
+		t.Fatalf("search PRs: %v", err)
+	}
+	if len(page.PRs) != 1 || page.PRs[0].ID != 101 || page.PRs[0].NodeID != "PR_kwDOA" {
+		t.Fatalf("PRs = %#v", page.PRs)
+	}
+}
+
+func TestPATClient_RequestReviewers_UsesGitHubReviewRequestEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/repos/acme/widget/pulls/42/requested_reviewers" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var body struct {
+			Reviewers []string `json:"reviewers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if got := strings.Join(body.Reviewers, ","); got != "octocat,hubot" {
+			t.Errorf("reviewers = %q", got)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	t.Cleanup(srv.Close)
+
+	if err := newPATClientPointingAt(t, srv.URL).RequestReviewers(context.Background(), "acme", "widget", 42, []string{"octocat", "hubot"}); err != nil {
+		t.Fatalf("RequestReviewers: %v", err)
+	}
+}
+
 func TestPATClient_ListCheckRunsPaginatesCheckRuns(t *testing.T) {
 	var requestedPages []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -816,6 +863,32 @@ func TestListAccessibleRepos_QueryFilterAndClamp(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0].FullName != "acme/widget" {
 		t.Fatalf("got %v, want [acme/widget] (case-insensitive substring on full_name)", repos)
+	}
+}
+
+func TestListAccessibleRepos_InstallationUsesInstallationEndpoint(t *testing.T) {
+	var gotPerPage string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/installation/repositories" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		gotPerPage = r.URL.Query().Get("per_page")
+		_, _ = w.Write([]byte(`{"repositories":[
+			{"full_name":"acme/widget","owner":{"login":"acme"},"name":"widget","private":true,"default_branch":"main"}
+		]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewTokenClient("installation-token", TokenPrincipal{Kind: TokenCredentialInstallation})
+	c.httpClient = &http.Client{Transport: &rewriteTransport{base: srv.URL}}
+	repos, err := c.ListAccessibleRepos(context.Background(), "widget", 50)
+	if err != nil {
+		t.Fatalf("ListAccessibleRepos: %v", err)
+	}
+	if gotPerPage != "50" || len(repos) != 1 || repos[0].FullName != "acme/widget" {
+		t.Fatalf("per_page=%q repos=%+v", gotPerPage, repos)
 	}
 }
 

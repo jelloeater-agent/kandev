@@ -1,5 +1,6 @@
 import { useEffect, useCallback } from "react";
 import { useAppStore } from "@/components/state-provider";
+import { useForegroundRefresh } from "@/hooks/use-foreground-refresh";
 import {
   queueMessage,
   clearQueue,
@@ -10,6 +11,7 @@ import {
   QueueEntryNotFoundError,
 } from "@/lib/api/domains/queue-api";
 import type { QueuedMessage } from "@/lib/state/slices/session/types";
+import type { EntityReference } from "@/lib/types/entity-reference";
 
 const EMPTY_ENTRIES: QueuedMessage[] = [];
 
@@ -19,6 +21,15 @@ export type MessageAttachment = {
   mime_type: string;
   name?: string;
   delivery_mode?: "prompt" | "path";
+};
+
+export type QueueMessageInput = {
+  taskId: string;
+  content: string;
+  model?: string;
+  planMode?: boolean;
+  attachments?: MessageAttachment[];
+  entityReferences?: EntityReference[];
 };
 
 /** Selectors over the queue slice for one session. */
@@ -85,13 +96,14 @@ function useQueueActions({
   );
 
   const queue = useCallback(
-    async (
-      taskId: string,
-      content: string,
-      model?: string,
-      planMode?: boolean,
-      attachments?: MessageAttachment[],
-    ) => {
+    async ({
+      taskId,
+      content,
+      model,
+      planMode,
+      attachments,
+      entityReferences,
+    }: QueueMessageInput) => {
       if (!sessionId) return;
       setQueueLoading(sessionId, true);
       try {
@@ -102,6 +114,7 @@ function useQueueActions({
           model,
           plan_mode: planMode,
           attachments,
+          entity_references: entityReferences,
         });
         await refetch(sessionId);
       } finally {
@@ -129,7 +142,12 @@ function useQueueActions({
   const drainNext = useDrainNextAction(sessionId, setQueueLoading, refetch);
 
   const editEntry = useCallback(
-    async (entryId: string, content: string, attachments?: MessageAttachment[]) => {
+    async (
+      entryId: string,
+      content: string,
+      attachments?: MessageAttachment[],
+      entityReferences: EntityReference[] = [],
+    ) => {
       if (!sessionId) return;
       try {
         await updateQueuedMessage({
@@ -137,6 +155,7 @@ function useQueueActions({
           entry_id: entryId,
           content,
           attachments,
+          entity_references: entityReferences,
         });
         await refetch(sessionId);
       } catch (err) {
@@ -195,18 +214,17 @@ export function useQueue(sessionId: string | null) {
     });
   }, [sessionId, connectionStatus, refetch]);
 
-  useEffect(() => {
-    if (!sessionId) return;
-    const refetchOnVisible = () => {
-      if (document.visibilityState !== "visible") return;
+  useForegroundRefresh(
+    () => {
+      if (!sessionId) return;
       if (connectionStatus !== "connected") return;
-      void refetch(sessionId).catch((err) => {
-        console.error("Failed to fetch queue status after visibility change:", err);
+      return refetch(sessionId).catch((err) => {
+        console.error("Failed to fetch queue status after foreground refresh:", err);
       });
-    };
-    document.addEventListener("visibilitychange", refetchOnVisible);
-    return () => document.removeEventListener("visibilitychange", refetchOnVisible);
-  }, [sessionId, connectionStatus, refetch]);
+    },
+    Boolean(sessionId),
+    sessionId,
+  );
 
   const refetchBound = useCallback(
     () => (sessionId ? refetch(sessionId) : Promise.resolve()),

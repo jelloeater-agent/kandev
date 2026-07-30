@@ -7,11 +7,9 @@ description: Verify a feature works after implementation. Actively try to break 
 
 ## Planner Entry
 
-The user-started primary session delegates this
-entire procedure to the registered `qa` worker, reviews its report, and creates
-new implementer assignments for any fixes. It does not run QA or fix findings
-directly. An explicitly assigned `qa` worker continues below and does not spawn
-other workers.
+Run `/qa` only when the user explicitly requests adversarial validation or an
+actionable PR/CI finding needs it. Do not add QA as a pre-PR quality gate:
+task-defined tests and the two PR AI reviewers are the default evidence.
 
 Verify that a feature works as intended after implementation. Assume bugs exist and hunt for them.
 
@@ -19,8 +17,8 @@ Mindset: you are not confirming it works — you are discovering where it breaks
 
 ## Available skills
 
-- **`/tdd`** — Recommend for an implementer assignment when unit or integration coverage is missing.
-- **`/e2e`** — Recommend for an implementer assignment when a user-facing flow lacks browser coverage.
+- **`/tdd`** — Use when unit or integration coverage is missing.
+- **`/e2e`** — Use when a user-facing flow lacks browser coverage.
 
 ---
 
@@ -120,7 +118,7 @@ Check that the implementation has tests covering the behaviors you just verified
 - Are tests at the right level: unit for pure logic, integration for boundaries, E2E for critical browser flows?
 - Do tests assert behavior/state/output rather than implementation details or mock behavior?
 - If tests are missing, report the exact behavior and recommended test level so
-  the planner can assign a `test-engineer` worker.
+  add the focused test in the same conversation.
 - Avoid snapshot tests unless the snapshot change will be deliberately reviewed.
 
 Mark task 5 as completed.

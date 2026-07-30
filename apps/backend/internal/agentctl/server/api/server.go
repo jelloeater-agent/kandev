@@ -113,6 +113,8 @@ func (s *Server) setupRoutes() {
 		// Rebuilds the per-repo tracker set so the new worktree's git/file
 		// events reach the UI without a session restart.
 		api.POST("/workspace/rescan", s.handleRescanWorkspace)
+		api.POST("/workspace/reconcile", s.handleReconcileWorkspace)
+		api.POST("/workspace/rebind", s.handleRebindWorkspace)
 
 		// Per-task base-branch map update: kandev backend hits this when
 		// the user picks a different "Compare against" branch via the
@@ -130,11 +132,14 @@ func (s *Server) setupRoutes() {
 		api.POST("/workspace/file/rename", s.handleFileRename)
 		api.DELETE("/workspace/file", s.handleFileDelete)
 		api.GET("/workspace/search", s.handleFileSearch)
+		api.GET("/workspace/content-search", s.handleWorkspaceContentSearch)
 
 		// Batched copy of files from the host (used by remote executors —
 		// Docker, Sprites — to seed the workspace with gitignored config
 		// after the in-container clone).
 		api.POST("/workspace/copy-files", s.handleWorkspaceCopyFiles)
+		api.POST("/workspace/materialize-repository", s.handleWorkspaceMaterializeRepository)
+		api.POST("/workspace/materialize-repository/remove", s.handleWorkspaceRemoveMaterializedRepository)
 
 		// Shell access (HTTP endpoints only - streaming is via /workspace/stream)
 		api.GET("/shell/status", s.handleShellStatus)
@@ -374,9 +379,21 @@ func (s *Server) handleStart(c *gin.Context) {
 // AgentConfigure request/response - configures the agent command before starting
 type AgentConfigureRequest struct {
 	Command         string            `json:"command"`
+	AgentArgs       optionalArgs      `json:"agent_args"`
 	ContinueCommand string            `json:"continue_command,omitempty"` // For one-shot agents (Amp): command for follow-up prompts
+	ContinueArgs    optionalArgs      `json:"continue_args"`
 	Env             map[string]string `json:"env,omitempty"`
 	ApprovalPolicy  string            `json:"approval_policy,omitempty"` // For Codex: "untrusted", "on-failure", "on-request", "never"
+}
+
+type optionalArgs struct {
+	Present bool
+	Args    []string
+}
+
+func (a *optionalArgs) UnmarshalJSON(data []byte) error {
+	a.Present = true
+	return json.Unmarshal(data, &a.Args)
 }
 
 type AgentConfigureResponse struct {
@@ -395,7 +412,7 @@ func (s *Server) handleAgentConfigure(c *gin.Context) {
 		return
 	}
 
-	if req.Command == "" {
+	if !req.AgentArgs.Present && req.Command == "" {
 		c.JSON(http.StatusBadRequest, AgentConfigureResponse{
 			Success: false,
 			Error:   "command is required",
@@ -403,7 +420,7 @@ func (s *Server) handleAgentConfigure(c *gin.Context) {
 		return
 	}
 
-	if err := s.procMgr.Configure(req.Command, req.Env, req.ApprovalPolicy, req.ContinueCommand); err != nil {
+	if err := s.procMgr.Configure(req.Command, req.AgentArgs.Args, req.AgentArgs.Present, req.Env, req.ApprovalPolicy, req.ContinueCommand, req.ContinueArgs.Args, req.ContinueArgs.Present); err != nil {
 		s.logger.Error("failed to configure agent", zap.Error(err), zap.String("command", req.Command))
 		c.JSON(http.StatusInternalServerError, AgentConfigureResponse{
 			Success: false,

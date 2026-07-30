@@ -16,6 +16,7 @@ export type BootRoute = {
 export type BootRuntime = {
   apiPrefix?: string;
   webSocketPath?: string;
+  hostOS?: string;
   debug?: boolean;
 };
 
@@ -46,6 +47,8 @@ export type BootPayload = {
   initialState?: Partial<AppState>;
   routeData?: BootRouteData;
   plugins?: ActivePlugin[];
+  /** Replayable per-boot CSRF/accidental-mutation interlock; not authentication. */
+  interimSettingsInterlockToken?: string;
 };
 
 type BootWindow = Window & {
@@ -68,7 +71,17 @@ export function readBootPayload(win: Window = window): BootPayload {
     initialState: isRecord(payload.initialState) ? (payload.initialState as Partial<AppState>) : {},
     routeData: isRecord(payload.routeData) ? (payload.routeData as BootRouteData) : undefined,
     plugins: Array.isArray(payload.plugins) ? readPlugins(payload.plugins) : undefined,
+    interimSettingsInterlockToken: readNonEmptyString(payload.interimSettingsInterlockToken),
   };
+}
+
+export function readInterimSettingsInterlockToken(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  return readBootPayload(window).interimSettingsInterlockToken;
+}
+
+export function readBackendHostOS(win: Window = window): string | undefined {
+  return readBootPayload(win).runtime?.hostOS;
 }
 
 function readPlugins(value: unknown[]): ActivePlugin[] {
@@ -125,12 +138,18 @@ function readRuntime(value: Record<string, unknown>): BootRuntime {
   return {
     apiPrefix: readString(value.apiPrefix),
     webSocketPath: readString(value.webSocketPath),
+    hostOS: readString(value.hostOS),
     debug: value.debug === true ? true : undefined,
   };
 }
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  const result = readString(value);
+  return result ? result : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

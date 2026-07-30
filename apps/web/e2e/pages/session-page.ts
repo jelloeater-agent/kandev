@@ -1,9 +1,9 @@
 import { type Locator, type Page, expect } from "@playwright/test";
 
-/** Maps old state-section labels to the new per-task state icon data-testid. */
+/** Maps state-section labels to the per-task state icon data-testid. */
 function sectionLabelToStateTestId(label: string): string {
   if (label === "Running") return "task-state-running";
-  if (label === "Turn Finished") return "task-state-review";
+  if (label === "Turn Finished") return "task-state-turn-finished";
   return "task-state-backlog";
 }
 
@@ -49,6 +49,9 @@ export class SessionPage {
   }
 
   // Chat status bar locators
+  appStatusBar() {
+    return this.page.getByTestId("app-status-bar");
+  }
   chatStatusBar() {
     return this.page.getByTestId("chat-status-bar");
   }
@@ -263,6 +266,10 @@ export class SessionPage {
     await taskRow.click({ button: "right" });
   }
 
+  async openCreateSubtaskForSidebarTask(title: string): Promise<void> {
+    await this.openSidebarMenuAndClick(title, "Create Subtask");
+  }
+
   async sendSidebarTaskToWorkflow(
     title: string,
     workflowId: string,
@@ -279,6 +286,13 @@ export class SessionPage {
    * Accepts "Turn Finished" (review/completed), "Running" (in-progress), or "Backlog".
    */
   sidebarSection(label: string): Locator {
+    if (label === "Turn Finished") {
+      return this.sidebar
+        .locator(
+          '[data-testid="task-state-turn-finished"], [data-testid="task-state-workflow-complete"]',
+        )
+        .first();
+    }
     const testId = sectionLabelToStateTestId(label);
     return this.sidebar.getByTestId(testId).first();
   }
@@ -288,6 +302,16 @@ export class SessionPage {
    * Accepts "Turn Finished" (review/completed), "Running" (in-progress), or "Backlog".
    */
   taskInSection(title: string, sectionLabel: string): Locator {
+    if (sectionLabel === "Turn Finished") {
+      return this.sidebar
+        .getByTestId("sidebar-task-item")
+        .filter({ has: this.page.getByText(title, { exact: false }) })
+        .filter({
+          has: this.page.locator(
+            '[data-testid="task-state-turn-finished"], [data-testid="task-state-workflow-complete"]',
+          ),
+        });
+    }
     const testId = sectionLabelToStateTestId(sectionLabel);
     return this.sidebar
       .getByTestId("sidebar-task-item")
@@ -295,9 +319,11 @@ export class SessionPage {
       .filter({ has: this.page.getByTestId(testId) });
   }
 
-  /** Agent STARTING or RUNNING status indicator. */
+  /** Foreground or detached-background working status indicator. */
   agentStatus(): Locator {
-    return this.page.getByRole("status", { name: /Agent is (starting|running)/ });
+    return this.page.getByRole("status", {
+      name: /Agent is (starting|running)|Background work is running/,
+    });
   }
 
   /** Divider that appears after the "New session started" status message is rendered. */
@@ -352,6 +378,11 @@ export class SessionPage {
   /** Custom text input on the clarification overlay. */
   clarificationInput(): Locator {
     return this.page.getByTestId("clarification-input");
+  }
+
+  /** Apparent custom-answer row surrounding the textarea. */
+  clarificationCustomInput(): Locator {
+    return this.activeChat().getByTestId("clarification-custom-input");
   }
 
   /** Inline Send button shown next to the custom input on touch devices. */
@@ -568,6 +599,21 @@ export class SessionPage {
    * current GitHub user authored the PR (self-approval is rejected upstream). */
   prApproveButton(): Locator {
     return this.page.getByTestId("pr-approve-button");
+  }
+
+  /** Submitted review row scoped by its normalized GitHub author login. */
+  prSubmittedReview(author: string): Locator {
+    return this.page.getByTestId(`pr-submitted-review-${author.trim().toLowerCase()}`);
+  }
+
+  /** Pending reviewer row scoped by its normalized GitHub author login. */
+  prPendingReviewer(author: string): Locator {
+    return this.page.getByTestId(`pr-pending-reviewer-${author.trim().toLowerCase()}`);
+  }
+
+  /** Re-request action scoped by its normalized GitHub author login. */
+  prReRequestReviewButton(author: string): Locator {
+    return this.page.getByTestId(`pr-rerequest-review-${author.trim().toLowerCase()}`);
   }
 
   // --- PR CI accessors: desktop hover popover + chip + mobile chip drawer ---
@@ -838,6 +884,59 @@ export class SessionPage {
   /** Compact request button in the expanded Review Changes toolbar. */
   reviewRequestWalkthroughButton(): Locator {
     return this.page.getByTestId("review-request-walkthrough");
+  }
+
+  /** Expanded Review dialog shared by the desktop and mobile task layouts. */
+  reviewDialog(): Locator {
+    return this.page.getByRole("dialog", { name: "Review Changes" });
+  }
+
+  /** Current-PR trigger rendered in Review when the task has multiple PRs. */
+  reviewPRSelectorTrigger(): Locator {
+    return this.page.getByTestId("review-pr-selector-trigger");
+  }
+
+  /** Portaled PR selector menu; intentionally page-scoped rather than dialog-scoped. */
+  reviewPRSelectorMenu(): Locator {
+    return this.page.getByTestId("review-pr-selector-menu");
+  }
+
+  /** One PR choice in the expanded Review selector. */
+  reviewPRSelectorItem(owner: string, repo: string, prNumber: number): Locator {
+    return this.page.getByTestId(`review-pr-selector-item-${owner}-${repo}-${prNumber}`);
+  }
+
+  /** Sticky diff header for one file in the expanded Review dialog. */
+  reviewFileHeader(path: string): Locator {
+    return this.reviewDialog().locator(
+      `[data-testid="review-file-header"][data-file-path=${JSON.stringify(path)}]`,
+    );
+  }
+
+  /**
+   * Read visible Review diff text from @pierre/diffs shadow roots.
+   *
+   * Dockview can leave hidden diff surfaces mounted, so scope to the active
+   * Review dialog and ignore zero-size/hidden containers before reading them.
+   */
+  async reviewDiffText(): Promise<string> {
+    return this.reviewDialog().evaluate((dialog) => {
+      const visibleContainers = Array.from(dialog.querySelectorAll("diffs-container")).filter(
+        (container) => {
+          const bounds = container.getBoundingClientRect();
+          const style = window.getComputedStyle(container);
+          return (
+            bounds.width > 0 &&
+            bounds.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden"
+          );
+        },
+      );
+      return visibleContainers
+        .map((container) => container.shadowRoot?.textContent ?? "")
+        .join("\n");
+    });
   }
 
   walkthroughLauncher(): Locator {
@@ -1284,6 +1383,11 @@ export class SessionPage {
    *  wrapper, so we anchor on that wrapper rather than `.dv-default-tab` itself. */
   primaryStarInTab(text: string): Locator {
     return this.sessionTabByText(text).locator(".tabler-icon-star").first();
+  }
+
+  /** Primary star icon inside a session tab identified by its session ID. */
+  primaryStarInSessionTab(sessionId: string): Locator {
+    return this.sessionTabBySessionId(sessionId).locator(".tabler-icon-star").first();
   }
 
   /** "Move to next step" button in the chat status bar. */

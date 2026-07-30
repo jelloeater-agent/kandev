@@ -1,6 +1,69 @@
 // GitHub integration types
 
-export type GitHubAuthMethod = "gh_cli" | "pat" | "none";
+import type { GitHubAppRegistration } from "./github-app";
+
+export * from "./github-app";
+
+export type GitHubAuthMethod =
+  | "gh_cli"
+  | "pat"
+  | "github_app_installation"
+  | "legacy_shared"
+  | "none";
+
+export type GitHubConnectionSource = Exclude<GitHubAuthMethod, "none">;
+export type GitHubConnectionState = "active" | "invalid" | "suspended" | "revoked";
+
+export type GitHubAuthPrincipal = {
+  kind: "human" | "app";
+  source: GitHubConnectionSource | "github_app_user";
+  login?: string;
+  installation_id?: number;
+  app_registration_id?: string;
+  app_credential_generation?: number;
+  workspace_id: string;
+  user_id?: string;
+};
+
+export type GitHubAutomationConnection = {
+  workspace_id: string;
+  source: GitHubConnectionSource;
+  github_host: string;
+  login?: string;
+  installation_id?: number;
+  installation_account_login?: string;
+  installation_account_type?: string;
+  app_registration_id?: string;
+  status: GitHubConnectionState;
+  actor?: GitHubAuthPrincipal;
+  capabilities?: Record<string, boolean>;
+  missing_capabilities?: string[];
+  missing_permissions?: string[];
+  legacy_migration?: boolean;
+  credential_generation: number;
+  last_error?: string;
+};
+
+export type GitHubPersonalConnection = {
+  workspace_id: string;
+  user_id: string;
+  app_registration_id: string;
+  github_user_id: number;
+  login: string;
+  status: GitHubConnectionState;
+  access_expires_at: string;
+  refresh_expires_at?: string;
+  credential_generation: number;
+  last_error?: string;
+};
+
+export type GitHubCLIAccount = {
+  host: string;
+  login: string;
+  active: boolean;
+  state: string;
+  selected?: boolean;
+};
 
 export type AuthDiagnostics = {
   command: string;
@@ -9,6 +72,15 @@ export type AuthDiagnostics = {
 };
 
 export type GitHubStatus = {
+  workspace_id?: string;
+  automation?: GitHubAutomationConnection | null;
+  personal?: GitHubPersonalConnection | null;
+  app_registration?: GitHubAppRegistration | null;
+  app_available?: boolean;
+  github_app_available?: boolean;
+  effective_personal_actor?: GitHubAuthPrincipal | null;
+  effective_manual_mutation_actor?: GitHubAuthPrincipal | null;
+  /** Compatibility fields for existing PR/issue surfaces. */
   authenticated: boolean;
   username: string;
   auth_method: GitHubAuthMethod;
@@ -196,6 +268,12 @@ export type TaskCIPRAutomationState = {
   auto_fix_exhausted_at: string | null;
   last_merge_signature: string;
   last_merge_attempt_at: string | null;
+  review_request_initialized?: boolean;
+  last_review_requested?: boolean;
+  last_observed_pr_state?: string;
+  last_lifecycle_event?: string;
+  last_lifecycle_prompt_at?: string | null;
+  last_lifecycle_session_id?: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -209,6 +287,10 @@ export type TaskCIAutomationOptions = {
   auto_fix_max_rounds?: number;
   effective_auto_fix_prompt: string;
   using_default_prompt: boolean;
+  prompt_on_review_requested?: boolean;
+  prompt_on_merged?: boolean;
+  prompt_on_closed?: boolean;
+  review_reviewer_login?: string;
   updated_at: string;
   pr_states: TaskCIPRAutomationState[];
 };
@@ -217,6 +299,9 @@ export type TaskCIAutomationPatch = {
   auto_fix_enabled?: boolean;
   auto_merge_enabled?: boolean;
   auto_fix_prompt_override?: string | null;
+  prompt_on_review_requested?: boolean;
+  prompt_on_merged?: boolean;
+  prompt_on_closed?: boolean;
 };
 
 export type PRWatch = {
@@ -240,9 +325,11 @@ export type RepoFilter = {
 };
 
 export type GitHubRepoScopeMode = "all" | "orgs" | "repos";
+export type TaskGitCredentialsMode = "managed" | "executor";
 
 export type GitHubWorkspaceSettings = {
   workspace_id: string;
+  task_git_credentials_mode?: TaskGitCredentialsMode;
   repo_scope_mode: GitHubRepoScopeMode;
   repo_scope_orgs: string[];
   repo_scope_repos: RepoFilter[];
@@ -254,6 +341,7 @@ export type GitHubWorkspaceSettings = {
 
 export type UpdateGitHubWorkspaceSettingsRequest = {
   workspace_id: string;
+  task_git_credentials_mode?: TaskGitCredentialsMode;
   repo_scope_mode?: GitHubRepoScopeMode;
   repo_scope_orgs?: string[];
   repo_scope_repos?: RepoFilter[];

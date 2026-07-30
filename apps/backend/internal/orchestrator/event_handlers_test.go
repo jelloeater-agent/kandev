@@ -252,6 +252,7 @@ type mockAgentManager struct {
 	// Passthrough stdin tracking
 	passthroughStdinCalls []passthroughStdinCall
 	passthroughStdinErr   error
+	passthroughStdinFunc  func(context.Context, string, string) error
 	markPassthroughCalls  []string // session IDs
 	markPassthroughErr    error
 
@@ -381,6 +382,14 @@ func (m *mockAgentManager) PromptAgent(ctx context.Context, executionID string, 
 	}
 	return &executor.PromptResult{}, nil
 }
+
+func (m *mockAgentManager) PromptAgentWithDispatchCallback(ctx context.Context, executionID string, prompt string, attachments []v1.MessageAttachment, dispatchOnly bool, onDispatched func()) (*executor.PromptResult, error) {
+	result, err := m.PromptAgent(ctx, executionID, prompt, attachments, dispatchOnly)
+	if err == nil && onDispatched != nil {
+		onDispatched()
+	}
+	return result, err
+}
 func (m *mockAgentManager) CancelAgent(_ context.Context, _ string) error {
 	m.cancelAgentCalls.Add(1)
 	if m.cancelAgentEntered != nil {
@@ -482,11 +491,16 @@ func (m *mockAgentManager) GetSessionAuthMethods(_ string) []streams.AuthMethodI
 func (m *mockAgentManager) IsPassthroughSession(_ context.Context, _ string) bool {
 	return m.isPassthrough
 }
-func (m *mockAgentManager) WritePassthroughStdin(_ context.Context, sessionID string, data string) error {
+func (m *mockAgentManager) WritePassthroughStdin(ctx context.Context, sessionID string, data string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.passthroughStdinCalls = append(m.passthroughStdinCalls, passthroughStdinCall{SessionID: sessionID, Data: data})
-	return m.passthroughStdinErr
+	writeFunc := m.passthroughStdinFunc
+	err := m.passthroughStdinErr
+	m.mu.Unlock()
+	if writeFunc != nil {
+		return writeFunc(ctx, sessionID, data)
+	}
+	return err
 }
 func (m *mockAgentManager) ResolvePassthroughConfig(_ context.Context, _ string) (agents.PassthroughConfig, error) {
 	m.mu.Lock()
@@ -607,6 +621,7 @@ func seedSession(t *testing.T, repo *sqliterepo.Repository, taskID, sessionID, w
 	// Create task
 	task := &models.Task{
 		ID:             taskID,
+		WorkspaceID:    "ws1",
 		WorkflowID:     "wf1",
 		WorkflowStepID: workflowStepID,
 		Title:          "Test Task",
@@ -630,6 +645,18 @@ func seedSession(t *testing.T, repo *sqliterepo.Repository, taskID, sessionID, w
 	if err := repo.CreateTaskSession(ctx, session); err != nil {
 		t.Fatalf("failed to create task session: %v", err)
 	}
+}
+
+type ownershipOverrideRepo struct {
+	sessionExecutorStore
+	tasks map[string]*models.Task
+}
+
+func (r ownershipOverrideRepo) GetTask(ctx context.Context, id string) (*models.Task, error) {
+	if task, ok := r.tasks[id]; ok {
+		return task, nil
+	}
+	return r.sessionExecutorStore.GetTask(ctx, id)
 }
 
 // seedExecutorRunning attaches an executors_running row to a session so the
@@ -664,7 +691,7 @@ func createTestServiceWithAgent(repo *sqliterepo.Repository, stepGetter *mockSte
 	if mock, ok := agentMgr.(*mockAgentManager); ok && mock.repoForExecutionLookup == nil {
 		mock.repoForExecutionLookup = repo
 	}
-	return &Service{
+	svc := &Service{
 		logger:             log,
 		repo:               repo,
 		workflowStepGetter: stepGetter,
@@ -672,6 +699,10 @@ func createTestServiceWithAgent(repo *sqliterepo.Repository, stepGetter *mockSte
 		agentManager:       agentMgr,
 		messageQueue:       messagequeue.NewServiceMemory(log),
 	}
+	repo.SetTaskQueuePurger(func(ctx context.Context, taskID string) {
+		_, _ = svc.messageQueue.PurgeTask(ctx, taskID)
+	})
+	return svc
 }
 
 // --- Tests ---
@@ -1246,6 +1277,8 @@ func TestExecuteQueuedMessage_RequeuesTransientPromptFailure(t *testing.T) {
 	}
 	svc := createTestServiceWithAgent(repo, newMockStepGetter(), taskRepo, agentMgr)
 	svc.executor = executor.NewExecutor(agentMgr, repo, testLogger(), executor.ExecutorConfig{})
+	messages := &mockMessageCreator{}
+	svc.messageCreator = messages
 
 	queuedMsg := &messagequeue.QueuedMessage{
 		ID:        "q1",
@@ -1264,6 +1297,27 @@ func TestExecuteQueuedMessage_RequeuesTransientPromptFailure(t *testing.T) {
 	}
 	if status.Entries[0].Content != "hello" {
 		t.Fatalf("expected queued content to be preserved, got %q", status.Entries[0].Content)
+	}
+	if status.Entries[0].Metadata[metaKeyUserMessageRecorded] != true {
+		t.Fatalf("expected requeued transient prompt to retain recorded-user-message metadata, got %#v", status.Entries[0].Metadata)
+	}
+
+	secondPromptDone := make(chan struct{})
+	agentMgr.mu.Lock()
+	agentMgr.promptErr = nil
+	agentMgr.promptDone = secondPromptDone
+	agentMgr.capturedPrompts = agentMgr.capturedPrompts[:0]
+	agentMgr.capturedPromptCalls = agentMgr.capturedPromptCalls[:0]
+	agentMgr.mu.Unlock()
+
+	svc.handleAgentBootReady(ctx, watcher.AgentEventData{TaskID: "t1", SessionID: "s1"})
+	select {
+	case <-secondPromptDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("boot-ready drain did not dispatch the transiently requeued prompt")
+	}
+	if len(messages.userMessages) != 1 {
+		t.Fatalf("expected boot-ready drain to reuse the existing user message, got %d", len(messages.userMessages))
 	}
 }
 
@@ -1446,7 +1500,7 @@ func createTestServiceWithScheduler(repo *sqliterepo.Repository, stepGetter *moc
 	log := testLogger()
 	exec := executor.NewExecutor(agentMgr, repo, log, executor.ExecutorConfig{})
 	sched := scheduler.NewScheduler(queue.NewTaskQueue(100), exec, taskRepo, log, scheduler.SchedulerConfig{})
-	return &Service{
+	svc := &Service{
 		logger:             log,
 		repo:               repo,
 		workflowStepGetter: stepGetter,
@@ -1456,6 +1510,10 @@ func createTestServiceWithScheduler(repo *sqliterepo.Repository, stepGetter *moc
 		executor:           exec,
 		scheduler:          sched,
 	}
+	repo.SetTaskQueuePurger(func(ctx context.Context, taskID string) {
+		_, _ = svc.messageQueue.PurgeTask(ctx, taskID)
+	})
+	return svc
 }
 
 func TestHandleAgentCompleted_CleansUpExecution(t *testing.T) {
@@ -2315,6 +2373,45 @@ func TestHandleRecoverableFailure(t *testing.T) {
 	})
 }
 
+func TestIsOfficeSessionUsesCanonicalTaskOwnership(t *testing.T) {
+	tests := []struct {
+		name         string
+		isFromOffice bool
+		sessionAgent string
+		want         bool
+	}{
+		{name: "unassigned Office task", isFromOffice: true, want: true},
+		{name: "assigned Kanban session", sessionAgent: "assigned-agent", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := setupTestRepo(t)
+			seedSession(t, repo, "t1", "s1", "")
+			session, err := repo.GetTaskSession(ctx, "s1")
+			if err != nil {
+				t.Fatalf("get session: %v", err)
+			}
+			session.AgentProfileID = tt.sessionAgent
+			if err := repo.UpdateTaskSession(ctx, session); err != nil {
+				t.Fatalf("update session: %v", err)
+			}
+
+			svc := createTestService(repo, newMockStepGetter(), newMockTaskRepo())
+			svc.repo = ownershipOverrideRepo{
+				sessionExecutorStore: repo,
+				tasks: map[string]*models.Task{"t1": {
+					ID: "t1", IsFromOffice: tt.isFromOffice,
+				}},
+			}
+			if got := svc.isOfficeSession(ctx, "s1"); got != tt.want {
+				t.Fatalf("isOfficeSession = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandleAgentStartFailed(t *testing.T) {
 	ctx := context.Background()
 
@@ -2429,60 +2526,6 @@ func TestHandleAgentStartFailed(t *testing.T) {
 	})
 }
 
-func TestHandleResumeFailure(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("clears resume token and sets WAITING_FOR_INPUT", func(t *testing.T) {
-		repo := setupTestRepo(t)
-		now := time.Now().UTC()
-		seedSession(t, repo, "t1", "s1", "step1")
-
-		// Add executor running with resume token
-		_ = repo.UpsertExecutorRunning(ctx, &models.ExecutorRunning{
-			ID: "er1", SessionID: "s1", TaskID: "t1", ResumeToken: "acp-session-old",
-			CreatedAt: now, UpdatedAt: now,
-		})
-
-		taskRepo := newMockTaskRepo()
-		seedMockTaskState(taskRepo, "t1", v1.TaskStateInProgress)
-		svc := createTestService(repo, newMockStepGetter(), taskRepo)
-
-		result := svc.handleResumeFailure(ctx, watcher.AgentEventData{
-			TaskID:           "t1",
-			SessionID:        "s1",
-			AgentExecutionID: "exec-1",
-			ErrorMessage:     "resume failed: session expired",
-		})
-
-		if !result {
-			t.Error("expected handleResumeFailure to return true")
-		}
-
-		// Verify resume token was cleared
-		running, err := repo.GetExecutorRunningBySessionID(ctx, "s1")
-		if err != nil {
-			t.Fatalf("failed to get executor running: %v", err)
-		}
-		if running.ResumeToken != "" {
-			t.Errorf("expected empty resume token, got %q", running.ResumeToken)
-		}
-
-		// Verify session state
-		session, err := repo.GetTaskSession(ctx, "s1")
-		if err != nil {
-			t.Fatalf("failed to get session: %v", err)
-		}
-		if session.State != models.TaskSessionStateWaitingForInput {
-			t.Errorf("expected session state %q, got %q", models.TaskSessionStateWaitingForInput, session.State)
-		}
-
-		// Verify task moved to REVIEW
-		if state, ok := taskRepo.updatedStates["t1"]; !ok || state != v1.TaskStateReview {
-			t.Errorf("expected task state %q, got %q (ok=%v)", v1.TaskStateReview, state, ok)
-		}
-	})
-}
-
 func TestHandleAgentFailed_RecoverableWithSession(t *testing.T) {
 	ctx := context.Background()
 
@@ -2519,7 +2562,7 @@ func TestHandleAgentFailed_RecoverableWithSession(t *testing.T) {
 		}
 	})
 
-	t.Run("routes to resume failure when resume token exists and init not completed", func(t *testing.T) {
+	t.Run("retains resume token when ACP fails before initialization", func(t *testing.T) {
 		repo := setupTestRepo(t)
 		now := time.Now().UTC()
 		seedSession(t, repo, "t1", "s1", "step1")
@@ -2540,13 +2583,14 @@ func TestHandleAgentFailed_RecoverableWithSession(t *testing.T) {
 			ErrorMessage:     "resume failed",
 		})
 
-		// Resume token should be cleared
+		// A pre-ACP failure is retryable; only explicit fresh-start recovery clears
+		// the provider-native session identity.
 		running, err := repo.GetExecutorRunningBySessionID(ctx, "s1")
 		if err != nil {
 			t.Fatalf("failed to get executor running: %v", err)
 		}
-		if running.ResumeToken != "" {
-			t.Errorf("expected resume token to be cleared, got %q", running.ResumeToken)
+		if running.ResumeToken != "acp-session-old" {
+			t.Errorf("expected resume token to be retained, got %q", running.ResumeToken)
 		}
 
 		// Session should be WAITING_FOR_INPUT

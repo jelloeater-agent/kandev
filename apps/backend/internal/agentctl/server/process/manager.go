@@ -4,7 +4,6 @@ package process
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +25,7 @@ import (
 	"github.com/kandev/kandev/internal/agentctl/types"
 	"github.com/kandev/kandev/internal/agentctl/types/streams"
 	"github.com/kandev/kandev/internal/common/logger"
+	"github.com/kandev/kandev/internal/gitconfigenv"
 	tools "github.com/kandev/kandev/internal/tools/installer"
 	"go.uber.org/zap"
 )
@@ -69,8 +69,6 @@ type PermissionNotification struct {
 
 // defaultStderrBufferSize is the number of recent stderr lines to keep for error context
 const defaultStderrBufferSize = 50
-
-const agentTempDirRoot = "kandev-agent"
 
 const processKillRequiredExitGrace = 250 * time.Millisecond
 
@@ -117,6 +115,11 @@ type Manager struct {
 	// swap it when transitioning single→multi mode.
 	repoTrackers   []*WorkspaceTracker
 	repoTrackersMu sync.RWMutex
+	// workspaceSourceRoots is the canonical durable-source allowlist used both
+	// by workspace operations and repository-child discovery. It is guarded by
+	// repoTrackersMu so a rebind snapshots its proposed policy before creating
+	// replacement trackers.
+	workspaceSourceRoots []string
 	// rescanMu serializes RescanRepositories calls so two concurrent
 	// rescans can't both observe an empty tracker set and double-bootstrap
 	// (or both append duplicate trackers for the same new child). The
@@ -182,15 +185,6 @@ type Manager struct {
 
 	// Final command string (full command with all adapter args)
 	finalCommand string
-
-	// agentTempRoot and agentTempDir record the exact temporary directory
-	// created for this manager. The retained Root keeps cleanup anchored to the
-	// directory opened at creation even if its pathname is later replaced.
-	agentTempRoot       string
-	agentTempDir        string
-	agentTempChild      string
-	agentTempRootHandle *os.Root
-	agentTempMu         sync.Mutex
 
 	// Synchronization
 	mu               sync.RWMutex
@@ -278,10 +272,11 @@ func (m *Manager) BeginStop() {
 func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
 	cfg.WorkDir = resolveExistingWorkDir(cfg.WorkDir, log.WithFields(zap.String("component", "process-manager")))
 	m := &Manager{
-		cfg:                cfg,
-		logger:             log.WithFields(zap.String("component", "process-manager")),
-		updatesCh:          make(chan adapter.AgentEvent, 100),
-		pendingPermissions: make(map[string]*PendingPermission),
+		cfg:                  cfg,
+		logger:               log.WithFields(zap.String("component", "process-manager")),
+		updatesCh:            make(chan adapter.AgentEvent, 100),
+		pendingPermissions:   make(map[string]*PendingPermission),
+		workspaceSourceRoots: canonicalWorkspaceSourceRoots(cfg.WorkspaceSourceRoots),
 	}
 	// Multi-repo task roots hold one git worktree per repository as siblings.
 	// In that case build a per-repo tracker for each child so each emits its
@@ -289,20 +284,23 @@ func NewManager(cfg *config.InstanceConfig, log *logger.Logger) *Manager {
 	// can show all repos. The root tracker covers the single-repo case via
 	// preferGitRepoChildIfRootIsBare; we skip its fallback when we've already
 	// detected a multi-repo root to avoid double-tracking the first repo.
-	repoChildren := scanRepositorySubdirs(cfg.WorkDir)
+	repoChildren := scanRepositorySubdirs(cfg.WorkDir, m.workspaceSourceRoots)
 	if len(repoChildren) >= 2 {
 		// Multi-repo: root tracker bound to the bare task root (no fallback,
 		// no events), plus one tracker per repo subdir.
 		m.workspaceTracker = NewWorkspaceTrackerForRepo(cfg.WorkDir, "", log)
 		m.workspaceTracker.SetBaseBranch(lookupBaseBranch(cfg.BaseBranches, ""))
+		m.workspaceTracker.SetAllowedSourceRoots(cfg.WorkspaceSourceRoots)
 		for _, child := range repoChildren {
 			tr := NewWorkspaceTrackerForRepo(child.path, child.name, log)
 			tr.SetBaseBranch(lookupBaseBranch(cfg.BaseBranches, child.name))
+			tr.SetAllowedSourceRoots(cfg.WorkspaceSourceRoots)
 			m.repoTrackers = append(m.repoTrackers, tr)
 		}
 	} else {
 		m.workspaceTracker = NewWorkspaceTracker(cfg.WorkDir, log)
 		m.workspaceTracker.SetBaseBranch(lookupBaseBranch(cfg.BaseBranches, ""))
+		m.workspaceTracker.SetAllowedSourceRoots(cfg.WorkspaceSourceRoots)
 	}
 	m.processRunner = NewProcessRunner(m.workspaceTracker, log, cfg.ProcessBufferMaxBytes)
 	m.shellMgr = shell.NewManager(cfg.WorkDir, log)
@@ -338,6 +336,33 @@ func (m *Manager) setBaseBranches(branches map[string]string) {
 		return
 	}
 	m.cfg.BaseBranches = branches
+}
+
+// SetWorkspaceSourceRoots atomically refreshes the canonical durable-source
+// allowlist used by workspace file operations. Roots are set on every active
+// tracker because rebind/rescan can swap the root tracker live.
+func (m *Manager) SetWorkspaceSourceRoots(roots []string) {
+	canonical := canonicalWorkspaceSourceRoots(roots)
+	m.rescanMu.Lock()
+	defer m.rescanMu.Unlock()
+	m.repoTrackersMu.RLock()
+	trackers := append([]*WorkspaceTracker{m.workspaceTracker}, m.repoTrackers...)
+	m.repoTrackersMu.RUnlock()
+	m.repoTrackersMu.Lock()
+	m.workspaceSourceRoots = canonical
+	m.cfg.WorkspaceSourceRoots = append([]string(nil), canonical...)
+	m.repoTrackersMu.Unlock()
+	for _, tracker := range trackers {
+		if tracker != nil {
+			tracker.SetAllowedSourceRoots(canonical)
+		}
+	}
+}
+
+func (m *Manager) currentWorkspaceSourceRoots() []string {
+	m.repoTrackersMu.RLock()
+	defer m.repoTrackersMu.RUnlock()
+	return append([]string(nil), m.workspaceSourceRoots...)
 }
 
 // lookupBaseBranch reads the task's recorded base branch for a given
@@ -377,7 +402,7 @@ type repositorySubdir struct {
 // that are themselves git repositories or worktrees. Returns an empty slice
 // when workDir doesn't exist, isn't readable, or contains zero git children.
 // Used to detect multi-repo task roots at Manager construction.
-func scanRepositorySubdirs(workDir string) []repositorySubdir {
+func scanRepositorySubdirs(workDir string, allowedSourceRoots []string) []repositorySubdir {
 	if workDir == "" {
 		return nil
 	}
@@ -387,16 +412,67 @@ func scanRepositorySubdirs(workDir string) []repositorySubdir {
 	}
 	var out []repositorySubdir
 	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+		if strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		candidate := filepath.Join(workDir, entry.Name())
-		if resolveGitIndexPath(candidate) == "" {
+		linkInfo, err := os.Lstat(candidate)
+		if err != nil {
 			continue
 		}
-		out = append(out, repositorySubdir{name: entry.Name(), path: candidate})
+		repositoryPath := candidate
+		if linkInfo.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(candidate)
+			if err != nil || !pathWithinSourceRoots(resolved, allowedSourceRoots) {
+				continue
+			}
+			repositoryPath = resolved
+		}
+		// Directory links are how a Local task exposes durable folder and
+		// repository attachments. DirEntry.IsDir is false for a Unix symlink;
+		// Stat follows only a link already proven under a registered source root.
+		// codeql[go/path-injection] Candidate is a child of workDir; links pass containment above.
+		info, err := os.Stat(repositoryPath)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if resolveGitIndexPath(repositoryPath) == "" {
+			continue
+		}
+		out = append(out, repositorySubdir{name: entry.Name(), path: repositoryPath})
 	}
 	return out
+}
+
+func canonicalWorkspaceSourceRoots(roots []string) []string {
+	canonical := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		resolved, err := filepath.EvalSymlinks(filepath.Clean(root))
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if _, ok := seen[resolved]; ok {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		canonical = append(canonical, resolved)
+	}
+	return canonical
+}
+
+func pathWithinSourceRoots(path string, roots []string) bool {
+	for _, root := range roots {
+		rel, err := filepath.Rel(root, path)
+		if err == nil && !pathEscapesRoot(rel) {
+			return true
+		}
+	}
+	return false
 }
 
 // Status returns the current process status
@@ -602,11 +678,11 @@ func (m *Manager) StartProcess(ctx context.Context, req StartProcessRequest) (*P
 	if m.processRunner == nil {
 		return nil, fmt.Errorf("process runner not available")
 	}
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return nil, err
+	effectiveReq, err := m.buildProcessRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("prepare process environment: %w", err)
 	}
-	req.Env = m.ownedProcessEnv(req.Env)
-	return m.processRunner.Start(ctx, req)
+	return m.processRunner.Start(ctx, effectiveReq)
 }
 
 // StopProcess stops a running process by ID.
@@ -814,12 +890,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.exitCode.Store(-1)
 	m.exitErr.Store(errorWrapper{err: nil})
 
-	if len(m.cfg.AgentArgs) == 0 {
-		m.status.Store(StatusError)
-		return fmt.Errorf("no agent command configured")
-	}
-
-	if err := m.ensureAgentTempEnv(); err != nil {
+	if err := config.ValidateCommandArgs(m.cfg.AgentArgs); err != nil {
 		m.status.Store(StatusError)
 		return err
 	}
@@ -908,11 +979,6 @@ func (m *Manager) Start(ctx context.Context) error {
 // startOneShot initialises a one-shot adapter without spawning a long-lived subprocess.
 // The adapter manages its own per-prompt subprocess lifecycle internally.
 func (m *Manager) startOneShot() error {
-	// One-shot adapters bypass buildFinalCommand, so restore temp env vars
-	// after StripEnv before their per-prompt subprocesses inherit Env.
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return err
-	}
 	if m.adapterCfg != nil && m.adapterCfg.OneShotConfig != nil {
 		m.adapterCfg.OneShotConfig.Env = m.cfg.AgentEnv
 	}
@@ -967,10 +1033,14 @@ func (m *Manager) buildAdapterConfig() error {
 
 	// Configure one-shot mode when a continue command is provided.
 	// One-shot adapters (e.g., Amp) spawn a new subprocess per prompt.
-	if m.cfg.ContinueCommand != "" {
+	continueArgs := m.cfg.ContinueArgs
+	if continueArgs == nil && m.cfg.ContinueCommand != "" {
+		continueArgs = config.ParseCommand(m.cfg.ContinueCommand)
+	}
+	if len(continueArgs) > 0 {
 		m.adapterCfg.OneShotConfig = &adapter.OneShotConfig{
 			InitialArgs:  m.cfg.AgentArgs,
-			ContinueArgs: config.ParseCommand(m.cfg.ContinueCommand),
+			ContinueArgs: continueArgs,
 			Env:          m.cfg.AgentEnv,
 			WorkDir:      m.cfg.WorkDir,
 		}
@@ -1014,10 +1084,6 @@ func (m *Manager) buildAdapterConfig() error {
 // buildFinalCommand assembles the full command args and creates the exec.Cmd.
 // The process group is set so child processes can be killed together.
 func (m *Manager) buildFinalCommand() error {
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return err
-	}
-
 	extraArgs := m.adapter.PrepareCommandArgs()
 
 	cmdArgs := make([]string, 0, len(m.cfg.AgentArgs)-1+len(extraArgs))
@@ -1111,167 +1177,6 @@ func formatEnvEntrySizes(entries []envEntrySize) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
-func (m *Manager) ensureAgentTempEnv() error {
-	m.agentTempMu.Lock()
-	defer m.agentTempMu.Unlock()
-
-	root := filepath.Join(os.TempDir(), agentTempDirRoot)
-	child := agentTempDirName(m.cfg.SessionID, m.cfg.InstanceID, m.cfg.Port)
-	dir := filepath.Join(root, child)
-	if m.agentTempRootHandle != nil {
-		if m.agentTempRoot == root && m.agentTempDir == dir && m.agentTempChild == child {
-			for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
-				m.cfg.AgentEnv = upsertEnvValue(m.cfg.AgentEnv, key, dir)
-			}
-			return nil
-		}
-		return fmt.Errorf("agent temp ownership already initialized for %q", m.agentTempDir)
-	}
-	rootHandle, err := openOwnedTempRoot(root)
-	if err != nil {
-		return err
-	}
-	if err := ensureOwnedTempChild(rootHandle, child); err != nil {
-		_ = rootHandle.Close()
-		return fmt.Errorf("failed to create agent temp dir: %w", err)
-	}
-	m.agentTempRoot = root
-	m.agentTempDir = dir
-	m.agentTempChild = child
-	m.agentTempRootHandle = rootHandle
-	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
-		m.cfg.AgentEnv = upsertEnvValue(m.cfg.AgentEnv, key, dir)
-	}
-	return nil
-}
-
-func (m *Manager) ownedProcessEnv(env map[string]string) map[string]string {
-	m.agentTempMu.Lock()
-	defer m.agentTempMu.Unlock()
-
-	managed := make(map[string]string, len(env)+3)
-	for key, value := range env {
-		managed[key] = value
-	}
-	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
-		managed[key] = m.agentTempDir
-	}
-	return managed
-}
-
-func openOwnedTempRoot(path string) (*os.Root, error) {
-	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, fmt.Errorf("failed to create agent temp root %q: %w", path, err)
-	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect agent temp root %q: %w", path, err)
-	}
-	if pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.IsDir() {
-		return nil, fmt.Errorf("unsafe agent temp root %q: expected a directory, not a symlink", path)
-	}
-	root, err := os.OpenRoot(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open agent temp root %q: %w", path, err)
-	}
-	openedInfo, err := root.Stat(".")
-	if err != nil || !os.SameFile(pathInfo, openedInfo) {
-		_ = root.Close()
-		return nil, fmt.Errorf("unsafe agent temp root %q: path changed while opening", path)
-	}
-	if err := root.Chmod(".", 0o700); err != nil {
-		_ = root.Close()
-		return nil, fmt.Errorf("failed to secure agent temp root %q: %w", path, err)
-	}
-	return root, nil
-}
-
-func ensureOwnedTempChild(root *os.Root, name string) error {
-	if err := root.Mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
-	}
-	info, err := root.Lstat(name)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("unsafe agent temp child %q: expected a directory, not a symlink", name)
-	}
-	return root.Chmod(name, 0o700)
-}
-
-func (m *Manager) cleanupAgentTempDir() error {
-	m.agentTempMu.Lock()
-	defer m.agentTempMu.Unlock()
-
-	root := filepath.Clean(m.agentTempRoot)
-	target := filepath.Clean(m.agentTempDir)
-	if m.agentTempRoot == "" && m.agentTempDir == "" {
-		return nil
-	}
-	if m.agentTempRoot == "" || m.agentTempDir == "" || target == root {
-		return fmt.Errorf("refusing to clean invalid agent temp dir %q under root %q", m.agentTempDir, m.agentTempRoot)
-	}
-	rel, err := filepath.Rel(root, target)
-	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("refusing to clean agent temp dir outside root: target %q root %q", m.agentTempDir, m.agentTempRoot)
-	}
-	if rel != m.agentTempChild || strings.ContainsRune(rel, filepath.Separator) || m.agentTempRootHandle == nil {
-		return fmt.Errorf("refusing to clean unowned agent temp dir %q under root %q", m.agentTempDir, m.agentTempRoot)
-	}
-	if err := m.agentTempRootHandle.RemoveAll(rel); err != nil {
-		return fmt.Errorf("failed to remove agent temp dir %q: %w", target, err)
-	}
-	closeErr := m.agentTempRootHandle.Close()
-	m.agentTempRoot = ""
-	m.agentTempDir = ""
-	m.agentTempChild = ""
-	m.agentTempRootHandle = nil
-	if closeErr != nil {
-		return fmt.Errorf("failed to close agent temp root %q: %w", root, closeErr)
-	}
-	return nil
-}
-
-func agentTempDirName(sessionID, instanceID string, port int) string {
-	name := strings.TrimSpace(sessionID)
-	if name == "" {
-		name = strings.TrimSpace(instanceID)
-	}
-	if name == "" && port > 0 {
-		name = fmt.Sprintf("port-%d", port)
-	}
-	if name == "" {
-		name = "default"
-	}
-
-	var b strings.Builder
-	for _, r := range name {
-		if isAgentTempDirRune(r) {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	cleaned := strings.Trim(b.String(), "._-")
-	if cleaned == "" {
-		cleaned = "default"
-	}
-	if len(cleaned) > 40 {
-		cleaned = cleaned[:40]
-	}
-	identity := fmt.Sprintf("%d:%s|%d:%s|%d", len(sessionID), sessionID, len(instanceID), instanceID, port)
-	digest := sha256.Sum256([]byte(identity))
-	return fmt.Sprintf("%s-%x", cleaned, digest[:12])
-}
-
-func isAgentTempDirRune(r rune) bool {
-	return r >= 'a' && r <= 'z' ||
-		r >= 'A' && r <= 'Z' ||
-		r >= '0' && r <= '9' ||
-		r == '.' || r == '_' || r == '-'
-}
-
 func upsertEnvValue(env []string, key, value string) []string {
 	prefix := key + "="
 	next := make([]string, 0, len(env)+1)
@@ -1320,9 +1225,13 @@ func (m *Manager) startAgentShell() {
 	if !m.cfg.ShellEnabled {
 		return
 	}
-	shellCfg := shell.DefaultConfig(m.cfg.WorkDir)
-	shellCfg.ShellCommand = preferredShellCommand(m.cfg.AgentEnv)
-	shellCfg.Env = m.ownedProcessEnv(nil)
+	// Start calls this while holding startMu. Copy AgentEnv directly instead of
+	// calling agentEnvSnapshot, which would attempt to acquire the same mutex.
+	shellCfg, err := m.buildShellConfigWithAgentEnv(append([]string(nil), m.cfg.AgentEnv...))
+	if err != nil {
+		m.logger.Warn("failed to prepare shell environment", zap.Error(err))
+		return
+	}
 	shellSession, err := shell.NewSession(shellCfg, m.logger)
 	if err != nil {
 		m.logger.Warn("failed to create shell session", zap.Error(err))
@@ -1330,6 +1239,31 @@ func (m *Manager) startAgentShell() {
 	}
 	m.shell = shellSession
 	m.logger.Info("shell session auto-created")
+}
+
+// buildShellConfig creates the embedded shell configuration with the same
+// effective instance environment used by agent and terminal processes.
+func (m *Manager) buildShellConfig() (shell.Config, error) {
+	return m.buildShellConfigWithAgentEnv(m.agentEnvSnapshot())
+}
+
+func (m *Manager) buildShellConfigWithAgentEnv(agentEnv []string) (shell.Config, error) {
+	shellCfg := shell.DefaultConfig(m.cfg.WorkDir)
+	shellCfg.ShellCommand = preferredShellCommand(agentEnv)
+	var err error
+	shellCfg.Env, err = mergeAgentEnvIntoShellConfigWithError(agentEnv, nil)
+	if err != nil {
+		return shell.Config{}, err
+	}
+	return shellCfg, nil
+}
+
+// buildProcessRequest applies the instance environment to a task-scoped
+// process request. Explicit request values remain authoritative.
+func (m *Manager) buildProcessRequest(req StartProcessRequest) (StartProcessRequest, error) {
+	var err error
+	req.Env, err = mergeAgentEnvIntoShellConfigWithError(m.agentEnvSnapshot(), req.Env)
+	return req, err
 }
 
 func preferredShellCommand(env []string) string {
@@ -1352,7 +1286,7 @@ func lookupEnvValue(env []string, key string) string {
 // Configure sets the agent command and optional environment variables.
 // This must be called before Start() if the instance was created without a command.
 // continueCommand is optional — when set, the adapter uses it for one-shot follow-up prompts.
-func (m *Manager) Configure(command string, env map[string]string, approvalPolicy, continueCommand string) error {
+func (m *Manager) Configure(command string, agentArgs []string, agentArgsPresent bool, env map[string]string, approvalPolicy, continueCommand string, continueArgs []string, continueArgsPresent bool) error {
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 
@@ -1360,14 +1294,22 @@ func (m *Manager) Configure(command string, env map[string]string, approvalPolic
 		return fmt.Errorf("cannot configure while agent is running")
 	}
 
-	if command == "" {
-		return fmt.Errorf("agent command cannot be empty")
+	args := agentArgs
+	if !agentArgsPresent {
+		args = config.ParseCommand(command)
 	}
-
-	// Parse the command string and update config
-	args := config.ParseCommand(command)
-	if len(args) == 0 {
-		return fmt.Errorf("failed to parse agent command")
+	if err := config.ValidateCommandArgs(args); err != nil {
+		return err
+	}
+	if continueArgsPresent {
+		if err := config.ValidateCommandArgs(continueArgs); err != nil {
+			return fmt.Errorf("invalid continue command: %w", err)
+		}
+	} else if continueCommand != "" {
+		continueArgs = config.ParseCommand(continueCommand)
+		if err := config.ValidateCommandArgs(continueArgs); err != nil {
+			return fmt.Errorf("invalid continue command: %w", err)
+		}
 	}
 
 	m.cfg.AgentCommand = command
@@ -1379,8 +1321,12 @@ func (m *Manager) Configure(command string, env map[string]string, approvalPolic
 	}
 
 	// Store continue command for one-shot adapters (e.g., Amp)
-	if continueCommand != "" {
+	if continueArgsPresent {
 		m.cfg.ContinueCommand = continueCommand
+		m.cfg.ContinueArgs = continueArgs
+	} else if continueCommand != "" {
+		m.cfg.ContinueCommand = continueCommand
+		m.cfg.ContinueArgs = continueArgs
 	}
 
 	// Merge additional env vars
@@ -1489,20 +1435,20 @@ func (m *Manager) GetSessionID() string {
 
 // Stop stops the agent process
 func (m *Manager) Stop(ctx context.Context) error {
-	return m.stop(ctx, false)
+	return m.stop(ctx)
 }
 
-// StopForTeardown permanently closes process admission, drains prior owners,
-// and removes the manager's temp directory after every owned process is reaped.
+// StopForTeardown permanently closes process admission and drains prior owners
+// before stopping every process owned by the manager.
 func (m *Manager) StopForTeardown(ctx context.Context) error {
 	m.CloseAdmission()
 	if err := m.WaitForAdmission(ctx); err != nil {
 		return fmt.Errorf("wait for process admission to drain: %w", err)
 	}
-	return m.stop(ctx, true)
+	return m.stop(ctx)
 }
 
-func (m *Manager) stop(ctx context.Context, terminalStop bool) error {
+func (m *Manager) stop(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1529,9 +1475,6 @@ func (m *Manager) stop(ctx context.Context, terminalStop bool) error {
 				}
 				m.mainReapPending.Store(false)
 			}
-			if terminalStop {
-				return classifyTempCleanupError(m.cleanupAgentTempDir())
-			}
 			return nil
 		}
 		return nil
@@ -1557,27 +1500,7 @@ func (m *Manager) stop(ctx context.Context, terminalStop bool) error {
 		return stopErr
 	}
 	m.mainReapPending.Store(false)
-	if terminalStop {
-		return classifyTempCleanupError(m.cleanupAgentTempDir())
-	}
 	return nil
-}
-
-type tempCleanupError struct {
-	err error
-}
-
-func (e tempCleanupError) Error() string { return e.err.Error() }
-func (e tempCleanupError) Unwrap() error { return e.err }
-func (e tempCleanupError) CanReleaseInstanceResources() bool {
-	return true
-}
-
-func classifyTempCleanupError(err error) error {
-	if err == nil {
-		return nil
-	}
-	return tempCleanupError{err: err}
 }
 
 func (m *Manager) agentPID() int {
@@ -2023,8 +1946,13 @@ func (m *Manager) waitForExit() {
 
 	pid := m.agentPID()
 	err := m.cmd.Wait()
+	intentionalStop := m.Status() == StatusStopping
 
-	if err != nil {
+	switch {
+	case intentionalStop:
+		m.exitCode.Store(0)
+		m.logger.Info("agent process exited during intentional stop")
+	case err != nil:
 		m.exitErr.Store(errorWrapper{err: err})
 		exitCode := -1
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -2055,12 +1983,12 @@ func (m *Manager) waitForExit() {
 		default:
 			m.logger.Warn("updates channel full, could not send exit error event")
 		}
-	} else {
+	default:
 		m.exitCode.Store(0)
 		m.logger.Info("agent process exited successfully")
 	}
 
-	if m.Status() != StatusStopping {
+	if !intentionalStop {
 		if err := m.reapRemainingProcessGroup(context.Background(), pid); err != nil {
 			m.mainReapPending.Store(true)
 			m.logger.Warn("agent process group reap remains pending", zap.Error(err))
@@ -2338,13 +2266,10 @@ func (m *Manager) StartShell() error {
 	if !m.cfg.ShellEnabled {
 		return nil
 	}
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return err
+	shellCfg, err := m.buildShellConfig()
+	if err != nil {
+		return fmt.Errorf("prepare shell environment: %w", err)
 	}
-
-	shellCfg := shell.DefaultConfig(m.cfg.WorkDir)
-	shellCfg.ShellCommand = preferredShellCommand(m.cfg.AgentEnv)
-	shellCfg.Env = m.ownedProcessEnv(nil)
 	shellSession, err := shell.NewSession(shellCfg, m.logger)
 	if err != nil {
 		return fmt.Errorf("failed to create shell session: %w", err)
@@ -2355,18 +2280,54 @@ func (m *Manager) StartShell() error {
 	return nil
 }
 
-// StartTerminalShell creates a managed per-terminal shell with the instance temp environment.
+// StartTerminalShell creates a managed per-terminal shell. The shell inherits the
+// instance's agent environment (executor-profile env vars, credentials, KANDEV_*
+// metadata) so a terminal opened on a remote workspace sees the same variables
+// the agent subprocess does. Caller-supplied cfg.Env still wins.
 func (m *Manager) StartTerminalShell(terminalID string, cfg shell.Config) (*shell.Session, error) {
 	release, err := m.admitStart()
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return nil, err
+	cfg.Env, err = mergeAgentEnvIntoShellConfigWithError(m.agentEnvSnapshot(), cfg.Env)
+	if err != nil {
+		return nil, fmt.Errorf("prepare terminal shell environment: %w", err)
 	}
-	cfg.Env = m.ownedProcessEnv(cfg.Env)
 	return m.shellMgr.Start(terminalID, cfg)
+}
+
+// agentEnvSnapshot returns a copy of the instance agent environment under the
+// start lock, so a concurrent Configure appending to AgentEnv can't race.
+func (m *Manager) agentEnvSnapshot() []string {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	return append([]string(nil), m.cfg.AgentEnv...)
+}
+
+// mergeAgentEnvIntoShellConfig folds the instance agent env into the shell's
+// override map. Explicit overrides take precedence over the inherited value.
+func mergeAgentEnvIntoShellConfig(agentEnv []string, overrides map[string]string) map[string]string {
+	merged, err := mergeAgentEnvIntoShellConfigWithError(agentEnv, overrides)
+	if err != nil {
+		return overrides
+	}
+	return merged
+}
+
+func mergeAgentEnvIntoShellConfigWithError(agentEnv []string, overrides map[string]string) (map[string]string, error) {
+	if len(agentEnv) == 0 && len(overrides) == 0 {
+		return overrides, nil
+	}
+	base := make(map[string]string, len(agentEnv))
+	for _, entry := range agentEnv {
+		eq := strings.IndexByte(entry, '=')
+		if eq <= 0 {
+			continue
+		}
+		base[entry[:eq]] = entry[eq+1:]
+	}
+	return gitconfigenv.Merge(base, overrides)
 }
 
 // StartVscode starts the code-server process on a random OS-assigned port.
@@ -2378,9 +2339,6 @@ func (m *Manager) StartVscode(_ context.Context, theme string) error {
 		return err
 	}
 	defer release()
-	if err := m.ensureAgentTempEnv(); err != nil {
-		return err
-	}
 	return m.startVscode(theme)
 }
 
@@ -2405,7 +2363,6 @@ func (m *Manager) startVscode(theme string) error {
 
 	strategy := codeServerInstallStrategy(m.logger)
 	m.vscode = NewVscodeManager(command, m.cfg.WorkDir, theme, strategy, m.logger)
-	m.vscode.setEnv(m.ownedProcessEnv(nil))
 	m.vscode.Start()
 	return nil
 }

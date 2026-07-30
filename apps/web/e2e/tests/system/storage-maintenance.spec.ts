@@ -64,6 +64,39 @@ test.describe("System storage maintenance", () => {
     await expect.poll(() => fs.existsSync(cache.artifact)).toBe(false);
   });
 
+  test("reuses the cached snapshot until Analyze refreshes it", async ({ testPage }) => {
+    await testPage.goto("/settings/system/storage");
+    const analyzedTime = testPage.locator("time[datetime]").filter({ hasText: "Last analyzed" });
+    await expect(analyzedTime).toHaveText(/^Last analyzed .+/);
+    const initialAnalyzedAt = await analyzedTime.getAttribute("datetime");
+    expect(initialAnalyzedAt).toBeTruthy();
+
+    await testPage.reload();
+    await expect(analyzedTime).toHaveAttribute("datetime", initialAnalyzedAt!);
+
+    const scheduling = testPage.getByTestId("storage-scheduling-enabled");
+    const initialSchedulingState = await scheduling.getAttribute("data-state");
+    try {
+      await scheduling.click();
+      await testPage.getByRole("button", { name: "Save changes" }).click();
+      await expect(testPage.getByText("Storage policy saved")).toBeVisible();
+      await expect(analyzedTime).toHaveAttribute("datetime", initialAnalyzedAt!);
+
+      await testPage.getByTestId("storage-analyze").click();
+      await expect(testPage.getByTestId("storage-analyze")).toHaveAttribute(
+        "data-job-state",
+        "succeeded",
+      );
+      await expect.poll(() => analyzedTime.getAttribute("datetime")).not.toBe(initialAnalyzedAt);
+    } finally {
+      if ((await scheduling.getAttribute("data-state")) !== initialSchedulingState) {
+        await scheduling.click();
+        await testPage.getByRole("button", { name: "Save changes" }).click();
+        await expect(testPage.getByText("Storage policy saved")).toBeVisible();
+      }
+    }
+  });
+
   test("persists policy and analyzes, quarantines, and restores an orphan workspace", async ({
     testPage,
     backend,
@@ -141,6 +174,7 @@ test.describe("System storage maintenance", () => {
     testPage,
     apiClient,
     seedData,
+    prCapture,
   }) => {
     const task = await apiClient.createTaskWithAgent(
       seedData.workspaceId,
@@ -191,7 +225,102 @@ test.describe("System storage maintenance", () => {
       status: 409,
       body: { busy_resources: expect.any(Array) },
     });
-    await expect(testPage.getByTestId("storage-error")).toContainText(/busy|active/i);
-    await expect(testPage.getByTestId("storage-run-now")).not.toHaveAttribute("data-job-state");
+    expect(responseBody.force_available).toBe(true);
+    expect(responseBody.busy_resources[0]).toMatchObject({
+      kind: expect.any(String),
+      label: expect.any(String),
+    });
+    await expect(testPage.getByTestId("storage-busy")).toContainText(
+      responseBody.busy_resources[0].label,
+    );
+    await expect(testPage.getByTestId("storage-busy")).toContainText(/may disrupt/i);
+    await prCapture.screenshot("busy-feedback", {
+      caption: "Desktop storage cleanup explains the active work and offers Run anyway",
+      fullPage: true,
+    });
+
+    const forceRequest = testPage.waitForRequest(
+      (request) =>
+        request.method() === "POST" &&
+        new URL(request.url()).pathname === "/api/v1/system/storage/run",
+    );
+    await testPage.getByTestId("storage-run-anyway").click();
+    expect((await forceRequest).postDataJSON()).toEqual({ force: true });
+    await expect(testPage.getByTestId("storage-run-now")).toHaveAttribute(
+      "data-job-state",
+      "succeeded",
+      { timeout: 20_000 },
+    );
+  });
+
+  test("shows quarantine deadlines and clears only eligible entries", async ({
+    testPage,
+    prCapture,
+  }) => {
+    const entries = [
+      {
+        id: "eligible-entry",
+        resource_type: "task_workspace",
+        original_path: "/tmp/eligible",
+        quarantine_path: "/tmp/trash/eligible",
+        size_bytes: 1024,
+        state: "quarantined",
+        quarantined_at: "2026-07-20T00:00:00Z",
+        delete_after: new Date(Date.now() - 60_000).toISOString(),
+        last_error: "",
+        metadata: {},
+      },
+      {
+        id: "protected-entry",
+        resource_type: "task_workspace",
+        original_path: "/tmp/protected",
+        quarantine_path: "/tmp/trash/protected",
+        size_bytes: 2048,
+        state: "quarantined",
+        quarantined_at: "2026-07-29T00:00:00Z",
+        delete_after: new Date(Date.now() + 86_400_000).toISOString(),
+        last_error: "",
+        metadata: {},
+      },
+    ];
+    await testPage.route("**/api/v1/system/storage/quarantine", async (route) => {
+      if (route.request().method() === "GET") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ entries }),
+        });
+        return;
+      }
+      expect(route.request().method()).toBe("DELETE");
+      expect(route.request().postDataJSON()).toEqual({
+        scope: "eligible",
+        confirm: "DELETE ELIGIBLE",
+      });
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({ job_id: "eligible-purge" }),
+      });
+    });
+    await testPage.goto("/settings/system/storage");
+    await expect(
+      testPage.getByTestId("storage-quarantine-eligible-entry").getByText("Eligible now"),
+    ).toBeVisible();
+    await expect(testPage.getByText(/Protected until/)).toBeVisible();
+    await expect(testPage.getByTestId("storage-quarantine-protected-entry-delete")).toBeDisabled();
+    await testPage.getByTestId("storage-quarantine-card").scrollIntoViewIfNeeded();
+    await prCapture.screenshot("quarantine-deadlines", {
+      caption: "Desktop quarantine shows eligibility and protected retention deadlines",
+    });
+    await testPage.getByTestId("storage-quarantine-clear-eligible").click();
+    await testPage
+      .getByTestId("storage-quarantine-clear-eligible-confirm-confirmation")
+      .fill("DELETE ELIGIBLE");
+    await testPage.getByTestId("storage-quarantine-clear-eligible-confirm").click();
+    await expect(testPage.getByText("Eligible quarantine cleanup started")).toBeVisible();
+    await prCapture.screenshot("quarantine-clear-eligible", {
+      caption: "Desktop typed confirmation starts eligible-only quarantine cleanup",
+    });
   });
 });

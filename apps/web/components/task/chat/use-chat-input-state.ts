@@ -25,12 +25,21 @@ import {
   MAX_TOTAL_SIZE,
   type FileAttachment,
 } from "./file-attachment";
+import {
+  useAttachmentCountFeedback,
+  useAttachmentFileFeedback,
+  useAttachmentTotalSizeFeedback,
+  useUnreadablePastedImageFeedback,
+} from "./use-attachment-file-feedback";
 import type { ContextItem, ImageContextItem, FileAttachmentContextItem } from "@/lib/types/context";
-import type { ContextFile } from "@/lib/state/context-files-store";
 import type { DiffComment } from "@/lib/diff/types";
-import type { ChatSubmitResult, MessageAttachment } from "./chat-input-container";
+import type {
+  ChatSubmitPayload,
+  ChatSubmitResult,
+  MessageAttachment,
+} from "./chat-input-container";
 import type { TipTapInputHandle } from "./tiptap-input";
-import type { TaskMentionData } from "@/hooks/use-inline-mention";
+import type { ImagePasteIssue } from "./clipboard-attachments";
 
 type UseChatInputStateProps = {
   sessionId: string | null;
@@ -41,13 +50,7 @@ type UseChatInputStateProps = {
   hasContextComments?: boolean;
   showRequestChangesTooltip: boolean;
   onRequestChangesTooltipDismiss?: () => void;
-  onSubmit: (
-    message: string,
-    reviewComments?: DiffComment[],
-    attachments?: MessageAttachment[],
-    inlineMentions?: ContextFile[],
-    inlineTaskMentions?: TaskMentionData[],
-  ) => ChatSubmitResult;
+  onSubmit: (payload: ChatSubmitPayload) => ChatSubmitResult;
 };
 
 function isPromiseLike(value: ChatSubmitResult): value is Promise<void | boolean> {
@@ -163,6 +166,14 @@ type SubmitDraftArgs = {
   clearArgs: Omit<ClearSubmittedInputArgs, "submittedText" | "submittedAttachments">;
 };
 
+function buildChatSubmitPayload(payload: Required<ChatSubmitPayload>): ChatSubmitPayload {
+  return Object.fromEntries(
+    Object.entries(payload).filter(
+      ([key, value]) => key === "message" || (Array.isArray(value) && value.length > 0),
+    ),
+  ) as ChatSubmitPayload;
+}
+
 function submitDraft(args: SubmitDraftArgs) {
   if (args.isSending) return;
   const trimmed = args.valueRef.current.trim();
@@ -175,12 +186,16 @@ function submitDraft(args: SubmitDraftArgs) {
   const messageAttachments = toMessageAttachments(currentAttachments);
   const inlineMentions = args.inputRef.current?.getMentions() ?? [];
   const inlineTaskMentions = args.inputRef.current?.getTaskMentions() ?? [];
+  const entityReferences = args.inputRef.current?.getEntityReferences() ?? [];
   const result = args.onSubmit(
-    trimmed,
-    allComments.length > 0 ? allComments : undefined,
-    messageAttachments.length > 0 ? messageAttachments : undefined,
-    inlineMentions.length > 0 ? inlineMentions : undefined,
-    inlineTaskMentions.length > 0 ? inlineTaskMentions : undefined,
+    buildChatSubmitPayload({
+      message: trimmed,
+      reviewComments: allComments,
+      attachments: messageAttachments,
+      inlineMentions,
+      inlineTaskMentions,
+      entityReferences,
+    }),
   );
   handleSubmitResult(result, () =>
     clearSubmittedInput({
@@ -195,6 +210,10 @@ function useAttachments(sessionId: string | null) {
   const [attachments, setAttachments] = useState<FileAttachment[]>(() =>
     sessionId ? getChatDraftAttachments(sessionId).map(restoreAttachmentPreview) : [],
   );
+  const warnAttachmentCountLimit = useAttachmentCountFeedback();
+  const rejectOversizedFile = useAttachmentFileFeedback();
+  const warnAttachmentTotalSizeLimit = useAttachmentTotalSizeFeedback();
+  const warnUnreadablePastedImage = useUnreadablePastedImageFeedback();
   const attachmentsRef = useRef(attachments);
   const prevSessionIdRef = useRef(sessionId);
   const prevPersistSessionIdRef = useRef(sessionId);
@@ -224,23 +243,42 @@ function useAttachments(sessionId: string | null) {
   }, [attachments, sessionId]);
 
   const addFiles = useCallback(
-    async (files: File[]) => {
-      if (attachments.length >= MAX_FILES) {
-        console.warn(`Maximum ${MAX_FILES} files allowed`);
+    async (files: File[], issue?: ImagePasteIssue) => {
+      if (issue === "unreadable-image") {
+        warnUnreadablePastedImage();
         return;
       }
-      const currentTotalSize = attachments.reduce((sum, att) => sum + att.size, 0);
+      if (attachments.length >= MAX_FILES) {
+        warnAttachmentCountLimit();
+        return;
+      }
+      let acceptedCount = attachments.length;
+      let acceptedTotalSize = attachments.reduce((sum, att) => sum + att.size, 0);
       for (const file of files) {
-        if (attachments.length >= MAX_FILES) break;
-        if (currentTotalSize + file.size > MAX_TOTAL_SIZE) {
-          console.warn("Total attachment size limit exceeded");
+        if (acceptedCount >= MAX_FILES) {
+          warnAttachmentCountLimit();
+          break;
+        }
+        if (rejectOversizedFile(file)) continue;
+        if (acceptedTotalSize + file.size > MAX_TOTAL_SIZE) {
+          warnAttachmentTotalSizeLimit();
           break;
         }
         const attachment = await processFile(file);
-        if (attachment) setAttachments((prev) => [...prev, attachment]);
+        if (attachment) {
+          acceptedCount += 1;
+          acceptedTotalSize += attachment.size;
+          setAttachments((prev) => [...prev, attachment]);
+        }
       }
     },
-    [attachments],
+    [
+      attachments,
+      rejectOversizedFile,
+      warnAttachmentCountLimit,
+      warnAttachmentTotalSizeLimit,
+      warnUnreadablePastedImage,
+    ],
   );
 
   const handleRemoveAttachment = useCallback((id: string) => {

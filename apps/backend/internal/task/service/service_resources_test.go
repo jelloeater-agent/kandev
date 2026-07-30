@@ -12,11 +12,86 @@ import (
 	"testing"
 	"time"
 
+	commonlogger "github.com/kandev/kandev/internal/common/logger"
 	"github.com/kandev/kandev/internal/events"
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/repository"
 	"github.com/kandev/kandev/internal/worktree"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+type failingWorkspaceBootstrapper struct {
+	err error
+}
+
+func (b *failingWorkspaceBootstrapper) CreateWorkspaceWithKanban(
+	context.Context,
+	*models.Workspace,
+) (*models.Workflow, error) {
+	return nil, b.err
+}
+
+func TestService_CreateWorkspaceKanbanBootstrapPublishesParentBeforeWorkflow(t *testing.T) {
+	svc, eventBus, _ := createTestService(t)
+
+	_, err := svc.CreateWorkspace(context.Background(), &CreateWorkspaceRequest{
+		Name:                    "Kanban",
+		BootstrapKanbanWorkflow: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	published := eventBus.GetPublishedEvents()
+	if len(published) != 2 {
+		t.Fatalf("published events = %d, want 2", len(published))
+	}
+	if published[0].Type != events.WorkspaceCreated || published[1].Type != events.WorkflowCreated {
+		t.Fatalf("event order = %q, %q; want workspace.created, workflow.created", published[0].Type, published[1].Type)
+	}
+}
+
+func TestService_CreateWorkspaceLogsKanbanBootstrapFailures(t *testing.T) {
+	testCases := []struct {
+		name         string
+		bootstrapper WorkspaceBootstrapper
+		wantErr      string
+	}{
+		{
+			name:    "missing bootstrapper",
+			wantErr: "workspace bootstrapper is not configured",
+		},
+		{
+			name:         "bootstrap persistence failure",
+			bootstrapper: &failingWorkspaceBootstrapper{err: errors.New("insert failed")},
+			wantErr:      "insert failed",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := createTestService(t)
+			svc.SetWorkspaceBootstrapper(tc.bootstrapper)
+			core, logs := observer.New(zapcore.ErrorLevel)
+			log, err := commonlogger.NewFromZap(zap.New(core))
+			if err != nil {
+				t.Fatalf("create logger: %v", err)
+			}
+			svc.logger = log
+
+			_, err = svc.CreateWorkspace(context.Background(), &CreateWorkspaceRequest{
+				Name:                    "Kanban",
+				BootstrapKanbanWorkflow: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("CreateWorkspace error = %v, want %q", err, tc.wantErr)
+			}
+			if logs.FilterMessage("failed to create workspace with Kanban bootstrap").Len() != 1 {
+				t.Fatalf("bootstrap failure log count = %d, want 1", logs.Len())
+			}
+		})
+	}
+}
 
 func TestService_CreateRepositoryCanonicalizesExplicitLocalPath(t *testing.T) {
 	svc, _, repo := createTestService(t)
@@ -53,6 +128,147 @@ func TestService_CreateRepositoryCanonicalizesExplicitLocalPath(t *testing.T) {
 	}
 	if stored.LocalPath != canonicalPath {
 		t.Fatalf("stored LocalPath = %q, want %q", stored.LocalPath, canonicalPath)
+	}
+}
+
+// TestService_CreateRepositoryResolvesRemoteURLForSelfHostedGitLabOrigin
+// covers the bug where a local repository cloned from a self-hosted GitLab
+// instance (e.g. gitlab.example.com, not gitlab.com) got no RemoteURL
+// persisted at creation time: resolveRepositoryProviderIdentity only tagged
+// Provider/ProviderHost/ProviderOwner/ProviderName for the well-known
+// github.com/gitlab.com hosts and never populated RemoteURL at all, so
+// downstream GitLab MR-task-link identity matching had nothing to compare
+// against and rejected every attach attempt for self-hosted repositories.
+func TestService_CreateRepositoryResolvesRemoteURLForSelfHostedGitLabOrigin(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	makeRepo(t, repoPath)
+	config := `[core]
+	repositoryformatversion = 0
+[remote "origin"]
+	url = git@gitlab.example.com:clients/socodevi/laravel/co-up.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+`
+	if err := os.WriteFile(filepath.Join(repoPath, ".git", "config"), []byte(config), 0o644); err != nil {
+		t.Fatalf("write .git/config: %v", err)
+	}
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "co-up",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   repoPath,
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	// ResolveGitRemoteIdentity normalizes scp-style remotes to an ssh://
+	// origin; the GitLab MR-link identity matcher already treats ssh:// and
+	// https:// origins as equivalent for the same host+path.
+	const wantRemoteURL = "ssh://gitlab.example.com/clients/socodevi/laravel/co-up"
+	if created.RemoteURL != wantRemoteURL {
+		t.Fatalf("RemoteURL = %q, want %q", created.RemoteURL, wantRemoteURL)
+	}
+	// Self-hosted hosts are deliberately left untagged: only github.com and
+	// gitlab.com get a durable Provider/ProviderHost identity.
+	if created.Provider != "" {
+		t.Fatalf("Provider = %q, want empty for self-hosted host", created.Provider)
+	}
+	stored, err := repo.GetRepository(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetRepository: %v", err)
+	}
+	if stored.RemoteURL != wantRemoteURL {
+		t.Fatalf("stored RemoteURL = %q, want %q", stored.RemoteURL, wantRemoteURL)
+	}
+}
+
+// TestService_CreateRepositoryPrefersCanonicalCloneOriginForKnownProviders
+// is a regression guard: for a local checkout whose origin is a well-known
+// provider host (gitlab.com here), the RemoteURL fallback must resolve to
+// canonicalCloneOrigin's exact ".git"-suffixed canonical form and not the
+// broader ResolveGitRemoteIdentity-based form (which omits the suffix).
+// Other code, including E2E test fixtures that rewrite Git's clone
+// transport via an "insteadOf" config keyed on that exact canonical URL,
+// depends on this byte-identical form to route the clone correctly.
+func TestService_CreateRepositoryPrefersCanonicalCloneOriginForKnownProviders(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	makeRepo(t, repoPath)
+	config := `[core]
+	repositoryformatversion = 0
+[remote "origin"]
+	url = https://gitlab.com/fixture/docker-second-source.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+`
+	if err := os.WriteFile(filepath.Join(repoPath, ".git", "config"), []byte(config), 0o644); err != nil {
+		t.Fatalf("write .git/config: %v", err)
+	}
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID:   "ws-1",
+		Name:          "fixture/docker-second-source",
+		SourceType:    sourceTypeLocal,
+		LocalPath:     repoPath,
+		Provider:      "gitlab",
+		ProviderHost:  "https://gitlab.com",
+		ProviderOwner: "fixture",
+		ProviderName:  "docker-second-source",
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	const wantRemoteURL = "https://gitlab.com/fixture/docker-second-source.git"
+	if created.RemoteURL != wantRemoteURL {
+		t.Fatalf("RemoteURL = %q, want %q", created.RemoteURL, wantRemoteURL)
+	}
+}
+
+// TestService_CreateRepositoryDoesNotOverwriteExplicitRemoteURL ensures the
+// new local-discovery RemoteURL fallback only fills a gap and never clobbers
+// a caller-supplied RemoteURL.
+func TestService_CreateRepositoryDoesNotOverwriteExplicitRemoteURL(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+	if err := repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-1", Name: "Workspace"}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	makeRepo(t, repoPath)
+	config := `[core]
+	repositoryformatversion = 0
+[remote "origin"]
+	url = git@gitlab.example.com:group/discovered-repo.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+`
+	if err := os.WriteFile(filepath.Join(repoPath, ".git", "config"), []byte(config), 0o644); err != nil {
+		t.Fatalf("write .git/config: %v", err)
+	}
+	const explicitRemoteURL = "https://gitlab.example.com/group/explicit-repo"
+
+	created, err := svc.CreateRepository(ctx, &CreateRepositoryRequest{
+		WorkspaceID: "ws-1",
+		Name:        "explicit-repo",
+		SourceType:  sourceTypeLocal,
+		LocalPath:   repoPath,
+		RemoteURL:   explicitRemoteURL,
+	})
+	if err != nil {
+		t.Fatalf("CreateRepository: %v", err)
+	}
+	if created.RemoteURL != explicitRemoteURL {
+		t.Fatalf("RemoteURL = %q, want unmodified explicit value %q", created.RemoteURL, explicitRemoteURL)
 	}
 }
 
@@ -1007,6 +1223,64 @@ func TestService_DeleteWorkflow_ArchivesChildTasks(t *testing.T) {
 	}
 	if other.ArchivedAt != nil {
 		t.Errorf("task in unrelated workflow should not be archived, got archived_at=%v", other.ArchivedAt)
+	}
+}
+
+func TestService_DeleteWorkflow_IgnoresLegacyTaskFromAnotherWorkspace(t *testing.T) {
+	svc, _, repo := createTestService(t)
+	ctx := context.Background()
+
+	for _, workspace := range []*models.Workspace{
+		{ID: "ws-victim", Name: "Victim", OwnerID: "user-victim"},
+		{ID: "ws-foreign", Name: "Foreign", OwnerID: "user-foreign"},
+	} {
+		if err := repo.CreateWorkspace(ctx, workspace); err != nil {
+			t.Fatalf("CreateWorkspace %s: %v", workspace.ID, err)
+		}
+	}
+	if err := repo.CreateWorkflow(ctx, &models.Workflow{
+		ID: "wf-victim", WorkspaceID: "ws-victim", Name: "Victim workflow",
+	}); err != nil {
+		t.Fatalf("CreateWorkflow: %v", err)
+	}
+	for _, task := range []*models.Task{
+		{
+			ID: "task-valid", WorkspaceID: "ws-victim", WorkflowID: "wf-victim",
+			WorkflowStepID: "step-1", Title: "Valid",
+		},
+		{
+			ID: "task-legacy-foreign", WorkspaceID: "ws-foreign", WorkflowID: "wf-victim",
+			WorkflowStepID: "step-1", Title: "Legacy foreign",
+		},
+	} {
+		if err := repo.CreateTask(ctx, task); err != nil {
+			t.Fatalf("CreateTask %s: %v", task.ID, err)
+		}
+	}
+
+	if err := svc.DeleteWorkflow(ctxAs("user-victim"), "wf-victim"); err != nil {
+		t.Fatalf("DeleteWorkflow: %v", err)
+	}
+
+	if _, err := repo.GetWorkflow(ctx, "wf-victim"); err == nil {
+		t.Fatal("victim workflow still exists after deletion")
+	}
+	valid, err := repo.GetTask(ctx, "task-valid")
+	if err != nil {
+		t.Fatalf("GetTask valid: %v", err)
+	}
+	if valid.ArchivedAt == nil {
+		t.Fatal("valid same-workspace task was not archived")
+	}
+	foreign, err := repo.GetTask(ctx, "task-legacy-foreign")
+	if err != nil {
+		t.Fatalf("GetTask legacy foreign: %v", err)
+	}
+	if foreign.ArchivedAt != nil {
+		t.Fatalf("legacy foreign task was mutated: archived_at=%v", foreign.ArchivedAt)
+	}
+	if foreign.WorkspaceID != "ws-foreign" || foreign.WorkflowID != "wf-victim" {
+		t.Fatalf("legacy foreign task identity changed: %+v", foreign)
 	}
 }
 

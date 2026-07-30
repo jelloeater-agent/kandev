@@ -1,28 +1,24 @@
 ---
 name: push
-description: Push an already verified and committed branch. With --fixup, return control to the planner for delegated CI and review handling.
+description: Push a committed branch whose task-defined checks passed. With --fixup, continue with CI and review handling in the primary conversation.
 ---
 
 # Push
 
 ## Planner Entry
 
-The user-started primary session delegates any
-required verification and commit first, then assigns the push to an
-`implementer` worker. With `--fixup`, the planner coordinates `/pr-fixup`
-workers after the push. It does not run Git or GitHub commands directly.
-
-An explicitly assigned push worker pushes only the already verified and
-committed branch and does not spawn other workers.
+Push the verified commit directly in the primary conversation. With `--fixup`,
+continue with `/pr-fixup` in that same conversation; do not delegate polling or
+delivery.
 
 ## Available skills
 
-- **`/commit`** — Planner-side prerequisite for verified, committed changes.
+- **`/commit`** — Creates the artifact after task-defined checks pass.
 - **`/pr-fixup`** — Wait for CI checks and CodeRabbit, Greptile, Claude, OpenCode, and cubic review feedback, fix any failures or valid comments, and push again.
 
 ## Options
 
-- `--fixup` — after pushing, report that the planner should begin the delegated `/pr-fixup` workflow.
+- `--fixup` — after pushing, begin `/pr-fixup` in the same conversation.
 
 > **Note:** This skill only uses `git push`. GitHub CLI dependency is indirect via `/pr-fixup`.
 
@@ -34,16 +30,23 @@ Push the already committed branch to its remote.
 
 **Create a todo/task for each step below and mark them as completed as you go.**
 
-1. **Uncommitted changes:** If there are dirty or staged changes, stop and tell
-   the planner that verification and commit assignments are required first.
+1. **Uncommitted changes:** If there are dirty or staged changes, stop: a new
+   commit and the affected task checks are required first.
 
-2. **Safety check:** Verify the current branch is NOT `main` or `master`. If it is, stop and ask the user — direct pushes to the default branch should go through a PR.
+2. **Task-check evidence:** Require the task-defined unit, integration, and E2E
+   checks affected by this commit to pass. If the checkout or commit changed
+   afterward, rerun only the affected task checks.
 
-3. **Push** the current branch:
+3. **Safety check:** Verify the current branch is NOT `main` or `master`. If it is, stop and ask the user — direct pushes to the default branch should go through a PR.
+
+4. **Push** the current branch:
    ```bash
    git push
    ```
-   If the branch has no upstream, use `git push -u origin <branch>`.
+   If the branch has no upstream, use `git push -u origin HEAD` rather than
+   transcribing the branch name. Then verify
+   `git rev-parse HEAD` equals `git rev-parse '@{upstream}'`, and report the
+   branch from `git branch --show-current`.
    If the branch was rebased or history was rewritten, first confirm the current
    branch is not `main` or `master`, then use `git push --force-with-lease`.
    If the branch modifies `.github/workflows/*` and GitHub rejects the push with
@@ -53,7 +56,6 @@ Push the already committed branch to its remote.
    example `git push git@github.com:<owner>/<repo>.git <branch>`, or tell the
    user the token needs `workflow` scope.
 
-4. **Report** the pushed commit hash and branch.
+5. **Report** the pushed commit hash and branch.
 
-5. **If `--fixup`:** Return the pushed branch state to the planner so it can
-   coordinate `/pr-fixup`. Do not poll, fix, verify, or spawn another worker.
+6. **If `--fixup`:** Continue with `/pr-fixup` in this conversation.

@@ -28,6 +28,7 @@ type CommitPayload = {
   repositoryIds: string[];
   preferredShell?: string | null;
   enablePreviewOnClick?: boolean;
+  tasksListShowDetails?: boolean;
   kanbanViewMode?: string | null;
 };
 
@@ -61,6 +62,9 @@ function carryForwardCoreSettings(current: DisplaySettings) {
     shellOptions: current.shellOptions ?? [],
     defaultEditorId: current.defaultEditorId ?? null,
     chatSubmitKey: current.chatSubmitKey ?? "cmd_enter",
+    showAnchoredPromptBar: current.showAnchoredPromptBar ?? true,
+    showScrollToLastPrompt: current.showScrollToLastPrompt ?? true,
+    showScrollToStart: current.showScrollToStart ?? true,
     reviewAutoMarkOnScroll: current.reviewAutoMarkOnScroll ?? true,
     showReleaseNotification: current.showReleaseNotification ?? true,
     releaseNotesLastSeenVersion: current.releaseNotesLastSeenVersion ?? null,
@@ -69,8 +73,18 @@ function carryForwardCoreSettings(current: DisplaySettings) {
     tasksListSort: current.tasksListSort ?? DEFAULT_TASKS_LIST_SORT,
     tasksListGroup: current.tasksListGroup ?? DEFAULT_TASKS_LIST_GROUP,
     changesPanelLayout: current.changesPanelLayout ?? "tree",
-    systemMetricsDisplay: current.systemMetricsDisplay ?? { showInTopbar: false },
+    ...carryForwardAppStatusSettings(current),
     voiceMode: current.voiceMode ?? { ...DEFAULT_VOICE_MODE_STATE },
+  };
+}
+
+function carryForwardAppStatusSettings(current: DisplaySettings) {
+  return {
+    systemMetricsDisplay: current.systemMetricsDisplay ?? {
+      showInTopbar: false,
+      simplified: false,
+    },
+    appStatusBarOrder: current.appStatusBarOrder ?? { leftItemIds: [], rightItemIds: [] },
   };
 }
 
@@ -125,23 +139,26 @@ function buildNormalizedSettings(next: CommitPayload, current: DisplaySettings):
   return {
     workspaceId: next.workspaceId,
     workflowId: next.workflowId,
-    kanbanViewMode:
-      next.kanbanViewMode !== undefined ? next.kanbanViewMode : (current.kanbanViewMode ?? null),
+    kanbanViewMode: current.kanbanViewMode ?? null,
     repositoryIds: Array.from(new Set(next.repositoryIds)).sort(),
     preferredShell: next.preferredShell ?? current.preferredShell ?? null,
     enablePreviewOnClick: next.enablePreviewOnClick ?? current.enablePreviewOnClick,
+    tasksListShowDetails: next.tasksListShowDetails ?? current.tasksListShowDetails ?? false,
     ...carryForwardSettings(current),
     loaded: true,
   };
 }
 
-function isSettingsUnchanged(normalized: DisplaySettings, current: DisplaySettings): boolean {
+export function isSettingsUnchanged(
+  normalized: DisplaySettings,
+  current: DisplaySettings,
+): boolean {
   if (!current.loaded) return false;
   return (
     normalized.workspaceId === current.workspaceId &&
     normalized.workflowId === current.workflowId &&
     normalized.enablePreviewOnClick === current.enablePreviewOnClick &&
-    normalized.kanbanViewMode === current.kanbanViewMode &&
+    normalized.tasksListShowDetails === current.tasksListShowDetails &&
     normalized.repositoryIds.length === current.repositoryIds.length &&
     normalized.repositoryIds.every((id, index) => id === current.repositoryIds[index])
   );
@@ -228,7 +245,7 @@ export function useUserDisplaySettings({
         workflow_filter_id: normalized.workflowId ?? "",
         repository_ids: normalized.repositoryIds,
         enable_preview_on_click: normalized.enablePreviewOnClick,
-        kanban_view_mode: normalized.kanbanViewMode ?? "",
+        tasks_list_show_details: normalized.tasksListShowDetails,
       };
       persistSettingsPayload(payload);
     },

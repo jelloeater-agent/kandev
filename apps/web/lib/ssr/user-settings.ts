@@ -28,7 +28,17 @@ export function parseMCPTaskAgentProfileDefault(
 }
 
 export function parseSystemMetricsDisplay(value: UserSettingsData["system_metrics_display"]) {
-  return { showInTopbar: value?.show_in_topbar ?? false };
+  return {
+    showInTopbar: value?.show_in_topbar ?? false,
+    simplified: value?.simplified ?? false,
+  };
+}
+
+export function parseAppStatusBarOrder(value: UserSettingsData["app_status_bar_order"]) {
+  return {
+    leftItemIds: value?.left_item_ids ?? [],
+    rightItemIds: value?.right_item_ids ?? [],
+  };
 }
 
 /**
@@ -103,6 +113,7 @@ function buildIdentityFields(s: UserSettingsData) {
     repositoryIds: s.repository_ids ?? [],
     tasksListSort: parseTasksListSort(s.tasks_list_sort),
     tasksListGroup: parseTasksListGroup(s.tasks_list_group),
+    tasksListShowDetails: s.tasks_list_show_details ?? false,
     preferredShell: s.preferred_shell || null,
     defaultEditorId: s.default_editor_id || null,
     defaultUtilityAgentId: s.default_utility_agent_id || null,
@@ -116,6 +127,9 @@ function buildBehaviorFields(s: UserSettingsData) {
     reviewAutoMarkOnScroll: s.review_auto_mark_on_scroll ?? true,
     confirmTaskArchive: s.confirm_task_archive ?? true,
     mcpTaskAgentProfileDefault: parseMCPTaskAgentProfileDefault(s.mcp_task_agent_profile_default),
+    showAnchoredPromptBar: s.show_anchored_prompt_bar ?? true,
+    showScrollToLastPrompt: s.show_scroll_to_last_prompt ?? true,
+    showScrollToStart: s.show_scroll_to_start ?? true,
     showReleaseNotification: s.show_release_notification ?? true,
     releaseNotesLastSeenVersion: s.release_notes_last_seen_version || null,
     keyboardShortcuts: s.keyboard_shortcuts ?? {},
@@ -139,6 +153,7 @@ export function buildCoreFields(s: UserSettingsData) {
     githubSavedPresets: s.github_saved_presets,
     githubDefaultQueryPresets: s.github_default_query_presets,
     gitlabSavedPresets: s.gitlab_saved_presets,
+    appStatusBarOrder: parseAppStatusBarOrder(s.app_status_bar_order),
     ...buildTerminalFields(s),
     ...buildSystemMetricsDisplayFields(s),
     ...buildVoiceModeFields(s),
@@ -168,6 +183,7 @@ export function mapUserSettingsResponse(response: UserSettingsResponse | null) {
       repositoryIds: [] as string[],
       tasksListSort: DEFAULT_TASKS_LIST_SORT,
       tasksListGroup: DEFAULT_TASKS_LIST_GROUP,
+      tasksListShowDetails: false,
       preferredShell: null,
       shellOptions,
       defaultEditorId: null,
@@ -176,6 +192,9 @@ export function mapUserSettingsResponse(response: UserSettingsResponse | null) {
       reviewAutoMarkOnScroll: true,
       confirmTaskArchive: true,
       mcpTaskAgentProfileDefault: "current_task" as const,
+      showAnchoredPromptBar: true,
+      showScrollToLastPrompt: true,
+      showScrollToStart: true,
       showReleaseNotification: true,
       releaseNotesLastSeenVersion: null,
       savedLayouts: [] as SavedLayout[],
@@ -195,6 +214,7 @@ export function mapUserSettingsResponse(response: UserSettingsResponse | null) {
       terminalFontFamily: null,
       terminalFontSize: null,
       changesPanelLayout: "tree" as const,
+      appStatusBarOrder: parseAppStatusBarOrder(undefined),
       ...buildSystemMetricsDisplayFields(undefined),
       voiceMode: { ...DEFAULT_VOICE_MODE_STATE },
       ...buildLspFields(undefined),

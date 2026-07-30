@@ -43,7 +43,7 @@ Office therefore treats a workspace-scoped rich `agent_profiles` row as a stable
 ### CEO agent
 
 - The CEO is an agent instance with `role=ceo` and elevated permissions.
-- The CEO does not write code. It reads task descriptions, decomposes them into subtasks, assigns them to workers, and monitors completion.
+- The CEO does not write code. It reads task descriptions and evidence, handles small coordination or status concerns directly, decomposes implementation work into subtasks, assigns them to workers, and monitors completion.
 - The CEO's system prompt includes its delegation rules, the current org tree, the workspace's project structure, and the current task backlog (unassigned and in-progress).
 - The CEO creates worker agents when no suitable worker exists for a task type, via the hire flow.
 - The CEO is configured with a high-capability reasoning model, user-selectable via the profile.
@@ -139,7 +139,7 @@ System skills ship inside the kandev binary (`apps/backend/internal/office/confi
 
 System SKILL.md carries an optional `kandev:` frontmatter block with `system: true`, `version: "<release>"`, `default_for_roles: [<roles>]`. `default_for_roles` drives auto-attach: a new agent with role `R` automatically gets every system skill whose `default_for_roles` contains `R`, unless the caller passes an explicit `desired_skills`. Users can untick a default-attached system skill on any agent (role default is a soft suggestion).
 
-v1 system-skill set: `kandev-protocol`, `memory`, and `kandev-task-ops` (every role); `kandev-escalation` (worker, specialist, assistant, reviewer); `kandev-team-admin`, `kandev-routines`, `kandev-approvals`, and `kandev-config-sync` (ceo).
+v1 system-skill set: `kandev-protocol`, `memory`, and `kandev-task-ops` (every role); `kandev-escalation` (worker, specialist, assistant, reviewer); `kandev-team-admin`, `kandev-routines`, `kandev-approvals`, `kandev-config-sync`, and `kandev-projects` (ceo).
 
 ### Activity, runs, events
 
@@ -155,6 +155,7 @@ Permissions are a JSON object on the agent instance. Role determines defaults; i
 |---|---|---|---|---|---|
 | `can_create_tasks` | yes | yes | yes | yes | no |
 | `can_assign_tasks` | yes | no | no | yes | no |
+| `can_create_projects` | yes | no | no | no | no |
 | `can_create_agents` | yes | no | no | no | no |
 | `can_approve` | yes | no | no | no | yes |
 | `can_manage_own_skills` | yes | no | no | yes | no |
@@ -169,6 +170,30 @@ Auth middleware on office API routes extracts `Authorization: Bearer <JWT>`, val
 Service-layer permission checks run on every mutating endpoint. Task scope is enforced: an agent can only operate on the task whose ID matches its run claims, except CEO agents with `can_assign_tasks` which may operate on any task (for delegation).
 
 When a CEO calls `POST /office/agents`: must have `can_create_agents`; must specify `role` (defaults applied automatically); may pass `permissions` overrides, but cannot grant permissions it doesn't have itself (no privilege escalation).
+
+### Required operator boundary (not yet implemented)
+
+The no-JWT UI convention must not apply to execution-profile mutations.
+Launcher definitions, executable/prefix argv, CLI configuration, and
+environment values are operator control-plane settings. Once operator
+authentication is implemented, creating, updating, or deleting those resources
+requires an authenticated operator principal; an omitted credential and an
+Office agent JWT are both rejected. Operator credentials are never included in
+Office runtime environment, workspace files, executor metadata, logs, or
+unauthenticated boot/runtime APIs. Full-detail profile and MCP reads containing
+literal environment values, headers, or resolved secrets are operator-only;
+agent-facing discovery uses a redacted catalog shape. Agent/workspace preview
+content runs on an origin that cannot exercise ambient operator credentials or
+read operator session/bootstrap state. Until these requirements are enforced,
+launcher prefixes are customization rather than an isolation boundary.
+Decision:
+[ADR-2026-07-24-operator-owned-agent-launcher-settings](../../decisions/2026-07-24-operator-owned-agent-launcher-settings.md).
+
+The interim risk-reduction guard requires a per-boot SPA token on
+state-changing agent/settings requests and rejects Office bearer tokens. Because
+an intentional agent can fetch and replay the unauthenticated boot payload,
+this guard is a CSRF and accidental-mutation interlock only; it does not satisfy
+the operator-boundary scenarios below.
 
 ### Hire flow
 
@@ -210,7 +235,7 @@ Each scheduler-launched agent turn has a runtime context with workspace, agent, 
 
 ### Capabilities
 
-A run carries an explicit capability scope. Capabilities include: post comment, update task status, create subtask, request approval, read/write memory, inspect assigned skills.
+A run carries an explicit capability scope. Capabilities include: post comment, update task status, `create_task`, `create_subtask`, create project, request approval, read/write memory, inspect assigned skills.
 
 - Runtime actions check capabilities before mutating state.
 - Runtime actions attach agent/run/session identity to emitted records whenever the underlying feature supports it.
@@ -219,7 +244,11 @@ A run carries an explicit capability scope. Capabilities include: post comment, 
 
 ### Environment variables
 
-Injected before each agent session:
+The Office scheduler injects the runtime environment before each Office agent
+turn. These values are runtime credentials, not operator configuration:
+users do not create them, copy them from settings, or reuse them between
+sessions. Regular Kanban/task-mode sessions do not receive this environment
+and use their injected Kandev MCP tools instead.
 
 | Variable | Value | Purpose |
 |---|---|---|
@@ -235,6 +264,14 @@ Injected before each agent session:
 | `KANDEV_WAKE_PAYLOAD_JSON` | Inline JSON | Pre-computed task context |
 | `KANDEV_WAKE_PAYLOAD_PATH` | Workspace-relative JSON file path | Pre-computed task context when too large for inline env |
 | `KANDEV_CLI` | Path to agentctl | CLI binary for API operations |
+
+An Office-mode launch requires `KANDEV_CLI`, `KANDEV_API_URL`,
+`KANDEV_API_KEY`, `KANDEV_AGENT_ID`, `KANDEV_WORKSPACE_ID`, `KANDEV_RUN_ID`,
+and the task-bound `KANDEV_TASK_ID`. Kandev fails the launch before starting
+the agent process when that signed run context is incomplete or bound to a
+different task. Generic task/session start paths must not manufacture,
+persist, or accept user-supplied substitutes for these values; only the
+internal Office scheduler adapter supplies the task-bound launch map.
 
 `KANDEV_CLI` resolves per executor:
 - **Docker** (`local_docker`): `/usr/local/bin/agentctl` (baked into the image).
@@ -319,9 +356,9 @@ When the scheduler processes a wakeup:
 
 Seeded on agent creation; users edit them in the Instructions tab.
 
-- **CEO `AGENTS.md`**: persona ("You are the CEO. You lead the company, not do individual work."), delegation routing table (code -> CTO, marketing -> CMO, etc.), rules (always delegate, never implement, post comments explaining decisions), subtask creation procedure, references to `./HEARTBEAT.md`.
-- **CEO `HEARTBEAT.md`** (8-step checklist): read wake reason; if `task_assigned` triage and delegate; if `task_comment` read and respond; if `task_children_completed` review and complete parent; if `approval_resolved` act on decision; if `heartbeat` check workspace status and reassign stalled tasks; post comments on all actions; exit.
-- **Worker `AGENTS.md`**: persona ("You are a worker agent. You implement tasks assigned to you."), procedure (read task -> check blockers -> do the work -> post progress -> update status), rules (only work on assigned tasks, write tests, focused commits), subtask creation for self-decomposition.
+- **CEO `AGENTS.md`**: persona ("You are the CEO. You lead the company, not do individual work."), delegation routing table (code -> CTO, marketing -> CMO, etc.), rules (directly handle first triage and small coordination/status concerns; delegate implementation work; post comments explaining decisions), subtask creation procedure, references to `./HEARTBEAT.md`.
+- **CEO `HEARTBEAT.md`** (8-step checklist): read wake reason; if `task_assigned` triage directly and delegate only when independent evidence justifies it; if `task_comment` read and respond; if `task_children_completed` review and complete parent; if `approval_resolved` act on decision; if `heartbeat` check workspace status and reassign stalled tasks; post comments on all actions; exit.
+- **Worker `AGENTS.md`**: persona ("You are a worker agent. You implement tasks assigned to you."), procedure (read task -> check blockers -> do the work -> post progress -> update status), rules (only work on assigned tasks, write tests, focused commits), and scope escalation to the CEO rather than recursive self-decomposition by default.
 - **Reviewer `AGENTS.md`**: persona ("You are a reviewer. You review work done by other agents."), review checklist (correctness, quality, security, performance), approve/reject procedure, rules (be specific, suggest fixes, approve if meets requirements).
 
 ## API surface
@@ -357,20 +394,23 @@ Seeded on agent creation; users edit them in the Instructions tab.
 
 ### agentctl CLI surface
 
-Agents call the `kandev` command group on the agentctl binary instead of raw curl. Each subcommand maps 1:1 to an HTTP endpoint under `/api/v1/office/…` (or `/api/v1/tasks/…` for move/archive). Auth reads `KANDEV_API_URL`, `KANDEV_API_KEY`, `KANDEV_RUN_ID`, `KANDEV_AGENT_ID`, `KANDEV_TASK_ID` from environment. Output is structured JSON by default; `--format text` for human-readable. Errors: non-zero exit + `{"error":"message","code":409}`. Task ID defaults to `$KANDEV_TASK_ID` when `--id`/`--task` is omitted.
+Agents call the `kandev` command group on the agentctl binary instead of raw curl. Mutating subcommands use the signed runtime action surface under `/api/v1/office/runtime/…`; they never use generic Kanban or dashboard mutation endpoints. Auth reads `KANDEV_API_URL`, `KANDEV_API_KEY`, `KANDEV_RUN_ID`, `KANDEV_AGENT_ID`, `KANDEV_TASK_ID` from environment. Output is structured JSON by default; `--format text` for human-readable. Errors: non-zero exit + `{"error":"message","code":409}`. Task ID defaults to `$KANDEV_TASK_ID` when `--id`/`--task` is omitted.
 
 ```
 # Task operations (singular)
 agentctl kandev task get    [--id ID]
 agentctl kandev task update [--id ID] [--status STATUS] [--comment BODY]
-agentctl kandev task create --title TITLE [--parent ID] [--assignee AGENT_ID] [--priority P]
+agentctl kandev task create --title TITLE [--description TEXT] [--parent ID] [--assignee AGENT_ID] [--project PROJECT_ID]
 
 # Task operations (plural)
 agentctl kandev tasks list         [--status S] [--assignee ID] [--project ID]
-agentctl kandev tasks move         --id T-1 --step STEP_ID [--prompt MSG]
-agentctl kandev tasks archive      --id T-1
 agentctl kandev tasks message      --id T-1 --prompt MSG
 agentctl kandev tasks conversation --id T-1
+
+# Projects
+agentctl kandev projects list
+agentctl kandev projects create --name NAME [--description TEXT] [--repository URL_OR_PATH ...] \
+  [--lead-agent-profile-id ID] [--color COLOR] [--budget-cents N] [--executor-config JSON]
 
 # Comments + memory + checkout
 agentctl kandev comment add        --task ID --body BODY
@@ -408,15 +448,19 @@ Three MCP modes coexist:
 
 | Mode | Tools | Token cost/turn | Used by |
 |---|---|---|---|
-| `ModeTask` | 13 (kanban + plans + ask_user) | ~3-5K | Interactive kanban sessions |
+| `ModeTask` | 27 (kanban + plans + walkthroughs + coordination + completion) | ~3-5K | Interactive kanban sessions |
 | `ModeConfig` | 29 (workflows + agents + executors) | ~8-10K | Config setup sessions |
-| `ModeOffice` | 5 (plans + ask_user) | ~1-2K | Office agent sessions |
+| `ModeOffice` | 9 (plans + ask_user + related tasks + task documents) | ~1-2K | Office agent sessions |
+
+Agent routing and Office ownership are independent. Workflow-level defaults, per-step agent profiles, and `runner` participants select the execution identity only; they never make a Kanban task Office-owned. A task is Office-owned only when it is linked to an Office project or its workflow matches the workspace's Office workflow.
 
 `ModeOffice` includes:
-- 4 plan tools (`create_task_plan`, `get_task_plan`, `update_task_plan`, `delete_task_plan`).
-- 1 `ask_user_question` tool (only meaningful when the user opens the task in advanced mode).
+- 4 plan tools (`create_task_plan_kandev`, `get_task_plan_kandev`, `update_task_plan_kandev`, `delete_task_plan_kandev`).
+- `ask_user_question_kandev` (only meaningful when the user opens the task in advanced mode).
+- `list_related_tasks_kandev`.
+- 3 task-document tools (`list_task_documents_kandev`, `get_task_document_kandev`, `write_task_document_kandev`).
 
-`ModeOffice` excludes kanban tools, config tools, `list_workspaces`, `list_workflows`, `list_workflow_steps`. If an agent calls an excluded tool, the MCP server returns: `"Tool not available in office mode. Use $KANDEV_CLI instead."`.
+`ModeOffice` excludes kanban tools, config tools, `list_workspaces_kandev`, `list_workflows_kandev`, `list_workflow_steps_kandev`, and `step_complete_kandev`. Office advances work through its Office task and approval surfaces, not the Kanban workflow-step completion signal. The first-turn Office context lists only tools registered in `ModeOffice` and directs Office mutations to `$KANDEV_CLI`; it never advertises an excluded tool.
 
 ### Skills are preferred over MCP tools
 
@@ -504,7 +548,9 @@ Skill list (name, description, source type, which agents use each skill), inline
 - **Budget exhaustion**: agent's budget reaches zero. Status auto-transitions to `paused` with `pause_reason="budget"`. Active sessions complete the current turn but no further prompts are dispatched. Surfaces as a banner on the agent card. See [costs](./costs.md).
 - **Concurrency saturation**: agent at `max_concurrent_sessions`. Scheduler skips claiming wakeups for this agent; wakeups remain in `queued` indefinitely until a slot frees up. No retry, no expiry.
 - **Stale MCP tool reference**: agent in `ModeOffice` calls a tool not in the mode (e.g. a kanban tool from an old skill). MCP server returns `"Tool not available in office mode. Use $KANDEV_CLI instead."`.
+- **Missing Office launch context**: a generic task/session path attempts to start or resume an Office-owned task without the scheduler-injected CLI path, API URL, signed run token, task-bound identity, or run ID. Kandev fails closed before starting or relaunching the agent process and directs the caller to start or wake the task through Office. It never asks the user to configure or paste these credentials.
 - **CLI auth failure**: agentctl call returns 401 because the JWT is expired or invalid. The CLI exits non-zero with structured error. Agent sees a clear failure and can surface it via comment.
+- **CLI invoked outside Office**: `agentctl kandev` cannot find `KANDEV_API_URL` or `KANDEV_API_KEY`. The CLI exits non-zero and explains that these values are injected automatically for Office runs; regular task sessions use Kandev MCP tools.
 - **Adapter without skill discovery**: agent type has no known `ProjectSkillDir`. Skill `SKILL.md` content appended to the system prompt as fallback.
 - **Skill registry edit while session runs**: the running session is unaffected (file already written). Next session for that agent picks up updated content.
 - **Worktree deletion**: when the worktree is deleted at session end, all injected skill directories are removed automatically. No explicit cleanup hook needed.
@@ -559,7 +605,32 @@ There are no TTLs on agent rows, runtime rows, instructions, skills, run history
 
 - **GIVEN** an agent run scoped to task `KAN-1`, **WHEN** the agent tries to update `KAN-2` without explicit scope, **THEN** the runtime denies the action and no task mutation is attempted.
 
-- **GIVEN** an agent run with `create_subtask` capability, **WHEN** it creates a subtask under its current task, **THEN** Office creates the task through the runtime action surface and preserves the caller agent identity.
+The following operator-boundary scenarios are acceptance criteria that must
+pass before launcher settings are described as an isolation boundary:
+
+- **GIVEN** a running Office agent that can reach the backend, **WHEN** it
+  submits an execution-profile mutation with its runtime JWT or without a
+  credential, **THEN** the backend rejects the request and persists no launcher
+  or environment change.
+
+- **GIVEN** an authenticated operator authorized for the target profile,
+  **WHEN** the settings UI saves an execution-profile change, **THEN** the
+  backend persists the change without exposing the operator credential to any
+  agent runtime surface.
+
+- **GIVEN** an Office agent requests execution-profile discovery, **WHEN** the
+  backend returns the agent-facing catalog, **THEN** the response contains no
+  literal profile environment values, MCP environment values, MCP headers, or
+  resolved secret material.
+
+- **GIVEN** agent-controlled JavaScript is rendered in a task preview, **WHEN**
+  it attempts to use the operator session, **THEN** browser origin isolation
+  prevents it from reading operator state or issuing an authenticated
+  control-plane mutation.
+
+- **GIVEN** an agent run with `create_subtask` capability and mutation scope for a parent task, **WHEN** it creates a subtask under that parent, **THEN** Office creates the task through the runtime action surface and preserves the caller agent identity.
+
+- **GIVEN** an agent run without `create_subtask` capability or without mutation scope for the requested parent, **WHEN** it attempts parented task creation, **THEN** Office rejects the request before reading parent relationships or creating any task.
 
 - **GIVEN** a run without a capability, **WHEN** the agent attempts the matching action, **THEN** Office returns a forbidden error and logs no downstream mutation.
 
@@ -587,15 +658,37 @@ There are no TTLs on agent rows, runtime rows, instructions, skills, run history
 
 ### CLI and MCP
 
-- **GIVEN** a worker agent woken for `task_assigned`, **WHEN** it needs to update task status, **THEN** it runs `$KANDEV_CLI kandev task update --status in_progress`, which reads auth from env vars, calls `PATCH /api/v1/office/tasks/:id`, and returns structured JSON.
+- **GIVEN** a worker agent woken for `task_assigned`, **WHEN** it needs to update task status, **THEN** it runs `$KANDEV_CLI kandev task update --status in_progress`, which reads auth from env vars, calls `POST /api/v1/office/runtime/tasks/:id/status`, and returns structured JSON.
 
-- **GIVEN** a CEO agent delegating work, **WHEN** it creates a subtask, **THEN** it runs `$KANDEV_CLI kandev task create --title "..." --parent $KANDEV_TASK_ID --assignee agent_id`, which calls `POST /api/v1/tasks` with correct headers and returns the created task ID.
+- **GIVEN** an Office agent wants to add a comment without changing status, **WHEN** it invokes `task update --comment` without `--status`, **THEN** the CLI rejects the command locally and directs it to the signed `tasks message` surface.
+
+- **GIVEN** a CEO agent delegating work with `create_subtask` capability and scope for the parent, **WHEN** it creates a subtask, **THEN** it runs `$KANDEV_CLI kandev task create --title "..." --parent $KANDEV_TASK_ID --assignee agent_id`, which calls `POST /api/v1/office/runtime/tasks` with the run token and returns the created task ID.
+
+- **GIVEN** an Office agent tries to move a task between workflow steps or archive it, **WHEN** it invokes `tasks move` or `tasks archive`, **THEN** the CLI fails before making an HTTP request and directs the operation to a human or admin because no signed Office runtime capability exists for it.
+
+- **GIVEN** a CEO with `can_create_projects=true`, **WHEN** the setup task requires a project for a repository, **THEN** it runs `$KANDEV_CLI kandev projects create --name "..." --repository "..."`, the project is created in `KANDEV_WORKSPACE_ID`, and the structured response contains its ID.
+
+- **GIVEN** an Office agent without `can_create_projects`, **WHEN** it attempts `projects create`, **THEN** the request is rejected with 403 and no project is created.
+
+- **GIVEN** an Office agent creating a follow-up task for an existing project, **WHEN** it passes `--project PROJECT_ID`, **THEN** `task create` sends `project_id`, runtime validation forces the token workspace and verifies the project, parent, and assignee are owned by it, and the created runner is assigned to the requested Office agent.
+
+- **GIVEN** a direct Office runtime caller, **WHEN** it supplies a cross-workspace project, parent, or assignee, **THEN** task creation is denied before persistence or wakeup.
+
+- **GIVEN** an Office agent passes priority, blocker, or workspace-policy flags to `task create`, **WHEN** the runtime cannot preserve those fields, **THEN** the CLI rejects the request explicitly instead of silently dropping them.
 
 - **GIVEN** a user viewing an office task in advanced mode, **WHEN** the agent needs clarification, **THEN** it uses `ask_user_question` (available in ModeOffice) and the user sees the question in the UI.
 
 - **GIVEN** an office agent in ModeOffice, **WHEN** something tries to call `create_task_kandev` MCP tool, **THEN** the MCP server returns an error saying to use `$KANDEV_CLI` instead.
 
-- **GIVEN** a regular kanban task (non-office), **WHEN** a user starts a session, **THEN** ModeTask is used with all 13 MCP tools. No change to existing behavior.
+- **GIVEN** an office agent in ModeOffice, **WHEN** its first-turn system context is generated, **THEN** every advertised MCP tool is registered in ModeOffice and `step_complete_kandev` is absent.
+
+- **GIVEN** an Office-owned task without a scheduler-prepared signed run context, **WHEN** a generic manual or workflow task/session path attempts to start it in ModeOffice, **THEN** Kandev starts no agent process and returns an error directing the caller to start or wake the task through Office.
+
+- **GIVEN** a regular kanban task (non-office), **WHEN** a user starts a session, **THEN** ModeTask is used with the full Kanban MCP surface, including `step_complete_kandev`. No Office CLI capability changes that behavior.
+
+- **GIVEN** a regular task-mode session, **WHEN** an agent invokes `agentctl kandev` without Office runtime credentials, **THEN** the CLI explains that `KANDEV_API_URL` and `KANDEV_API_KEY` are injected automatically only for Office runs and directs the agent to its Kandev MCP tools.
+
+- **GIVEN** a regular Kanban task on a step with a default agent profile, **WHEN** the runner projection resolves that profile, **THEN** the profile selects the execution identity without changing Office ownership or the session's `ModeTask` MCP surface.
 
 - **GIVEN** a Docker executor, **WHEN** the agent runs `$KANDEV_CLI kandev task get`, **THEN** agentctl resolves to `/usr/local/bin/agentctl` (on PATH inside the container), reads env vars, and calls the backend API.
 
@@ -636,6 +729,7 @@ There are no TTLs on agent rows, runtime rows, instructions, skills, run history
 - Automatic skill recommendation based on task content.
 - Bash completion for `agentctl kandev` subcommands. Offline/cached mode for CLI. Incremental skill sync.
 - CLI commands for workspace config CRUD (workflows, executors). Handled by ModeConfig MCP tools used by IDE agents.
+- CLI creation of additional Office workspaces. Office agents operate inside `KANDEV_WORKSPACE_ID`; humans create or import workspaces through onboarding and settings.
 - Configurable date range on dashboard charts. Fixed 14 days for v1.
 - Bespoke transcript renderer or adapter-specific "Nice mode" parsers. The existing session-messages component is reused.
 - Object-store offload for run logs. The `office_run_events` table covers the structured event log.

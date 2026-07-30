@@ -75,6 +75,7 @@ export const MobileChangesPanel = memo(function MobileChangesPanel({
       path,
       sourceFilter: options?.source ?? "all",
       repositoryName: options?.repositoryName || undefined,
+      prKey: options?.prKey,
     });
   }, []);
 
@@ -116,6 +117,7 @@ export const MobileChangesPanel = memo(function MobileChangesPanel({
           onRenameBranch={data.git.renameBranch}
           repoDisplayName={data.repoDisplayName}
           taskId={data.activeTaskId}
+          credentialDisplay={data.gitCredentialDisplay}
         />
         <ChangesPanelBody {...bodyProps} />
       </PanelRoot>

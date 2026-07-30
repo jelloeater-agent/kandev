@@ -24,6 +24,7 @@ type GoCacheAdopter interface {
 type QuarantineController interface {
 	Restore(context.Context, string) (QuarantineEntry, error)
 	PermanentDelete(context.Context, string, string) (QuarantineEntry, error)
+	Purge(context.Context, QuarantinePurgeScope, string) (QuarantinePurgeResult, error)
 }
 
 type OperationsConfig struct {
@@ -32,7 +33,7 @@ type OperationsConfig struct {
 	Jobs       *jobs.Tracker
 	Activity   *activity.Coordinator
 	Providers  []CleanupProvider
-	Overview   OverviewProvider
+	Overview   OverviewRefresher
 	GoCache    GoCacheAdopter
 	Quarantine QuarantineController
 }
@@ -60,6 +61,7 @@ func (o *Operations) AdoptGoCache(
 	if err != nil {
 		return StorageMaintenanceSettings{}, Capabilities{}, err
 	}
+	o.invalidateOverview()
 	return settings, o.config.Overview.Capabilities(ctx, settings), nil
 }
 
@@ -75,12 +77,18 @@ func (o *Operations) Analyze(ctx context.Context) (string, error) {
 		if _, err := o.config.Store.TransitionRun(jobCtx, id, RunStateRunning, nil, ""); err != nil {
 			return nil, err
 		}
-		summary, analyzeErr := o.config.Overview.Summary(jobCtx)
-		return o.finishAnalysis(jobCtx, id, summary, analyzeErr)
+		snapshot, analyzeErr := o.config.Overview.Refresh(jobCtx)
+		return o.finishAnalysis(jobCtx, id, snapshot.Summary, analyzeErr)
 	}), nil
 }
 
-func (o *Operations) RunNow(ctx context.Context, resources []string) (string, error) {
+type OverviewRefresher interface {
+	OverviewReader
+	OverviewInvalidator
+	Refresh(context.Context) (OverviewSnapshot, error)
+}
+
+func (o *Operations) RunNow(ctx context.Context, resources []string, force bool) (string, error) {
 	settings, err := o.config.Settings.GetSettings(ctx)
 	if err != nil {
 		return "", err
@@ -89,13 +97,13 @@ func (o *Operations) RunNow(ctx context.Context, resources []string) (string, er
 	if err != nil {
 		return "", err
 	}
-	if err := o.preflight(ctx); err != nil {
+	if err := o.preflight(ctx, force); err != nil {
 		return "", err
 	}
 	return o.startTracked(ctx, JobKindCleanup, func(jobCtx context.Context, id string) (map[string]any, error) {
 		runner := NewRunner(RunnerConfig{
 			Activity: o.config.Activity, Store: o.config.Store, Providers: providers,
-			NewID: func() string { return id },
+			Force: force, NewID: func() string { return id }, Overview: o.config.Overview,
 		})
 		run, runErr := runner.Run(jobCtx, RunTriggerManual, settings)
 		return runResultMap(run), runErr
@@ -106,11 +114,16 @@ func (o *Operations) RestoreQuarantine(ctx context.Context, id string) (Quaranti
 	if o.config.Quarantine == nil {
 		return QuarantineEntry{}, errors.New("quarantine provider is unavailable")
 	}
-	return o.config.Quarantine.Restore(ctx, id)
+	entry, err := o.config.Quarantine.Restore(ctx, id)
+	if err != nil {
+		return QuarantineEntry{}, err
+	}
+	o.invalidateOverview()
+	return entry, nil
 }
 
 func (o *Operations) DeleteQuarantine(ctx context.Context, id, confirmation string) (string, error) {
-	if confirmation != "DELETE" {
+	if confirmation != QuarantineConfirmationDelete {
 		return "", validationError("quarantine deletion requires DELETE confirmation")
 	}
 	if o.config.Quarantine == nil {
@@ -125,14 +138,62 @@ func (o *Operations) DeleteQuarantine(ctx context.Context, id, confirmation stri
 	}
 	return o.startTracked(ctx, JobKindQuarantineDelete, func(jobCtx context.Context, _ string) (map[string]any, error) {
 		entry, err := o.config.Quarantine.PermanentDelete(jobCtx, id, confirmation)
+		if err == nil {
+			o.invalidateOverview()
+		}
 		return map[string]any{"entry": entry}, err
 	}), nil
 }
 
-func (o *Operations) preflight(ctx context.Context) error {
-	lease, busy, err := o.config.Activity.TryAcquireMaintenance(ctx, 0)
+func (o *Operations) PurgeQuarantine(
+	ctx context.Context,
+	scope QuarantinePurgeScope,
+	confirmation string,
+) (string, error) {
+	switch scope {
+	case QuarantinePurgeScopeEligible:
+		if confirmation != QuarantineConfirmationEligible {
+			return "", validationError("eligible quarantine purge requires %s confirmation", QuarantineConfirmationEligible)
+		}
+	case QuarantinePurgeScopeAll:
+		if confirmation != QuarantineConfirmationForce {
+			return "", validationError("forced quarantine purge requires %s confirmation", QuarantineConfirmationForce)
+		}
+	default:
+		return "", validationError("unknown quarantine purge scope %q", scope)
+	}
+	if o.config.Quarantine == nil {
+		return "", errors.New("quarantine provider is unavailable")
+	}
+	return o.startTracked(ctx, JobKindQuarantineDelete, func(jobCtx context.Context, _ string) (map[string]any, error) {
+		result, err := o.config.Quarantine.Purge(jobCtx, scope, confirmation)
+		if result.Deleted > 0 {
+			o.invalidateOverview()
+		}
+		return valueMap(result), err
+	}), nil
+}
+
+func (o *Operations) invalidateOverview() {
+	if o.config.Overview != nil {
+		o.config.Overview.Invalidate()
+	}
+}
+
+func (o *Operations) preflight(ctx context.Context, force bool) error {
+	var lease *activity.MaintenanceLease
+	var busy []activity.Kind
+	var err error
+	if force {
+		lease, busy, err = o.config.Activity.TryAcquireMaintenanceForce(ctx)
+	} else {
+		lease, busy, err = o.config.Activity.TryAcquireMaintenance(ctx, 0)
+	}
 	if errors.Is(err, activity.ErrBusy) {
-		return &BusyError{Resources: busy}
+		return &BusyError{
+			Resources:      activity.BusyResourcesForKinds(busy),
+			ForceAvailable: forceAvailable(busy),
+		}
 	}
 	if err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -107,6 +108,132 @@ func TestSQLiteRepository_TakeHeadFIFO(t *testing.T) {
 	}
 }
 
+func TestSQLiteRepository_ReserveHeadMarksLifecycleRowInFlight(t *testing.T) {
+	repo := newTestSQLiteRepo(t)
+	ctx := context.Background()
+
+	msg := &QueuedMessage{
+		SessionID: "s1", TaskID: "t1", Content: "pr merged", QueuedBy: QueuedByWorkflow,
+		Metadata: map[string]interface{}{MetadataLifecycleDurable: true},
+	}
+	if err := repo.Insert(ctx, msg, 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	reserved, err := repo.ReserveHead(ctx, "s1")
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if reserved == nil {
+		t.Fatal("reserve: nil head")
+	}
+	// The caller's copy stays unmarked so a requeue rewrites a pending row.
+	if reserved.IsReservedInFlight() {
+		t.Error("reserved copy should not carry the in-flight marker")
+	}
+	if !reserved.IsReservedLifecycleDelivery() {
+		t.Error("reserved copy should carry process-local reservation evidence")
+	}
+
+	entries, err := repo.ListBySession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected the reserved row to survive, got %d entries", len(entries))
+	}
+	if !entries[0].IsReservedInFlight() {
+		t.Errorf("stored row missing the in-flight marker: %+v", entries[0].Metadata)
+	}
+	if !entries[0].IsDurableLifecycle() {
+		t.Error("stored row lost its durable lifecycle marker")
+	}
+}
+
+func TestSQLiteRepository_ReserveAfterRestartReturnsRetryableLifecycleMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "queue.db")
+	openRepo := func() (Repository, *sqlx.DB) {
+		raw, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on")
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		raw.SetMaxOpenConns(1)
+		raw.SetMaxIdleConns(1)
+		db := sqlx.NewDb(raw, "sqlite3")
+		repo, err := NewSQLiteRepository(db, db)
+		if err != nil {
+			_ = db.Close()
+			t.Fatalf("NewSQLiteRepository: %v", err)
+		}
+		return repo, db
+	}
+
+	repo, db := openRepo()
+	firstDB := db
+	t.Cleanup(func() { _ = firstDB.Close() })
+	if _, err := db.Exec(`
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			archived_at TIMESTAMP NULL,
+			updated_at TIMESTAMP NOT NULL
+		);
+		INSERT INTO tasks (id, archived_at, updated_at) VALUES ('t1', NULL, CURRENT_TIMESTAMP);
+	`); err != nil {
+		t.Fatalf("seed active task: %v", err)
+	}
+	msg := &QueuedMessage{
+		SessionID: "s1", TaskID: "t1", Content: "pr merged", QueuedBy: QueuedByWorkflow,
+		Metadata: map[string]interface{}{
+			MetadataLifecycleDurable:    true,
+			MetadataLifecycleGeneration: float64(0),
+			MetadataCoalesceKey:         "github-pr:repo:1:merged",
+		},
+	}
+	if err := repo.Insert(ctx, msg, 0); err != nil {
+		t.Fatalf("insert lifecycle row: %v", err)
+	}
+	if _, err := repo.ReserveHead(ctx, "s1"); err != nil {
+		t.Fatalf("initial reserve: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close before restart: %v", err)
+	}
+
+	repo, db = openRepo()
+	t.Cleanup(func() { _ = db.Close() })
+	reserved, err := repo.ReserveHead(ctx, "s1")
+	if err != nil {
+		t.Fatalf("reserve after restart: %v", err)
+	}
+	if reserved == nil {
+		t.Fatal("reserve after restart returned nil")
+	}
+	if reserved.IsReservedInFlight() {
+		t.Fatalf("returned reservation leaked transient marker: %+v", reserved.Metadata)
+	}
+	if !reserved.IsReservedLifecycleDelivery() {
+		t.Fatal("returned reservation lost process-local reservation evidence")
+	}
+
+	retried, _, err := repo.InsertOrReplaceLifecycleByCoalesceKey(
+		ctx, reserved, "github-pr:repo:1:merged", 0, false,
+	)
+	if err != nil {
+		t.Fatalf("requeue failed delivery: %v", err)
+	}
+	if retried.IsReservedInFlight() {
+		t.Fatalf("requeued copy retained transient marker: %+v", retried.Metadata)
+	}
+	entries, err := repo.ListBySession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("list retried lifecycle row: %v", err)
+	}
+	if len(entries) != 1 || entries[0].IsReservedInFlight() {
+		t.Fatalf("failed delivery was not visible for retry: %+v", entries)
+	}
+}
+
 func TestSQLiteRepository_AppendOrInsertTail(t *testing.T) {
 	repo := newTestSQLiteRepo(t)
 	ctx := context.Background()
@@ -187,6 +314,69 @@ func TestSQLiteRepository_UpdateContent(t *testing.T) {
 	}
 }
 
+func TestSQLiteRepository_UpdateContentAndMetadataPreservesUnrelatedKeys(t *testing.T) {
+	repo := newTestSQLiteRepo(t)
+	ctx := context.Background()
+	msg := &QueuedMessage{
+		SessionID: "s1",
+		TaskID:    "t1",
+		Content:   "original",
+		QueuedBy:  "user-1",
+		Metadata: map[string]interface{}{
+			"entity_references": []interface{}{"old"},
+			"origin":            "inter-task",
+		},
+	}
+	if err := repo.Insert(ctx, msg, 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := repo.UpdateContentAndMetadata(
+		ctx, "s1", msg.ID, "edited", nil,
+		map[string]interface{}{"entity_references": []interface{}{"new"}},
+		"user-1",
+	); err != nil {
+		t.Fatalf("update content and metadata: %v", err)
+	}
+
+	entries, err := repo.ListBySession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(entries))
+	}
+	if entries[0].Content != "edited" {
+		t.Fatalf("content = %q, want edited", entries[0].Content)
+	}
+	if entries[0].Metadata["origin"] != "inter-task" {
+		t.Fatalf("unrelated metadata lost: %+v", entries[0].Metadata)
+	}
+	wantReferences := []interface{}{"new"}
+	gotReferences, ok := entries[0].Metadata["entity_references"].([]interface{})
+	if !ok || len(gotReferences) != len(wantReferences) || gotReferences[0] != wantReferences[0] {
+		t.Fatalf("entity references = %#v, want %#v", entries[0].Metadata["entity_references"], wantReferences)
+	}
+
+	if err := repo.UpdateContentAndMetadata(
+		ctx, "s1", msg.ID, "edited again", nil,
+		map[string]interface{}{"entity_references": nil},
+		"user-1",
+	); err != nil {
+		t.Fatalf("clear references: %v", err)
+	}
+	entries, err = repo.ListBySession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("list after clear: %v", err)
+	}
+	if entries[0].Metadata["origin"] != "inter-task" {
+		t.Fatalf("unrelated metadata lost while clearing: %+v", entries[0].Metadata)
+	}
+	if _, exists := entries[0].Metadata["entity_references"]; exists {
+		t.Fatalf("stale references survived clear: %+v", entries[0].Metadata)
+	}
+}
+
 func TestSQLiteRepository_ReplaceCoalescedDetectsMissingRow(t *testing.T) {
 	repo := newTestSQLiteRepo(t).(*sqliteRepository)
 	ctx := context.Background()
@@ -246,6 +436,39 @@ func TestSQLiteRepository_DeleteByID(t *testing.T) {
 	count, _ = repo.CountBySession(ctx, "s1")
 	if count != 1 {
 		t.Errorf("agent-authored entry should survive delete attempt, got count=%d", count)
+	}
+}
+
+func TestSQLiteRepository_ClientMutationsRejectWorkflowOwnedEntry(t *testing.T) {
+	repo := newTestSQLiteRepo(t)
+	ctx := context.Background()
+
+	msg := &QueuedMessage{
+		SessionID: "s1",
+		TaskID:    "t1",
+		Content:   "lifecycle prompt",
+		QueuedBy:  QueuedByWorkflow,
+		Metadata:  map[string]interface{}{"origin": "github_pr_automation"},
+	}
+	if err := repo.Insert(ctx, msg, 0); err != nil {
+		t.Fatalf("insert workflow entry: %v", err)
+	}
+
+	if err := repo.UpdateContent(
+		ctx, "s1", msg.ID, "hostile replacement", nil, QueuedByWorkflow,
+	); !errors.Is(err, ErrEntryNotFound) {
+		t.Errorf("workflow-owned update error = %v, want ErrEntryNotFound", err)
+	}
+	if err := repo.DeleteByID(ctx, "s1", msg.ID); !errors.Is(err, ErrEntryNotFound) {
+		t.Errorf("workflow-owned delete error = %v, want ErrEntryNotFound", err)
+	}
+
+	entries, err := repo.ListBySession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("list workflow entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Content != "lifecycle prompt" {
+		t.Fatalf("workflow entry changed after hostile mutations: %+v", entries)
 	}
 }
 

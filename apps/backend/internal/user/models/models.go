@@ -17,11 +17,29 @@ func NormalizeMCPTaskAgentProfileDefault(value string) string {
 	return MCPTaskAgentProfileDefaultCurrentTask
 }
 
+const (
+	// RoleAdmin unlocks user management and system settings mutation when
+	// authentication is enabled. It does NOT grant visibility into other
+	// users' workspaces (hard privacy isolation).
+	RoleAdmin = "admin"
+	// RoleMember is a regular authenticated user.
+	RoleMember = "member"
+
+	// StatusActive marks a user that may log in.
+	StatusActive = "active"
+	// StatusDisabled marks a user whose access is revoked; all sessions and
+	// API tokens are invalidated when this status is set.
+	StatusDisabled = "disabled"
+)
+
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          string    `json:"id"`
+	Email       string    `json:"email"`
+	DisplayName string    `json:"display_name"`
+	Role        string    `json:"role"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type UserSettings struct {
@@ -32,6 +50,7 @@ type UserSettings struct {
 	RepositoryIDs               []string                          `json:"repository_ids"`
 	TasksListSort               string                            `json:"tasks_list_sort"`
 	TasksListGroup              string                            `json:"tasks_list_group"`
+	TasksListShowDetails        bool                              `json:"tasks_list_show_details"`
 	InitialSetupComplete        bool                              `json:"initial_setup_complete"`
 	PreferredShell              string                            `json:"preferred_shell"`
 	DefaultEditorID             string                            `json:"default_editor_id"`
@@ -40,6 +59,9 @@ type UserSettings struct {
 	ReviewAutoMarkOnScroll      bool                              `json:"review_auto_mark_on_scroll"`
 	ConfirmTaskArchive          bool                              `json:"confirm_task_archive"`
 	MCPTaskAgentProfileDefault  string                            `json:"mcp_task_agent_profile_default"`
+	ShowAnchoredPromptBar       bool                              `json:"show_anchored_prompt_bar"` // desktop-only sticky last-prompt bar
+	ShowScrollToLastPrompt      bool                              `json:"show_scroll_to_last_prompt"`
+	ShowScrollToStart           bool                              `json:"show_scroll_to_start"`
 	ShowReleaseNotification     bool                              `json:"show_release_notification"`
 	ReleaseNotesLastSeenVersion string                            `json:"release_notes_last_seen_version"`
 	LspAutoStartLanguages       []string                          `json:"lsp_auto_start_languages"`
@@ -64,6 +86,7 @@ type UserSettings struct {
 	TerminalFontSize            int                               `json:"terminal_font_size"`
 	ChangesPanelLayout          string                            `json:"changes_panel_layout"` // "flat" | "tree"
 	SystemMetricsDisplay        SystemMetricsDisplaySettings      `json:"system_metrics_display"`
+	AppStatusBarOrder           AppStatusBarOrder                 `json:"app_status_bar_order"`
 	VoiceMode                   VoiceModeSettings                 `json:"voice_mode"`
 	CreatedAt                   time.Time                         `json:"created_at"`
 	UpdatedAt                   time.Time                         `json:"updated_at"`
@@ -71,6 +94,12 @@ type UserSettings struct {
 
 type SystemMetricsDisplaySettings struct {
 	ShowInTopbar bool `json:"show_in_topbar"`
+	Simplified   bool `json:"simplified"`
+}
+
+type AppStatusBarOrder struct {
+	LeftItemIDs  []string `json:"left_item_ids"`
+	RightItemIDs []string `json:"right_item_ids"`
 }
 
 // VoiceModeSettings is the per-user configuration surface for the chat

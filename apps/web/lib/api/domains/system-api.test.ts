@@ -33,6 +33,7 @@ import {
   fetchStorageOverview,
   fetchStorageQuarantine,
   fetchStorageRuns,
+  purgeStorageQuarantine,
   restoreStorageQuarantine,
   runStorageMaintenance,
   saveStorageSettings,
@@ -334,7 +335,13 @@ describe("storage maintenance", () => {
   it("loads overview and list resources without caching", async () => {
     fetchSpy
       .mockResolvedValueOnce(
-        jsonResponse({ settings, summary: {}, capabilities: {}, last_run: null }),
+        jsonResponse({
+          settings,
+          summary: {},
+          capabilities: {},
+          analyzed_at: "2026-07-23T12:00:00Z",
+          last_run: null,
+        }),
       )
       .mockResolvedValueOnce(jsonResponse({ runs: [{ id: "run-1" }] }))
       .mockResolvedValueOnce(jsonResponse({ entries: [{ id: "entry-1" }] }));
@@ -374,14 +381,38 @@ describe("storage maintenance", () => {
     expect(response.job_id).toBe("delete-job");
   });
 
+  it("uses typed confirmations for bulk quarantine purge", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ job_id: "eligible-job" }));
+    await purgeStorageQuarantine("eligible");
+    expect(lastCall().url).toBe(`${BASE}/storage/quarantine`);
+    expect(method()).toBe("DELETE");
+    expect(JSON.parse(String(lastCall().init?.body))).toEqual({
+      scope: "eligible",
+      confirm: "DELETE ELIGIBLE",
+    });
+
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ job_id: "all-job" }));
+    await purgeStorageQuarantine("all");
+    expect(JSON.parse(String(lastCall().init?.body))).toEqual({
+      scope: "all",
+      confirm: "DELETE ALL NOW",
+    });
+  });
+
   it("starts analysis, selected cleanup, and restore operations", async () => {
     fetchSpy
       .mockResolvedValueOnce(jsonResponse({ job_id: "analysis" }))
-      .mockResolvedValueOnce(jsonResponse({ job_id: "cleanup" }))
-      .mockResolvedValueOnce(jsonResponse({ entry: { id: "restored" } }));
+      .mockResolvedValueOnce(jsonResponse({ job_id: "cleanup" }));
     expect((await analyzeStorage()).job_id).toBe("analysis");
     expect((await runStorageMaintenance(["workspaces"])).job_id).toBe("cleanup");
     expect(JSON.parse(String(lastCall().init?.body))).toEqual({ resources: ["workspaces"] });
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ job_id: "forced-cleanup" }));
+    expect((await runStorageMaintenance(["workspaces"], true)).job_id).toBe("forced-cleanup");
+    expect(JSON.parse(String(lastCall().init?.body))).toEqual({
+      resources: ["workspaces"],
+      force: true,
+    });
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ entry: { id: "restored" } }));
     expect((await restoreStorageQuarantine("entry-1")).id).toBe("restored");
   });
 });

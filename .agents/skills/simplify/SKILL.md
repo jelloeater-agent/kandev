@@ -1,6 +1,6 @@
 ---
 name: simplify
-description: Simplify recently changed code — inline one-off abstractions, remove speculative code, reduce nesting, replace cleverness with clarity. Run after implementing a feature.
+description: Simplify recently changed code — inline one-off abstractions, remove speculative code, reduce nesting, replace cleverness with clarity. Use only on explicit request or PR-review remediation.
 ---
 
 # Simplify
@@ -9,17 +9,10 @@ Post-implementation simplification pass. Review recently changed code and active
 
 ## Planner Entry
 
-The user-started primary session delegates this
-procedure to the registered `simplify` worker and assigns verification to the
-`verify` worker afterward. It does not edit or verify the code directly. An
-explicitly assigned simplify worker continues below and does not spawn workers.
+Run `/simplify` only on explicit request or when an actionable PR finding calls
+for it. It is not a default post-implementation or pre-PR pass.
 
 The best code is code you don't have to write. The second best is code anyone can read.
-
-## Available skills and subagents
-
-- **`verify` worker** — The planner runs this after simplification to ensure all
-  tests, lints, and typechecks still pass.
 
 ## Steps
 
@@ -29,9 +22,9 @@ Run `git diff --name-only` (or `git diff origin/<base>...HEAD --name-only` for a
 
 ### 2. Apply simplifications
 
-Work through each changed file. Preserve behavior by inspection; do not run
-tests, lint, typecheck, or full verification from the simplify assignment.
-Report any verification concerns or focused checks the planner should delegate.
+Work through each changed file. Preserve behavior by inspection; defer broad
+test suites, lint, typecheck, and full verification until after this pass.
+Report any verification concerns and the focused task check to run next.
 
 **Inline one-off abstractions:**
 - Helper functions with a single call site — inline them
@@ -60,12 +53,12 @@ Report any verification concerns or focused checks the planner should delegate.
 - Empty error handlers, unused catch variables
 - Leftover debug logging
 
-### 3. Verify
+### 3. Validate
 
-Report the required full verification and any focused concerns to the planner;
-do not run verification yourself. The planner delegates it to the `verify`
-worker. If anything breaks, the simplification changed behavior and the
-planner assigns the correction to a worker.
+After the simplification pass, run the focused task check affected by the
+change. If anything breaks, the simplification changed behavior and must be
+corrected before continuing. Broad suites remain deferred unless the task or
+user explicitly requires them.
 
 ### 4. Summary
 

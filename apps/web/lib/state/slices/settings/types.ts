@@ -102,6 +102,31 @@ export type InstallJobsState = {
   byAgent: Record<string, InstallJob>;
 };
 
+export type AgentUpdateJobStatus =
+  | "queued"
+  | "resolving"
+  | "updating"
+  | "refreshing"
+  | "succeeded"
+  | "failed";
+
+export type AgentUpdateJob = {
+  job_id: string;
+  agent_name: string;
+  status: AgentUpdateJobStatus;
+  current_version?: string;
+  target_version?: string;
+  output?: string;
+  error?: string;
+  refresh_error?: string;
+  started_at: string;
+  finished_at?: string;
+};
+
+export type AgentUpdateJobsState = {
+  byAgent: Record<string, AgentUpdateJob>;
+};
+
 export type EditorsState = {
   items: EditorOption[];
   loaded: boolean;
@@ -147,6 +172,7 @@ export type UserSettingsState = {
   repositoryIds: string[];
   tasksListSort: TasksListSort;
   tasksListGroup: TasksListGroup;
+  tasksListShowDetails: boolean;
   preferredShell: string | null;
   shellOptions: Array<{ value: string; label: string }>;
   defaultEditorId: string | null;
@@ -155,6 +181,9 @@ export type UserSettingsState = {
   reviewAutoMarkOnScroll: boolean;
   confirmTaskArchive: boolean;
   mcpTaskAgentProfileDefault: MCPTaskAgentProfileDefault;
+  showAnchoredPromptBar: boolean;
+  showScrollToLastPrompt: boolean;
+  showScrollToStart: boolean;
   showReleaseNotification: boolean;
   releaseNotesLastSeenVersion: string | null;
   lspAutoStartLanguages: string[];
@@ -177,9 +206,15 @@ export type UserSettingsState = {
   terminalFontFamily: string | null;
   terminalFontSize: number | null;
   changesPanelLayout: "flat" | "tree";
-  systemMetricsDisplay: { showInTopbar: boolean };
+  systemMetricsDisplay: { showInTopbar: boolean; simplified: boolean };
+  appStatusBarOrder: AppStatusBarOrderState;
   voiceMode: VoiceModeState;
   loaded: boolean;
+};
+
+export type AppStatusBarOrderState = {
+  leftItemIds: string[];
+  rightItemIds: string[];
 };
 
 export type TaskCreateLastUsedState = {
@@ -216,6 +251,7 @@ export type SettingsSliceState = {
   availableAgents: AvailableAgentsState;
   agentProfiles: AgentProfilesState;
   installJobs: InstallJobsState;
+  updateJobs: AgentUpdateJobsState;
   editors: EditorsState;
   prompts: PromptsState;
   secrets: SecretsState;
@@ -240,6 +276,10 @@ export type SettingsSliceActions = {
   upsertInstallJob: (job: InstallJob) => void;
   appendInstallOutput: (agentName: string, chunk: string) => void;
   clearInstallJob: (agentName: string) => void;
+  setAgentUpdateJobs: (jobs: AgentUpdateJob[]) => void;
+  upsertAgentUpdateJob: (job: AgentUpdateJob) => void;
+  appendAgentUpdateOutput: (agentName: string, jobId: string, chunk: string) => void;
+  clearAgentUpdateJob: (agentName: string) => void;
   setEditors: (editors: EditorsState["items"]) => void;
   setEditorsLoading: (loading: boolean) => void;
   setPrompts: (prompts: PromptsState["items"]) => void;

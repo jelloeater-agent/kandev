@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import type { Repository, RepositoryScript, Task } from "@/lib/types/http";
 import type { Terminal } from "@/hooks/domains/session/use-terminals";
@@ -12,9 +12,11 @@ import { useSessionAgentctl } from "@/hooks/domains/session/use-session-agentctl
 import { useTaskFocus } from "@/hooks/domains/session/use-task-focus";
 import { useAppStore } from "@/components/state-provider";
 import { useEnsureTaskSession } from "@/hooks/domains/session/use-ensure-task-session";
+import { useExternalVcsFileLinkHydration } from "@/hooks/domains/workspace/use-external-vcs-file-link";
 import { fetchTask } from "@/lib/api";
 import { useTasks } from "@/hooks/use-tasks";
 import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import { useForegroundRefresh } from "@/hooks/use-foreground-refresh";
 import type { Layout } from "react-resizable-panels";
 import {
   deriveIsAgentWorking,
@@ -135,7 +137,7 @@ export function useMergedAgentState(
 function TaskLoadingState() {
   return (
     <div
-      className="flex h-screen w-full items-center justify-center bg-background px-4"
+      className="flex h-full min-h-0 w-full items-center justify-center bg-background px-4"
       data-testid="task-loading-state"
     >
       <div className="flex min-h-24 min-w-0 flex-col items-center justify-center gap-3 text-center text-sm text-muted-foreground">
@@ -149,7 +151,7 @@ function TaskLoadingState() {
 function TaskLoadErrorState() {
   return (
     <div
-      className="flex h-screen w-full items-center justify-center bg-background px-4"
+      className="flex h-full min-h-0 w-full items-center justify-center bg-background px-4"
       data-testid="task-load-error-state"
     >
       <div className="flex min-h-24 max-w-sm min-w-0 flex-col items-center justify-center gap-3 text-center text-sm text-muted-foreground">
@@ -168,6 +170,7 @@ function TaskLoadErrorState() {
 function useTaskDetails(activeTaskId: string | null, initialTask: Task | null) {
   const [taskDetails, setTaskDetails] = useState<Task | null>(initialTask);
   const [taskLoadError, setTaskLoadError] = useState<unknown | null>(null);
+  const activeTaskIdRef = useRef(activeTaskId);
   const kanbanTask = useAppStore((state) =>
     activeTaskId
       ? (state.kanban.tasks.find(
@@ -188,34 +191,34 @@ function useTaskDetails(activeTaskId: string | null, initialTask: Task | null) {
   useTasks(task?.workflow_id ?? null);
 
   useEffect(() => {
+    activeTaskIdRef.current = activeTaskId;
+  }, [activeTaskId]);
+
+  const loadTaskDetails = useCallback(async () => {
+    if (!activeTaskId) return;
+    const requestedTaskId = activeTaskId;
+    try {
+      const response = await fetchTask(requestedTaskId, { cache: "no-store" });
+      if (activeTaskIdRef.current !== requestedTaskId) return;
+      setTaskDetails(response);
+      setTaskLoadError(null);
+    } catch (error) {
+      if (activeTaskIdRef.current !== requestedTaskId) return;
+      console.error("[TaskPageContent] Failed to load task details:", error);
+      setTaskLoadError(error);
+    }
+  }, [activeTaskId]);
+
+  useEffect(() => {
     if (!activeTaskId || taskDetails?.id === activeTaskId) {
       setTaskLoadError(null);
       return;
     }
-    let cancelled = false;
     setTaskLoadError(null);
-    fetchTask(activeTaskId, { cache: "no-store" })
-      .then((response) => {
-        if (cancelled) return;
-        setTaskDetails(response);
-        setTaskLoadError(null);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        console.error("[TaskPageContent] Failed to load task details:", error);
-        setTaskLoadError(error);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    activeTaskId,
-    taskDetails?.id,
-    taskDetails?.workspace_id,
-    taskDetails?.workflow_id,
-    kanbanTask,
-    setTaskDetails,
-  ]);
+    void loadTaskDetails();
+  }, [activeTaskId, taskDetails?.id, loadTaskDetails]);
+
+  useForegroundRefresh(loadTaskDetails, Boolean(activeTaskId), activeTaskId);
 
   const onTaskUnarchived = useCallback((taskId: string) => {
     setTaskDetails((current) =>
@@ -283,6 +286,7 @@ function useTaskPageData(
     agent,
     effectiveSessionId,
     repository,
+    repositories: effectiveRepositories,
     ensureSession,
     onTaskUnarchived,
   };
@@ -310,9 +314,11 @@ export function TaskPageContent({
     agent,
     effectiveSessionId,
     repository,
+    repositories,
     ensureSession,
     onTaskUnarchived,
   } = useTaskPageData(initialTask, initialTaskId, sessionId, initialRepositories);
+  useExternalVcsFileLinkHydration(task, repositories);
 
   const workflowSteps = useWorkflowStepsMapped();
   const sessionPanel = useSessionPanelState(effectiveSessionId);

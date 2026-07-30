@@ -16,6 +16,11 @@ import (
 
 // CreateWorkspace creates a new workspace
 func (r *Repository) CreateWorkspace(ctx context.Context, workspace *models.Workspace) error {
+	r.prepareWorkspace(workspace)
+	return r.insertWorkspace(ctx, r.db, workspace)
+}
+
+func (r *Repository) prepareWorkspace(workspace *models.Workspace) {
 	if workspace.ID == "" {
 		workspace.ID = uuid.New().String()
 	}
@@ -25,8 +30,10 @@ func (r *Repository) CreateWorkspace(ctx context.Context, workspace *models.Work
 	if workspace.TaskPrefix == "" {
 		workspace.TaskPrefix = "KAN"
 	}
+}
 
-	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+func (r *Repository) insertWorkspace(ctx context.Context, exec sqlx.ExtContext, workspace *models.Workspace) error {
+	_, err := exec.ExecContext(ctx, r.db.Rebind(`
 		INSERT INTO workspaces (
 			id,
 			name,
@@ -174,6 +181,9 @@ func (r *Repository) deleteWorkspaceCascade(
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := r.purgeWorkspaceTaskQueuesInTx(ctx, tx, tasks); err != nil {
+		return nil, nil, err
+	}
 
 	rows, err := r.deleteWorkspaceCascadeRow(ctx, tx, id, expectedName)
 	if err != nil {
@@ -193,6 +203,16 @@ func (r *Repository) deleteWorkspaceCascade(
 		return nil, nil, err
 	}
 	if _, err := tx.ExecContext(ctx, r.db.Rebind(`
+		DELETE FROM workflow_steps
+		WHERE workflow_id IN (
+			SELECT id
+			FROM workflows
+			WHERE workspace_id = ?
+		)
+	`), id); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, r.db.Rebind(`
 		DELETE FROM workflows
 		WHERE workspace_id = ?
 	`), id); err != nil {
@@ -201,7 +221,19 @@ func (r *Repository) deleteWorkspaceCascade(
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
+	for _, task := range tasks {
+		r.notifyTaskQueuePurged(ctx, task.ID)
+	}
 	return tasks, workflows, nil
+}
+
+func (r *Repository) purgeWorkspaceTaskQueuesInTx(ctx context.Context, tx *sqlx.Tx, tasks []*models.Task) error {
+	for _, task := range tasks {
+		if err := r.purgeTaskQueueInTx(ctx, tx, task.ID); err != nil {
+			return fmt.Errorf("purge task queue for workspace cascade task %s: %w", task.ID, err)
+		}
+	}
+	return nil
 }
 
 func (r *Repository) deleteWorkspaceCascadeRow(
@@ -305,6 +337,16 @@ func (r *Repository) listWorkspaceCascadeDeleteWorkflows(
 }
 
 // ListWorkspaces returns all workspaces
+// ClaimUnownedWorkspaces assigns every pre-auth workspace (empty owner_id) to
+// ownerID. Called by the auth setup wizard when promoting the instance's
+// single user to the admin account; idempotent.
+func (r *Repository) ClaimUnownedWorkspaces(ctx context.Context, ownerID string) error {
+	_, err := r.db.ExecContext(ctx, r.db.Rebind(`
+		UPDATE workspaces SET owner_id = ? WHERE owner_id = '' OR owner_id IS NULL
+	`), ownerID)
+	return err
+}
+
 func (r *Repository) ListWorkspaces(ctx context.Context) ([]*models.Workspace, error) {
 	rows, err := r.ro.QueryContext(ctx, `
 		SELECT id, name, description, owner_id, default_executor_id, default_environment_id, default_agent_profile_id, default_config_agent_profile_id, task_prefix, task_sequence, office_workflow_id, created_at, updated_at

@@ -10,7 +10,7 @@ Sources:
 
 ## Skills
 
-Cursor supports Agent Skills as reusable `SKILL.md` packages. Project skills are generated under `.cursor/skills/` by Cursor's migration flow, and skills follow the standard folder shape:
+Cursor supports Agent Skills as reusable `SKILL.md` packages. It discovers project skills from both `.cursor/skills/` and the shared `.agents/skills/` source Kandev uses directly; no `.cursor/skills` mirror or symlink is required. Cursor's migration flow can also generate project skills under `.cursor/skills/`, which follows the standard folder shape:
 
 ```text
 .cursor/skills/<name>/SKILL.md
@@ -61,22 +61,21 @@ readonly: false
 Implement only the assigned scope and report verification.
 ```
 
-Important fields used by this repository:
+Important fields:
 
 - `name`: stable role name matching the filename.
 - `description`: routing trigger for automatic or explicit delegation.
-- `model`: concrete Cursor model slug. Use `composer-2.5` for normal workers
-  and `grok-4.5` for frontier architecture, security, and deep review roles.
-- `readonly`: `true` for architecture, QA, review, security, and polling;
-  `false` for implementation, tests, simplification, and verification.
+- `model`: optional concrete Cursor model slug.
+- `readonly`: whether the worker may modify the workspace.
 
 Custom subagents receive their own context and can use custom prompts, tool
 access, and models. Keep worker bodies explicit that they do not spawn further
 subagents. Cursor writes remain subject to the user's normal permission policy.
 
 Cursor has no verified per-agent effort or reasoning-effort frontmatter field
-as of 2026-07-20. Kandev `.cursor/agents/` mirrors encode model tier only; role
-effort mapping lives in `.agents/agents/` and Codex mirrors.
+as of 2026-07-20. Kandev does not maintain `.cursor/agents/` mirrors; create a
+project agent only when the user explicitly authorizes its added cost and
+context isolation.
 
 ## Rules
 

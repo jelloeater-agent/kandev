@@ -50,6 +50,22 @@ type LaunchSessionRequest struct {
 	// suppress the upgrade and strand a passthrough session without a PTY.
 	DeferredStart bool                   `json:"-"`
 	Attachments   []v1.MessageAttachment `json:"attachments,omitempty"`
+	// SpawnOrigin identifies the agent session that requested this launch via
+	// spawn_session_kandev, so the new session's first turn can carry spawner
+	// attribution and reply instructions. Like DeferredStart it is kept off the
+	// wire protocol (`json:"-"`): the launch site turns it into a *trusted*
+	// <kandev-system> block that survives first-turn canonicalization, so a WS
+	// client must not be able to forge one and fabricate server authority.
+	SpawnOrigin *SpawnOrigin `json:"-"`
+}
+
+// SpawnOrigin describes the agent session that spawned a new sibling session.
+// The identifiers are resolved server-side by the MCP layer from the calling
+// agent's own session, never read from the tool arguments.
+type SpawnOrigin struct {
+	TaskID      string
+	SessionID   string
+	SessionName string
 }
 
 // LaunchSessionResponse is the unified response for session.launch.
@@ -85,6 +101,14 @@ func ResolveIntent(req *LaunchSessionRequest) SessionIntent {
 
 // LaunchSession is the unified entry point for all session operations.
 func (s *Service) LaunchSession(ctx context.Context, req *LaunchSessionRequest) (*LaunchSessionResponse, error) {
+	// Every intent funnels through here. SessionID is empty when creating, so
+	// that case is carried by the task check alone.
+	if err := s.authorizeTask(ctx, req.TaskID); err != nil {
+		return nil, err
+	}
+	if err := s.authorizeSession(ctx, req.SessionID); err != nil {
+		return nil, err
+	}
 	intent := ResolveIntent(req)
 	req.Prompt = strings.TrimSpace(req.Prompt)
 
@@ -170,10 +194,11 @@ func (s *Service) launchStart(ctx context.Context, req *LaunchSessionRequest) (*
 		return s.launchPrepare(ctx, req)
 	}
 
-	execution, err := s.StartTask(
+	execution, err := s.startTask(
 		ctx, req.TaskID, req.AgentProfileID, req.ExecutorID,
 		req.ExecutorProfileID, req.Priority, req.Prompt,
 		req.WorkflowStepID, req.PlanMode, req.AutoStart, req.Attachments,
+		startTaskOptions{SpawnOrigin: req.SpawnOrigin},
 	)
 	if err != nil {
 		return nil, err
@@ -215,7 +240,7 @@ func (s *Service) shouldBlockAutoStart(ctx context.Context, req *LaunchSessionRe
 func (s *Service) launchStartCreated(ctx context.Context, req *LaunchSessionRequest) (*LaunchSessionResponse, error) {
 	execution, err := s.StartCreatedSession(
 		ctx, req.TaskID, req.SessionID, req.AgentProfileID,
-		req.Prompt, req.SkipMessageRecord, req.PlanMode, req.AutoStart, req.Attachments,
+		req.Prompt, req.SkipMessageRecord, req.PlanMode, req.AutoStart, req.Attachments, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -286,6 +311,14 @@ func (s *Service) launchRestoreWorkspace(ctx context.Context, req *LaunchSession
 // RecoverSession handles user-initiated recovery after an agent CLI failure.
 // action is "resume" (retry with existing ACP session) or "fresh_start" (clear token, start fresh).
 func (s *Service) RecoverSession(ctx context.Context, taskID, sessionID, action string) (*LaunchSessionResponse, error) {
+	// Guard before the switch: "fresh_start" clears the resume token, so an
+	// unauthorized call would mutate the session even if the launch failed.
+	if err := s.authorizeSession(ctx, sessionID); err != nil {
+		return nil, err
+	}
+	if err := s.authorizeTask(ctx, taskID); err != nil {
+		return nil, err
+	}
 	switch action {
 	case "fresh_start":
 		s.clearResumeToken(ctx, sessionID)

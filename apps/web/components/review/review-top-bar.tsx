@@ -20,10 +20,16 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
 import { Checkbox } from "@kandev/ui/checkbox";
 import type { DiffComment } from "@/lib/diff/types";
 import { useAppStore } from "@/components/state-provider";
+import { useTaskReview } from "@/hooks/domains/review/use-task-review";
 import { getWebSocketClient } from "@/lib/ws/connection";
 import { updateUserSettings } from "@/lib/api";
 import { VcsSplitButton } from "@/components/vcs-split-button";
+import { isRunActive } from "@/lib/review/findings";
 import { FixCommentsButton } from "./review-fix-comments-button";
+import { ReviewRunButton } from "./review-run-button";
+import { ReviewFindingsButton } from "./review-findings-button";
+import { ReviewPRSelector } from "./review-pr-selector";
+import type { TaskPR } from "@/lib/types/github";
 
 type ReviewTopBarProps = {
   sessionId: string;
@@ -37,10 +43,16 @@ type ReviewTopBarProps = {
   onToggleWordWrap: (wrap: boolean) => void;
   onSendComments: (comments: DiffComment[]) => void;
   onClose: () => void;
+  /** Selects a file in the review diff — used to jump to a finding's file. */
+  onSelectFile: (fileKey: string) => void;
   onRequestWalkthrough?: () => void;
   requestWalkthroughDisabled?: boolean;
   getPendingComments: () => DiffComment[];
   markCommentsSent: (ids: string[]) => void;
+  prs: TaskPR[];
+  selectedPR: TaskPR | null;
+  onSelectPR?: (pr: TaskPR) => void;
+  prDiffLoading: boolean;
 };
 
 function sendAutoMarkSetting(checked: boolean) {
@@ -103,6 +115,50 @@ function ReviewProgress({ reviewedCount, totalCount }: ReviewProgressProps) {
   );
 }
 
+function ReviewDisplayControls({
+  wordWrap,
+  splitView,
+  onToggleWordWrap,
+  onToggleSplitView,
+}: Pick<ReviewTopBarProps, "wordWrap" | "splitView" | "onToggleWordWrap" | "onToggleSplitView">) {
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={`px-2 cursor-pointer ${wordWrap ? "bg-muted" : ""}`}
+            onClick={() => onToggleWordWrap(!wordWrap)}
+          >
+            <IconTextWrap className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Toggle word wrap</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="px-2 cursor-pointer"
+            onClick={() => onToggleSplitView(!splitView)}
+          >
+            {splitView ? (
+              <IconLayoutRows className="h-4 w-4" />
+            ) : (
+              <IconLayoutColumns className="h-4 w-4" />
+            )}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {splitView ? "Switch to unified view" : "Switch to split view"}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  );
+}
+
 function ReviewWalkthroughButton({
   onRequestWalkthrough,
   disabled,
@@ -150,11 +206,19 @@ export const ReviewTopBar = memo(function ReviewTopBar({
   onToggleWordWrap,
   onSendComments,
   onClose,
+  onSelectFile,
   onRequestWalkthrough,
   requestWalkthroughDisabled,
   getPendingComments,
   markCommentsSent,
+  prs,
+  selectedPR,
+  onSelectPR,
+  prDiffLoading,
 }: ReviewTopBarProps) {
+  const activeTaskId = useAppStore((state) => state.tasks.activeTaskId);
+  const { activeRun, findings } = useTaskReview(activeTaskId);
+  const reviewRunning = isRunActive(activeRun);
   const reviewAutoMarkOnScroll = useAppStore((state) => state.userSettings.reviewAutoMarkOnScroll);
   const setUserSettings = useAppStore((state) => state.setUserSettings);
   const userSettings = useAppStore((state) => state.userSettings);
@@ -175,44 +239,27 @@ export const ReviewTopBar = memo(function ReviewTopBar({
   );
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2 border-b border-border bg-card/50 min-h-[48px]">
+    <div className="flex min-h-[48px] flex-wrap items-center gap-2 border-b border-border bg-card/50 px-2 py-2 sm:gap-3 sm:px-4">
       <ReviewSettingsMenu
         reviewAutoMarkOnScroll={reviewAutoMarkOnScroll}
         onToggleAutoMark={handleToggleAutoMark}
       />
+      {onSelectPR && (
+        <ReviewPRSelector
+          prs={prs}
+          selectedPR={selectedPR}
+          loading={prDiffLoading}
+          onSelectPR={onSelectPR}
+          className="order-first w-full sm:order-none sm:w-auto"
+        />
+      )}
       <ReviewProgress reviewedCount={reviewedCount} totalCount={totalCount} />
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            size="sm"
-            variant="ghost"
-            className={`px-2 cursor-pointer ${wordWrap ? "bg-muted" : ""}`}
-            onClick={() => onToggleWordWrap(!wordWrap)}
-          >
-            <IconTextWrap className="h-4 w-4" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>Toggle word wrap</TooltipContent>
-      </Tooltip>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="px-2 cursor-pointer"
-            onClick={() => onToggleSplitView(!splitView)}
-          >
-            {splitView ? (
-              <IconLayoutRows className="h-4 w-4" />
-            ) : (
-              <IconLayoutColumns className="h-4 w-4" />
-            )}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>
-          {splitView ? "Switch to unified view" : "Switch to split view"}
-        </TooltipContent>
-      </Tooltip>
+      <ReviewDisplayControls
+        wordWrap={wordWrap}
+        splitView={splitView}
+        onToggleWordWrap={onToggleWordWrap}
+        onToggleSplitView={onToggleSplitView}
+      />
       {commentCount > 0 && (
         <FixCommentsButton
           commentCount={commentCount}
@@ -220,6 +267,8 @@ export const ReviewTopBar = memo(function ReviewTopBar({
           onFixComments={handleFixComments}
         />
       )}
+      <ReviewRunButton taskId={activeTaskId} sessionId={sessionId} activeRun={activeRun} />
+      {!reviewRunning && <ReviewFindingsButton findings={findings} onSelectFile={onSelectFile} />}
       <ReviewWalkthroughButton
         onRequestWalkthrough={onRequestWalkthrough}
         disabled={requestWalkthroughDisabled}

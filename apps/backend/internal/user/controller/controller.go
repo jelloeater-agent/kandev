@@ -50,6 +50,7 @@ func (c *Controller) UpdateUserSettings(ctx context.Context, req dto.UpdateUserS
 		RepositoryIDs:               req.RepositoryIDs,
 		TasksListSort:               req.TasksListSort,
 		TasksListGroup:              req.TasksListGroup,
+		TasksListShowDetails:        req.TasksListShowDetails,
 		InitialSetupComplete:        req.InitialSetupComplete,
 		PreferredShell:              req.PreferredShell,
 		DefaultEditorID:             req.DefaultEditorID,
@@ -58,6 +59,9 @@ func (c *Controller) UpdateUserSettings(ctx context.Context, req dto.UpdateUserS
 		ReviewAutoMarkOnScroll:      req.ReviewAutoMarkOnScroll,
 		ConfirmTaskArchive:          req.ConfirmTaskArchive,
 		MCPTaskAgentProfileDefault:  req.MCPTaskAgentProfileDefault,
+		ShowAnchoredPromptBar:       req.ShowAnchoredPromptBar,
+		ShowScrollToLastPrompt:      req.ShowScrollToLastPrompt,
+		ShowScrollToStart:           req.ShowScrollToStart,
 		ShowReleaseNotification:     req.ShowReleaseNotification,
 		ReleaseNotesLastSeenVersion: req.ReleaseNotesLastSeenVersion,
 		LspAutoStartLanguages:       req.LspAutoStartLanguages,
@@ -81,7 +85,8 @@ func (c *Controller) UpdateUserSettings(ctx context.Context, req dto.UpdateUserS
 		TerminalFontFamily:          req.TerminalFontFamily,
 		TerminalFontSize:            req.TerminalFontSize,
 		ChangesPanelLayout:          req.ChangesPanelLayout,
-		SystemMetricsDisplay:        req.SystemMetricsDisplay,
+		SystemMetricsDisplay:        systemMetricsDisplayPatch(req.SystemMetricsDisplay),
+		AppStatusBarOrder:           req.AppStatusBarOrder,
 		VoiceMode:                   req.VoiceMode,
 	})
 	if err != nil {
@@ -91,6 +96,16 @@ func (c *Controller) UpdateUserSettings(ctx context.Context, req dto.UpdateUserS
 		Settings:     dto.FromUserSettings(settings),
 		ShellOptions: shellOptionsForOS(),
 	}, nil
+}
+
+func systemMetricsDisplayPatch(patch *dto.SystemMetricsDisplaySettingsPatch) *service.SystemMetricsDisplaySettingsPatch {
+	if patch == nil {
+		return nil
+	}
+	return &service.SystemMetricsDisplaySettingsPatch{
+		ShowInTopbar: patch.ShowInTopbar,
+		Simplified:   patch.Simplified,
+	}
 }
 
 func shellOptionsForOS() []dto.ShellOption {

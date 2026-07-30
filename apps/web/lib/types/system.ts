@@ -259,6 +259,17 @@ export type StorageRunState =
   | "cancelled"
   | "skipped_busy";
 
+export interface StorageBusyResource {
+  kind: string;
+  label: string;
+}
+
+export interface StorageBusyResponse {
+  error: string;
+  busy_resources: StorageBusyResource[];
+  force_available: boolean;
+}
+
 export interface StorageMaintenanceRun {
   id: string;
   trigger: "scheduled" | "manual" | "analysis";
@@ -287,10 +298,30 @@ export interface StorageQuarantineEntry {
   metadata: Record<string, unknown>;
 }
 
+export type StorageQuarantinePurgeScope = "eligible" | "all";
+
+export interface StorageQuarantinePurgeFailure {
+  id: string;
+  error: string;
+}
+
+export interface StorageQuarantinePurgeResult {
+  scope: StorageQuarantinePurgeScope;
+  considered: number;
+  deleted: number;
+  deleted_bytes: number;
+  protected: number;
+  protected_bytes: number;
+  failed: number;
+  failed_bytes: number;
+  failures?: StorageQuarantinePurgeFailure[];
+}
+
 export interface StorageOverviewResponse {
   settings: StorageMaintenanceSettings;
   capabilities: StorageCapabilities;
   summary: StorageSummary;
+  analyzed_at: string;
   last_run: StorageMaintenanceRun | null;
 }
 
@@ -315,7 +346,7 @@ export interface RestartResponse {
   message: string;
 }
 
-export type LicenseEcosystem = "npm" | "go";
+export type LicenseEcosystem = "npm" | "go" | "source";
 
 export interface LicenseEntry {
   name: string;

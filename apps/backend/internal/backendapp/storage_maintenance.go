@@ -69,25 +69,26 @@ func provideStorageComposition(
 		docker: dockerProvider, dockerClient: dockerClient, dockerHost: cfg.Docker.Host,
 		homeDir: cfg.ResolvedHomeDir(),
 	}
-	providers := storageCleanupProviders(settings, workspaceFactory, goCache, dockerProvider)
+	cachedOverview := storagepkg.NewOverviewCache(overview)
+	quarantine := &workspaceQuarantineController{
+		settings: settings, store: store, factory: workspaceFactory, homeDir: cfg.ResolvedHomeDir(),
+		activity: coordinator,
+	}
+	providers := storageCleanupProviders(settings, workspaceFactory, goCache, dockerProvider, quarantine)
 	runner := storagepkg.NewRunner(storagepkg.RunnerConfig{
-		Activity: coordinator, Store: store, Providers: providers,
+		Activity: coordinator, Store: store, Providers: providers, Overview: cachedOverview,
 	})
 	scheduler := storagepkg.NewScheduler(settings, runner, storagepkg.SchedulerOptions{})
 	runtime := storagepkg.NewRuntime(storagepkg.RuntimeConfig{
 		Scheduler: scheduler, Settings: settings, Worker: taskSvc,
 		Reconciler: &workspaceReconciler{settings: settings, factory: workspaceFactory},
 	})
-	quarantine := &workspaceQuarantineController{
-		settings: settings, store: store, factory: workspaceFactory, homeDir: cfg.ResolvedHomeDir(),
-		activity: coordinator,
-	}
 	operations := storagepkg.NewOperations(storagepkg.OperationsConfig{
 		Settings: settings, Store: store, Jobs: tracker, Activity: coordinator,
-		Providers: providers, Overview: overview, GoCache: goCache, Quarantine: quarantine,
+		Providers: providers, Overview: cachedOverview, GoCache: goCache, Quarantine: quarantine,
 	})
 	handler := storagepkg.NewHandler(storagepkg.HandlerConfig{
-		Settings: settings, Runs: store, Quarantine: store, Overview: overview,
+		Settings: settings, Runs: store, Quarantine: store, Overview: cachedOverview,
 		Mutations: operations, OnSettingsChanged: runtime.ApplySettings,
 	})
 	return &storageComposition{
@@ -190,6 +191,21 @@ type namedCleanupProvider struct {
 	cleanup func(context.Context) (map[string]any, error)
 }
 
+type quarantinePurger interface {
+	Purge(context.Context, storagepkg.QuarantinePurgeScope, string) (storagepkg.QuarantinePurgeResult, error)
+}
+
+type quarantineCleanupProvider struct {
+	purger quarantinePurger
+}
+
+func (p quarantineCleanupProvider) Name() string { return "quarantine" }
+
+func (p quarantineCleanupProvider) Cleanup(ctx context.Context) (map[string]any, error) {
+	result, err := p.purger.Purge(ctx, storagepkg.QuarantinePurgeScopeEligible, storagepkg.QuarantineConfirmationEligible)
+	return toMap(result), err
+}
+
 type goCacheCleanupProvider struct {
 	provider *gocache.Provider
 }
@@ -214,8 +230,10 @@ func storageCleanupProviders(
 	workspaceFactory workspaceFactory,
 	goCache *gocache.Provider,
 	docker *dockerstore.Provider,
+	quarantine quarantinePurger,
 ) []storagepkg.CleanupProvider {
 	return []storagepkg.CleanupProvider{
+		quarantineCleanupProvider{purger: quarantine},
 		workspaceCleanupAdapter(settings, workspaceFactory),
 		goCacheCleanupProvider{provider: goCache},
 		dockerContainerCleanupAdapter(settings, docker),
@@ -311,9 +329,65 @@ type workspaceQuarantineController struct {
 
 type quarantineEntryStore interface {
 	GetQuarantineEntry(context.Context, string) (storagepkg.QuarantineEntry, error)
+	ListQuarantineEntries(context.Context, bool) ([]storagepkg.QuarantineEntry, error)
 	TransitionQuarantineEntry(
 		context.Context, string, storagepkg.QuarantineState, string,
 	) (storagepkg.QuarantineEntry, error)
+}
+
+func (c *workspaceQuarantineController) Purge(
+	ctx context.Context,
+	scope storagepkg.QuarantinePurgeScope,
+	confirmation string,
+) (storagepkg.QuarantinePurgeResult, error) {
+	result := storagepkg.QuarantinePurgeResult{Scope: scope}
+	force := false
+	switch scope {
+	case storagepkg.QuarantinePurgeScopeEligible:
+		if confirmation != storagepkg.QuarantineConfirmationEligible {
+			return result, fmt.Errorf("%w: eligible quarantine purge requires %s confirmation", storagepkg.ErrValidation, storagepkg.QuarantineConfirmationEligible)
+		}
+	case storagepkg.QuarantinePurgeScopeAll:
+		if confirmation != storagepkg.QuarantineConfirmationForce {
+			return result, storagepkg.ErrForceDeleteConfirmation
+		}
+		force = true
+	default:
+		return result, fmt.Errorf("%w: unknown quarantine purge scope %q", storagepkg.ErrValidation, scope)
+	}
+	entries, err := c.store.ListQuarantineEntries(ctx, false)
+	if err != nil {
+		return result, err
+	}
+	now := time.Now().UTC()
+	var purgeErrs []error
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		result.Considered++
+		if !force && now.Before(entry.DeleteAfter) {
+			result.Protected++
+			result.ProtectedBytes += entry.SizeBytes
+			continue
+		}
+		var deleted storagepkg.QuarantineEntry
+		if force {
+			deleted, err = c.PermanentDeleteForce(ctx, entry.ID, confirmation)
+		} else {
+			deleted, err = c.PermanentDelete(ctx, entry.ID, storagepkg.QuarantineConfirmationDelete)
+		}
+		if err != nil {
+			result.Failed++
+			result.FailedBytes += entry.SizeBytes
+			result.Failures = append(result.Failures, storagepkg.QuarantinePurgeFailure{ID: entry.ID, Error: err.Error()})
+			purgeErrs = append(purgeErrs, fmt.Errorf("%s: %w", entry.ID, err))
+			continue
+		}
+		result.Deleted++
+		result.DeletedBytes += deleted.SizeBytes
+	}
+	return result, errors.Join(purgeErrs...)
 }
 
 const (
@@ -362,11 +436,31 @@ func (c *workspaceQuarantineController) PermanentDelete(
 	id string,
 	confirmation string,
 ) (storagepkg.QuarantineEntry, error) {
+	return c.permanentDelete(ctx, id, confirmation, false)
+}
+
+func (c *workspaceQuarantineController) PermanentDeleteForce(
+	ctx context.Context,
+	id string,
+	confirmation string,
+) (storagepkg.QuarantineEntry, error) {
+	return c.permanentDelete(ctx, id, confirmation, true)
+}
+
+func (c *workspaceQuarantineController) permanentDelete(
+	ctx context.Context,
+	id string,
+	confirmation string,
+	force bool,
+) (storagepkg.QuarantineEntry, error) {
 	entry, err := c.store.GetQuarantineEntry(ctx, id)
 	if err != nil {
 		return storagepkg.QuarantineEntry{}, err
 	}
 	if entry.ResourceType == storagepkg.ResourceTypeGoCache {
+		if force {
+			return c.deleteGoCacheForce(ctx, entry, confirmation)
+		}
 		return c.deleteGoCache(ctx, entry, confirmation)
 	}
 	if entry.ResourceType != storagepkg.ResourceTypeTaskWorkspace {
@@ -375,6 +469,9 @@ func (c *workspaceQuarantineController) PermanentDelete(
 	settings, err := c.settings.GetSettings(ctx)
 	if err != nil {
 		return storagepkg.QuarantineEntry{}, err
+	}
+	if force {
+		return c.factory(settings).PermanentDeleteForce(ctx, id, confirmation)
 	}
 	return c.factory(settings).PermanentDelete(ctx, id, confirmation)
 }
@@ -468,7 +565,10 @@ func (c *workspaceQuarantineController) acquireGoCacheMaintenance(
 	}
 	lease, busy, err := c.activity.TryAcquireMaintenance(ctx, 0)
 	if errors.Is(err, activity.ErrBusy) {
-		return nil, &storagepkg.BusyError{Resources: busy}
+		return nil, &storagepkg.BusyError{
+			Resources:      activity.BusyResourcesForKinds(busy),
+			ForceAvailable: false,
+		}
 	}
 	return lease, err
 }
@@ -478,13 +578,34 @@ func (c *workspaceQuarantineController) deleteGoCache(
 	entry storagepkg.QuarantineEntry,
 	confirmation string,
 ) (storagepkg.QuarantineEntry, error) {
-	if confirmation != "DELETE" {
+	return c.deleteGoCacheWithRetention(ctx, entry, confirmation, false)
+}
+
+func (c *workspaceQuarantineController) deleteGoCacheForce(
+	ctx context.Context,
+	entry storagepkg.QuarantineEntry,
+	confirmation string,
+) (storagepkg.QuarantineEntry, error) {
+	return c.deleteGoCacheWithRetention(ctx, entry, confirmation, true)
+}
+
+func (c *workspaceQuarantineController) deleteGoCacheWithRetention(
+	ctx context.Context,
+	entry storagepkg.QuarantineEntry,
+	confirmation string,
+	force bool,
+) (storagepkg.QuarantineEntry, error) {
+	if force {
+		if confirmation != storagepkg.QuarantineConfirmationForce {
+			return storagepkg.QuarantineEntry{}, storagepkg.ErrForceDeleteConfirmation
+		}
+	} else if confirmation != storagepkg.QuarantineConfirmationDelete {
 		return storagepkg.QuarantineEntry{}, fmt.Errorf("%w: quarantine deletion requires DELETE confirmation", storagepkg.ErrValidation)
 	}
 	if err := c.validateGoCacheEntry(ctx, entry); err != nil {
 		return storagepkg.QuarantineEntry{}, err
 	}
-	if time.Now().UTC().Before(entry.DeleteAfter) {
+	if !force && time.Now().UTC().Before(entry.DeleteAfter) {
 		return storagepkg.QuarantineEntry{}, fmt.Errorf("%w: quarantine retention deadline has not elapsed", storagepkg.ErrConflict)
 	}
 	if err := c.rejectAmbiguousMissingGoCachePayload(entry); err != nil {
@@ -494,7 +615,7 @@ func (c *workspaceQuarantineController) deleteGoCache(
 		return storagepkg.QuarantineEntry{}, fmt.Errorf("delete quarantined Go cache: %w", err)
 	}
 	deleted, err := c.store.TransitionQuarantineEntry(
-		ctx, entry.ID, storagepkg.QuarantineStateDeleted, "",
+		context.WithoutCancel(ctx), entry.ID, storagepkg.QuarantineStateDeleted, "",
 	)
 	if err != nil {
 		return storagepkg.QuarantineEntry{}, fmt.Errorf("persist Go-cache deletion: %w", err)

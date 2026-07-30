@@ -83,6 +83,9 @@ func (m *mockRepository) ArchiveTask(ctx context.Context, id string) error {
 func (m *mockRepository) ListTasksForAutoArchive(ctx context.Context) ([]*models.Task, error) {
 	return nil, nil
 }
+func (m *mockRepository) ListArchivedTasksWithActiveSessions(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
 func (m *mockRepository) ListExpiredQuickChatTasks(ctx context.Context, cutoff time.Time) ([]*models.Task, error) {
 	return nil, nil
 }
@@ -285,6 +288,28 @@ func (m *mockRepository) UpdateTaskSession(ctx context.Context, session *models.
 func (m *mockRepository) UpdateTaskSessionState(ctx context.Context, id string, state models.TaskSessionState, errorMessage string) error {
 	return nil
 }
+func (m *mockRepository) ClaimPromptableTaskSessionIfActive(_ context.Context, id string) (models.PromptableTaskSessionClaim, error) {
+	return claimPromptableTaskSession(m.sessions, id)
+}
+
+func claimPromptableTaskSession(sessions map[string]*models.TaskSession, id string) (models.PromptableTaskSessionClaim, error) {
+	session, ok := sessions[id]
+	if !ok {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionInactive}, nil
+	}
+	if !isPromptableTaskSessionState(session.State) {
+		return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionBusy}, nil
+	}
+	previousState := session.State
+	session.State = models.TaskSessionStateRunning
+	return models.PromptableTaskSessionClaim{Status: models.PromptableTaskSessionClaimed, PreviousState: previousState}, nil
+}
+
+func isPromptableTaskSessionState(state models.TaskSessionState) bool {
+	return state == models.TaskSessionStateWaitingForInput ||
+		state == models.TaskSessionStateIdle ||
+		state == models.TaskSessionStateCompleted
+}
 func (m *mockRepository) ResetTaskSessionBasesForRepository(ctx context.Context, taskID, repositoryID, baseBranch string) (int64, error) {
 	return 0, nil
 }
@@ -297,8 +322,8 @@ func (m *mockRepository) ListActiveTaskSessions(ctx context.Context) ([]*models.
 func (m *mockRepository) ListActiveTaskSessionsByTaskID(ctx context.Context, taskID string) ([]*models.TaskSession, error) {
 	return nil, nil
 }
-func (m *mockRepository) CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) (int64, error) {
-	return 0, nil
+func (m *mockRepository) CancelActiveTaskSessionsByTaskID(ctx context.Context, taskID, reason string) ([]*models.TaskSession, error) {
+	return nil, nil
 }
 func (m *mockRepository) HasActiveTaskSessionsByAgentProfile(ctx context.Context, agentProfileID string) (bool, error) {
 	return false, nil
@@ -376,6 +401,9 @@ func (m *mockRepository) ListScriptsByRepositoryIDs(_ context.Context, _ []strin
 	return make(map[string][]*models.RepositoryScript), nil
 }
 func (m *mockRepository) GetRepositoryByProviderInfo(_ context.Context, _, _, _, _, _ string) (*models.Repository, error) {
+	return nil, nil
+}
+func (m *mockRepository) GetRepositoryByLocalPath(_ context.Context, _, _ string) (*models.Repository, error) {
 	return nil, nil
 }
 func (m *mockRepository) CreateExecutor(ctx context.Context, executor *models.Executor) error {
@@ -519,7 +547,17 @@ func (m *mockRepository) GetPrimarySessionInfoByTaskIDs(ctx context.Context, tas
 	return make(map[string]*models.TaskSession), nil
 }
 func (m *mockRepository) BatchGetSessionsByTaskIDs(ctx context.Context, taskIDs []string) (map[string][]*models.TaskSession, error) {
-	return make(map[string][]*models.TaskSession), nil
+	result := make(map[string][]*models.TaskSession)
+	wanted := make(map[string]struct{}, len(taskIDs))
+	for _, taskID := range taskIDs {
+		wanted[taskID] = struct{}{}
+	}
+	for _, session := range m.sessions {
+		if _, ok := wanted[session.TaskID]; ok {
+			result[session.TaskID] = append(result[session.TaskID], session)
+		}
+	}
+	return result, nil
 }
 func (m *mockRepository) SetSessionPrimary(ctx context.Context, sessionID string) error {
 	return nil

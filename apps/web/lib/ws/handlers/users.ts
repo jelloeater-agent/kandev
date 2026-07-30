@@ -4,6 +4,7 @@ import type { UserSettingsUpdatedPayload } from "@/lib/types/backend";
 import type { WsHandlers } from "@/lib/ws/handlers/types";
 import {
   parseChangesPanelLayout,
+  parseAppStatusBarOrder,
   parseSystemMetricsDisplay,
   taskCreateLastUsedHasValue,
   parseVoiceMode,
@@ -28,13 +29,17 @@ export function registerUsersHandlers(store: StoreApi<AppState>): WsHandlers {
 function buildUserSettingsState(state: AppState, payload: UserSettingsUpdatedPayload) {
   return {
     ...state.userSettings,
-    ...buildBehaviorSettings(payload),
+    ...buildBehaviorSettings(state, payload),
     ...buildSidebarSettings(state, payload),
     ...buildLspSettings(payload),
     ...buildSyncedLocalSettings(state, payload),
     defaultUtilityAgentId: payload.default_utility_agent_id || null,
     keyboardShortcuts: payload.keyboard_shortcuts ?? {},
     changesPanelLayout: parseChangesPanelLayout(payload.changes_panel_layout),
+    appStatusBarOrder:
+      payload.app_status_bar_order === undefined
+        ? state.userSettings.appStatusBarOrder
+        : parseAppStatusBarOrder(payload.app_status_bar_order),
     systemMetricsDisplay: parseSystemMetricsDisplay(payload.system_metrics_display),
     voiceMode: parseVoiceMode(payload.voice_mode),
     loaded: true,
@@ -69,7 +74,7 @@ function buildSyncedLocalSettings(state: AppState, payload: UserSettingsUpdatedP
   };
 }
 
-function buildBehaviorSettings(payload: UserSettingsUpdatedPayload) {
+function buildBehaviorSettings(state: AppState, payload: UserSettingsUpdatedPayload) {
   return {
     preferredShell: payload.preferred_shell || null,
     defaultEditorId: payload.default_editor_id || null,
@@ -80,12 +85,19 @@ function buildBehaviorSettings(payload: UserSettingsUpdatedPayload) {
     mcpTaskAgentProfileDefault: parseMCPTaskAgentProfileDefault(
       payload.mcp_task_agent_profile_default,
     ),
+    showAnchoredPromptBar: payload.show_anchored_prompt_bar ?? true,
+    showScrollToLastPrompt: payload.show_scroll_to_last_prompt ?? true,
+    showScrollToStart: payload.show_scroll_to_start ?? true,
     showReleaseNotification: payload.show_release_notification ?? true,
     releaseNotesLastSeenVersion: (payload.release_notes_last_seen_version as string) || null,
     terminalLinkBehavior:
       payload.terminal_link_behavior === "browser_panel"
         ? ("browser_panel" as const)
         : ("new_tab" as const),
+    tasksListShowDetails:
+      payload.tasks_list_show_details === undefined
+        ? state.userSettings.tasksListShowDetails
+        : payload.tasks_list_show_details,
   };
 }
 

@@ -8,13 +8,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/kandev/kandev/internal/agent/executor"
 	"github.com/kandev/kandev/internal/agent/runtime/activity"
@@ -51,7 +55,7 @@ func TestErrSessionWorkspaceNotReady_UnrelatedError(t *testing.T) {
 }
 
 func TestGetOrEnsureExecutionLeaderCancellationDoesNotAbortLiveWaiter(t *testing.T) {
-	mgr, _ := newEnvironmentExecutionTestManager(t, &mockWorkspaceInfoProvider{
+	mgr, backend := newEnvironmentExecutionTestManager(t, &mockWorkspaceInfoProvider{
 		infos: map[string]*WorkspaceInfo{
 			"session-shared": {
 				TaskID: "task-1", SessionID: "session-shared", TaskEnvironmentID: "env-1",
@@ -59,41 +63,64 @@ func TestGetOrEnsureExecutionLeaderCancellationDoesNotAbortLiveWaiter(t *testing
 			},
 		},
 	})
-	coordinator := activity.NewCoordinator(activity.Options{})
-	mgr.SetActivityCoordinator(coordinator)
-	maintenance, _, err := coordinator.TryAcquireMaintenance(context.Background(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	backend.entered = make(chan struct{}, 1)
+	backend.barrier = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(backend.barrier)
+		}
+	}()
+
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
-	type result struct {
-		caller string
-		err    error
-	}
-	results := make(chan result, 2)
+	leaderResult := make(chan error, 1)
 	go func() {
 		_, err := mgr.GetOrEnsureExecution(leaderCtx, "session-shared")
-		results <- result{caller: "leader", err: err}
+		leaderResult <- err
 	}()
 	select {
-	case <-maintenance.Context().Done():
+	case <-backend.entered:
 	case <-time.After(time.Second):
-		t.Fatal("leader did not reach activity admission")
+		t.Fatal("leader did not reach CreateInstance")
 	}
+
+	followerCtx := &doneObservedContext{
+		Context:  context.Background(),
+		doneRead: make(chan struct{}),
+	}
+	followerResult := make(chan error, 1)
 	go func() {
-		_, err := mgr.GetOrEnsureExecution(context.Background(), "session-shared")
-		results <- result{caller: "follower", err: err}
+		_, err := mgr.GetOrEnsureExecution(followerCtx, "session-shared")
+		followerResult <- err
 	}()
+	select {
+	case <-followerCtx.doneRead:
+	case <-time.After(time.Second):
+		t.Fatal("follower did not join the coalesced execution")
+	}
+
 	cancelLeader()
-	maintenance.Release()
-	for range 2 {
-		got := <-results
-		if got.caller == "leader" && !errors.Is(got.err, context.Canceled) {
-			t.Fatalf("leader error = %v, want context cancellation", got.err)
-		}
-		if got.caller == "follower" && got.err != nil {
-			t.Fatalf("live follower failed after leader cancellation: %v", got.err)
+	if err := <-leaderResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want context cancellation", err)
+	}
+	close(backend.barrier)
+	released = true
+	if err := <-followerResult; err != nil {
+		t.Fatalf("live follower failed after leader cancellation: %v", err)
+	}
+}
+
+func TestAwaitCoalescedResultPrefersCanceledContext(t *testing.T) {
+	for range 100 {
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan singleflight.Result, 1)
+		result <- singleflight.Result{Val: "created"}
+		cancel()
+
+		_, err := awaitCoalescedResult(ctx, result)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("await error = %v, want context cancellation", err)
 		}
 	}
 }
@@ -836,7 +863,114 @@ func TestCreateExecutionResolvesProfileOnceForEnvAndAutoApprove(t *testing.T) {
 	}
 }
 
+func TestCreateExecutionRunsRemoteResumePreflightBeforeCreatingWorkspaceExecution(t *testing.T) {
+	log := newTestLogger()
+	backend := &resumeTrackingExecutor{
+		MockExecutor: MockExecutor{name: executor.NameStandalone},
+		client:       newReadyAgentctlClient(t, log),
+	}
+	execRegistry := NewExecutorRegistry(log)
+	execRegistry.Register(backend)
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry, &MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	cleanupManagerStopCh(t, mgr)
+
+	metadata := map[string]interface{}{"ssh_host": "recovery.example", "ssh_port": 2222}
+	_, err := mgr.createExecution(context.Background(), "task-1", &WorkspaceInfo{
+		SessionID:        "session-1",
+		AgentID:          "auggie",
+		WorkspacePath:    "/workspace/task-1",
+		Metadata:         metadata,
+		AgentExecutionID: "previous-execution",
+	})
+	if err != nil {
+		t.Fatalf("createExecution returned error: %v", err)
+	}
+	if got, want := backend.calls, []string{"resume", "create"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("backend calls = %v, want %v", got, want)
+	}
+	if backend.createRequest == nil {
+		t.Fatal("CreateInstance was not called")
+	}
+	if got := backend.createRequest.PreviousExecutionID; got != "previous-execution" {
+		t.Fatalf("PreviousExecutionID = %q, want %q", got, "previous-execution")
+	}
+	if got := backend.createRequest.Metadata; !reflect.DeepEqual(got, metadata) {
+		t.Fatalf("Metadata = %#v, want %#v", got, metadata)
+	}
+}
+
+func TestCreateExecutionReturnsRemoteResumePreflightError(t *testing.T) {
+	log := newTestLogger()
+	backend := &resumeTrackingExecutor{
+		MockExecutor: MockExecutor{name: executor.NameStandalone},
+		client:       newReadyAgentctlClient(t, log),
+		resumeErr:    errors.New("remote unavailable"),
+	}
+	execRegistry := NewExecutorRegistry(log)
+	execRegistry.Register(backend)
+	mgr := NewManager(
+		newTestRegistry(), &MockEventBus{}, execRegistry, &MockCredentialsManager{}, &MockProfileResolver{}, nil,
+		ExecutorFallbackWarn, "", log,
+	)
+	cleanupManagerStopCh(t, mgr)
+
+	_, err := mgr.createExecution(context.Background(), "task-1", &WorkspaceInfo{
+		SessionID:     "session-1",
+		AgentID:       "auggie",
+		WorkspacePath: "/workspace/task-1",
+	})
+	if !errors.Is(err, backend.resumeErr) {
+		t.Fatalf("createExecution error = %v, want remote resume error", err)
+	}
+	if !strings.Contains(err.Error(), "failed remote resume preflight") {
+		t.Fatalf("createExecution error = %q, want remote resume preflight context", err)
+	}
+	if got, want := backend.calls, []string{"resume"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("backend calls = %v, want %v", got, want)
+	}
+}
+
 // --- test helpers ---
+
+type resumeTrackingExecutor struct {
+	MockExecutor
+	client        *agentctl.Client
+	resumeErr     error
+	calls         []string
+	createRequest *ExecutorCreateRequest
+}
+
+func (e *resumeTrackingExecutor) ResumeRemoteInstance(_ context.Context, _ *ExecutorCreateRequest) error {
+	e.calls = append(e.calls, "resume")
+	return e.resumeErr
+}
+
+func (e *resumeTrackingExecutor) CreateInstance(_ context.Context, req *ExecutorCreateRequest) (*ExecutorInstance, error) {
+	e.calls = append(e.calls, "create")
+	e.createRequest = req
+	return &ExecutorInstance{
+		InstanceID:    req.InstanceID,
+		TaskID:        req.TaskID,
+		SessionID:     req.SessionID,
+		RuntimeName:   e.Name(),
+		Client:        e.client,
+		WorkspacePath: req.WorkspacePath,
+	}, nil
+}
+
+type doneObservedContext struct {
+	context.Context
+	doneRead chan struct{}
+	once     sync.Once
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.doneRead) })
+	return c.Context.Done()
+}
 
 type notifyingWorkspaceInfoProvider struct {
 	*mockWorkspaceInfoProvider
@@ -856,6 +990,7 @@ type createInstanceExecutor struct {
 	client       *agentctl.Client
 	createCount  atomic.Int32
 	stopCount    atomic.Int32
+	forceStopped atomic.Bool
 	lastRequest  *ExecutorCreateRequest
 	authToken    string
 	nonce        string
@@ -914,6 +1049,7 @@ func (e *createInstanceExecutor) CreateInstance(ctx context.Context, req *Execut
 
 func (e *createInstanceExecutor) StopInstance(ctx context.Context, instance *ExecutorInstance, force bool) error {
 	e.stopCount.Add(1)
+	e.forceStopped.Store(force)
 	return nil
 }
 

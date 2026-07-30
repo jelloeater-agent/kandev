@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"testing"
 
+	"github.com/kandev/kandev/internal/agent/agents"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,4 +67,28 @@ func TestFilterPersistentMetadata(t *testing.T) {
 		require.Equal(t, true, got[MetadataKeyIsRemote])
 		require.NotContains(t, got, "task_description")
 	})
+}
+
+func TestToAgentExecutionRecordsHistoryForWorkspaceRebindFallback(t *testing.T) {
+	instance := &ExecutorInstance{InstanceID: "execution"}
+	execution := instance.ToAgentExecution(&ExecutorCreateRequest{
+		AgentConfig: agents.NewOpenCodeACP(),
+	})
+
+	require.True(t, execution.historyEnabled)
+}
+
+func TestToAgentExecutionCapturesDefensiveRuntimeEnvironment(t *testing.T) {
+	reqEnv := map[string]string{
+		"KANDEV_GITHUB_CREDENTIAL_BROKER_URL": "http://127.0.0.1:9876",
+		"PATH":                                "/tmp/kandev-shim:/usr/bin",
+	}
+	execution := (&ExecutorInstance{InstanceID: "execution"}).ToAgentExecution(&ExecutorCreateRequest{Env: reqEnv})
+
+	reqEnv["PATH"] = "/usr/bin"
+	got := execution.RuntimeEnvironment()
+	require.Equal(t, "/tmp/kandev-shim:/usr/bin", got["PATH"])
+
+	got["PATH"] = "/mutated"
+	require.Equal(t, "/tmp/kandev-shim:/usr/bin", execution.RuntimeEnvironment()["PATH"])
 }

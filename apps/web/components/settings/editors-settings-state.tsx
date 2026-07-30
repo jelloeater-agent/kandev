@@ -10,6 +10,7 @@ import type { EditorOption } from "@/lib/types/http";
 import { type ComboboxOption } from "@/components/combobox";
 import {
   parseChangesPanelLayout,
+  parseAppStatusBarOrder,
   parseSystemMetricsDisplay,
   parseTerminalLinkBehavior,
   taskCreateLastUsedHasValue,
@@ -235,6 +236,7 @@ function mapTasksListSettingsFields(
   return {
     tasksListSort: parseTasksListSort(s.tasks_list_sort),
     tasksListGroup: parseTasksListGroup(s.tasks_list_group),
+    tasksListShowDetails: s.tasks_list_show_details ?? false,
   };
 }
 
@@ -246,6 +248,9 @@ function mapEditorBehaviorFields(
     reviewAutoMarkOnScroll: s.review_auto_mark_on_scroll ?? true,
     confirmTaskArchive: s.confirm_task_archive ?? true,
     mcpTaskAgentProfileDefault: parseMCPTaskAgentProfileDefault(s.mcp_task_agent_profile_default),
+    showAnchoredPromptBar: s.show_anchored_prompt_bar ?? true,
+    showScrollToLastPrompt: s.show_scroll_to_last_prompt ?? true,
+    showScrollToStart: s.show_scroll_to_start ?? true,
     showReleaseNotification: s.show_release_notification ?? true,
     releaseNotesLastSeenVersion: (s.release_notes_last_seen_version as string) || null,
     savedLayouts: s.saved_layouts ?? [],
@@ -315,6 +320,7 @@ function buildUserSettingsFromResponse(
     terminalFontSize: s.terminal_font_size || null,
     changesPanelLayout: parseChangesPanelLayout(s.changes_panel_layout),
     systemMetricsDisplay: parseSystemMetricsDisplay(s.system_metrics_display),
+    appStatusBarOrder: parseAppStatusBarOrder(s.app_status_bar_order),
     voiceMode: parseVoiceMode(s.voice_mode),
     ...mapEditorSettingsFields(s),
   };

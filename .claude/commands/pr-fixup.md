@@ -1,21 +1,17 @@
 ---
 description: Run the Kandev PR fixup loop for CI failures and automated review threads.
 argument-hint: "<PR number>"
-allowed-tools: Read Grep Glob Agent
+allowed-tools: Bash Read Edit Write Grep Glob Agent
 model: opus
 effort: high
 ---
 
-Rely on the root `AGENTS.md`/`CLAUDE.md` planner/worker contract and coordinate
-`.agents/skills/pr-fixup/SKILL.md` as the primary planner.
+Use `.agents/skills/pr-fixup/SKILL.md`; the root `AGENTS.md`/`CLAUDE.md`
+single-session model workflow applies. Handle remediation directly in the same
+conversation; rerun only the affected task-defined check after a fix. When the
+user explicitly asks to wait or monitor PR status, an authorized read-only
+`pr-poller` may collect updates without remediation.
 
-Delegate PR state collection to `pr-poller`, remediation to `implementer`, full
-checks to `verify`, and commit/push to a bounded delivery assignment. Review
-each compact result and launch another bounded assignment when needed. Do not
-run GitHub, edit, test, commit, or push commands in this primary session. If a
-required worker cannot be launched, stop and report the blocked phase.
-
-If `pr-poller` reports that GitHub access requires approval, surface that gate
-to the user and stop. Do not relaunch polling after approval is denied,
-cancelled, or interrupted; follow `.agents/skills/pr-fixup/SKILL.md` for the
-full distinction between approval gates and transient fetch failures.
+If GitHub access requires approval, surface that gate
+and stop. Do not relaunch after denial, cancellation, or interruption; the
+shared skill distinguishes approval gates from transient fetch failures.

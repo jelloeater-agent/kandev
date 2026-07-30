@@ -59,6 +59,21 @@ interface PluginHostApi {
   // path as the app router, so plugin pages can link into native routes
   // (e.g. /t/{taskId}) without a full reload.
   navigate(href: string, options?: { replace?: boolean }): void;
+  // Imperatively opens a modal window rendered by the host's <PluginModalHost/>
+  // (mounted once at the app root, isolated behind its own error boundary).
+  // Independent of keybindings — any plugin code path may call it.
+  openModal(options: PluginModalOptions): PluginModalHandle;
+}
+
+interface PluginModalOptions {
+  title?: string;                          // rendered in a DialogHeader/DialogTitle; omit for no header title
+  content: React.ComponentType<{ slotProps?: unknown }>; // reuses the slot-component contract
+  size?: "sm" | "md" | "lg" | "xl";         // maps to the host's Dialog width classes; default "md"
+  dismissible?: boolean;                    // overlay click / Escape close the modal; default true
+}
+
+interface PluginModalHandle {
+  close(): void; // closes this modal instance; no-op if already closed
 }
 ```
 
@@ -122,14 +137,15 @@ interface PluginRegistry {
   registerSettingsRoute(path: string, Component: React.ComponentType): void;
 
   // Named slot injection. Host renders all components registered for a slot via
-  // <PluginSlot name="..." props={...}/>. Initial slots: "task-sidebar",
+  // <PluginSlot name="..." slotProps={...}/>. Initial slots: "task-sidebar",
   // "settings-nav", "main-nav-footer", "chat-input-actions", "chat-top-bar",
-  // "main-top-bar", "plugin-settings".
+  // "main-top-bar", "app-status-bar-left", "app-status-bar-right", and
+  // "plugin-settings".
   // "chat-input-actions" renders icon buttons in the chat composer toolbar
   // (beside the model picker, mic, and send) and forwards
   // `{ taskId, taskTitle, activeSessionId, sessionIds }` as `slotProps`.
-  // "chat-top-bar" renders status in the session top bar (beside the CPU/DB
-  // metrics and the document/editor/debug controls) and forwards
+  // "chat-top-bar" renders status in the session top bar (beside the
+  // document/editor/debug controls) and forwards
   // `{ taskId, taskTitle, workspaceId, activeSessionId, sessionIds }`. Both
   // carry the active session plus every kandev session id on the task.
   // "main-top-bar" renders status/actions in the default app top bar on the
@@ -152,8 +168,67 @@ interface PluginRegistry {
   // WS action handler. Bridged into the existing lib/ws dispatch; called with the
   // decoded message payload for that action string.
   registerWsHandler(action: string, handler: (payload: unknown) => void): void;
+
+  // Binds a handler to a keybinding declared in this plugin's manifest
+  // (ui.keybindings[].id — { id, default, description }, see manifest schema).
+  // The host resolves the effective combo (user override if the user
+  // rebound it, else the manifest default) and dispatches globally, skipping
+  // editable targets the same way core app shortcuts do. Combos are
+  // user-overridable in Settings > Keyboard Shortcuts, namespaced
+  // `plugin:{pluginId}:{id}`. Binding an id the manifest didn't declare still
+  // stores the handler (a console warning is logged) since the dispatcher's
+  // effective-shortcut resolution keys off the manifest list.
+  //
+  // Combo grammar (manifest `default` and any user override): `+`-separated
+  // tokens, one of the modifiers `mod|ctrl|cmd|meta|alt|option|shift`
+  // (repeatable) plus exactly one key token. `mod` resolves to Cmd on macOS
+  // and Ctrl elsewhere (⌘/Ctrl). `shift` may not be combined with a digit or
+  // symbol key (e.g. `shift+1`, `shift+slash`) — Shift changes the character
+  // a browser reports for those keys, so the combo could never dispatch; both
+  // the manifest validator and the frontend parser reject it.
+  registerKeybinding(id: string, handler: (event: KeyboardEvent) => void): void;
 }
 ```
+
+### App-status-bar slots
+
+`app-status-bar-left` and `app-status-bar-right` are live named component slots.
+Each registration is one opaque status item; the slot chooses its default side,
+not a permanent side after user customization. Components receive
+`slotProps` with this exact shape:
+
+```ts
+interface AppStatusBarSlotProps {
+  placement: "left" | "right";
+  presentation: "bar" | "mobile-drawer";
+  density: "full" | "compact";
+  pathname: string;
+  activeWorkspaceId: string | null;
+  activeTaskId: string | null;
+  activeSessionId: string | null;
+}
+```
+
+`placement` matches registration slot. `presentation` identifies the mounted host;
+the host mounts only one presentation at once. `density` is `full` on desktop and
+phone drawer, `compact` on tablet. `pathname` and active IDs are current-context
+hints, not entity payloads; read complete records from `host.store`.
+
+Before customization, registration order is render order within each default side.
+Users can Cmd-drag on macOS or Ctrl-drag elsewhere with a mouse to move any item
+across the whole desktop/tablet bar. Kandev stores that order in backend user
+settings; disabled contributions keep their place and return there when enabled.
+Phone renders the saved left sequence followed by the saved right sequence, without
+dragging. There is no cross-plugin priority API, keyboard-arrow ordering, or touch
+ordering. Enable, disable, and uninstall update slots without reload. Each component
+is isolated by an owner-aware error boundary, so plugins must tolerate remounting and
+render a compact bar control or touch-usable drawer row for the supplied presentation.
+The host neither inspects nor separately reorders children inside a registration, and
+does not add a nested interactive wrapper.
+
+A full-bleed plugin route (`topbar: false`) opts out of host chrome. It may mount
+the host-provided Status drawer trigger when its own chrome should expose status;
+otherwise status access is intentionally its responsibility.
 
 ## Registry internals (host side)
 

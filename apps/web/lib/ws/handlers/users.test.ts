@@ -25,6 +25,56 @@ function userSettingsMessage(
 }
 
 describe("user settings websocket handler", () => {
+  it("updates the List detail preference and preserves it when omitted", () => {
+    const store = makeStore();
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({ tasks_list_show_details: true }),
+    );
+    expect(store.getState().userSettings.tasksListShowDetails).toBe(true);
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(userSettingsMessage({}));
+    expect(store.getState().userSettings.tasksListShowDetails).toBe(true);
+  });
+
+  it("normalizes the simplified metrics preference from live updates", () => {
+    const store = makeStore();
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({
+        system_metrics_display: { show_in_topbar: true, simplified: true } as never,
+      }),
+    );
+
+    expect(store.getState().userSettings.systemMetricsDisplay).toEqual({
+      showInTopbar: true,
+      simplified: true,
+    });
+  });
+
+  it("replaces portable status order when present and preserves it when omitted", () => {
+    const store = makeStore();
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({
+        app_status_bar_order: {
+          left_item_ids: ["builtin:metrics"],
+          right_item_ids: ["builtin:connection"],
+        },
+      }),
+    );
+    expect(store.getState().userSettings.appStatusBarOrder).toEqual({
+      leftItemIds: ["builtin:metrics"],
+      rightItemIds: ["builtin:connection"],
+    });
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(userSettingsMessage({}));
+    expect(store.getState().userSettings.appStatusBarOrder).toEqual({
+      leftItemIds: ["builtin:metrics"],
+      rightItemIds: ["builtin:connection"],
+    });
+  });
+
   it("applies valid MCP task profile preferences and normalizes unknown values", () => {
     const store = makeStore();
 
@@ -55,6 +105,32 @@ describe("user settings websocket handler", () => {
     expect(store.getState().userSettings.confirmTaskArchive).toBe(true);
   });
 
+  it("syncs transcript navigation preferences and defaults missing values to enabled", () => {
+    const store = makeStore();
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({
+        show_anchored_prompt_bar: false,
+        show_scroll_to_last_prompt: false,
+        show_scroll_to_start: false,
+      }),
+    );
+    expect(store.getState().userSettings).toMatchObject({
+      showAnchoredPromptBar: false,
+      showScrollToLastPrompt: false,
+      showScrollToStart: false,
+    });
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(userSettingsMessage({}));
+    expect(store.getState().userSettings).toMatchObject({
+      showAnchoredPromptBar: true,
+      showScrollToLastPrompt: true,
+      showScrollToStart: true,
+    });
+  });
+});
+
+describe("user settings websocket sidebar sync", () => {
   it("preserves local collapsed groups when syncing sidebar views", () => {
     const store = makeStore();
     store.setState((state) => ({

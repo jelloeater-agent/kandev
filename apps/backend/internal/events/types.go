@@ -3,11 +3,13 @@ package events
 
 // Event types for tasks
 const (
-	TaskCreated      = "task.created"
-	TaskUpdated      = "task.updated"
-	TaskStateChanged = "task.state_changed"
-	TaskDeleted      = "task.deleted"
-	TaskMoved        = "task.moved" // Manual step change via MoveTask
+	TaskCreated                    = "task.created"
+	TaskUpdated                    = "task.updated"
+	TaskStateChanged               = "task.state_changed"
+	TaskDeleted                    = "task.deleted"
+	TaskMoved                      = "task.moved" // Manual step change via MoveTask
+	TaskQueuePromoted              = "task.queue_promoted"
+	SessionWorkspaceSourcesUpdated = "session.workspace_sources.updated"
 )
 
 // Event types for office task tree controls.
@@ -58,6 +60,14 @@ const (
 // Event types for task sessions
 const (
 	TaskSessionStateChanged = "task_session.state_changed"
+	// TaskSessionActivityChanged fires when a session's fine-grained activity
+	// flips — a RUNNING foreground turn moving between actively generating and
+	// idle-on-background-work, or detached background work starting/finishing
+	// under a settled coarse state — without any change to the coarse session
+	// state. It carries the fine-grained busy signal (ADR-0049) so the
+	// operator-facing composer and status indicator can distinguish
+	// "generating" from "waiting on spawned background work".
+	TaskSessionActivityChanged = "task_session.activity_changed"
 )
 
 // Event types for task plans
@@ -74,6 +84,14 @@ const (
 	TaskWalkthroughCreated = "task_walkthrough.created"
 	TaskWalkthroughUpdated = "task_walkthrough.updated"
 	TaskWalkthroughDeleted = "task_walkthrough.deleted"
+)
+
+// Event types for native code review (agent-authored anchored findings)
+const (
+	TaskReviewRunUpdated        = "task_review.run_updated"
+	TaskReviewFindingsPublished = "task_review.findings_published"
+	TaskReviewFindingUpdated    = "task_review.finding_updated"
+	TaskReviewCleared           = "task_review.cleared"
 )
 
 // Event types for session turns
@@ -150,6 +168,7 @@ const (
 	AgentReady             = "agent.ready"      // Agent finished a prompt turn, ready for follow-up
 	AgentCompleted         = "agent.completed"
 	AgentFailed            = "agent.failed"
+	AgentStalled           = "agent.stalled"
 	AgentStopped           = "agent.stopped"
 	AgentContextReset      = "agent.context_reset" // Agent subprocess restarted with fresh ACP session
 	AgentACPSessionCreated = "agent.acp_session_created"
@@ -243,6 +262,8 @@ const (
 	GitHubTaskCIOptionsUpdated = "github.task_ci_options.updated" // Task CI automation options updated
 	GitHubWatchEvent           = "github.watch.event"             // Watch created/deleted
 	GitHubRateLimitUpdated     = "github.rate_limit.updated"      // GitHub API rate-limit snapshot changed
+	GitHubPushReceived         = "github.push_received"           // Push webhook verified + installation resolved to workspaces
+	GitHubCheckRunCompleted    = "github.check_run_completed"     // Completed check_run webhook resolved to workspaces
 )
 
 // Event types for GitLab integration

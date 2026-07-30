@@ -70,6 +70,7 @@ func (p *Poller) waitForRateLimit(ctx context.Context, resource Resource, loop s
 // RepositoryID scopes multi-repo tasks: each repo is a separate watch row.
 // Empty for legacy single-repo tasks.
 type TaskBranchInfo struct {
+	WorkspaceID  string
 	TaskID       string
 	SessionID    string
 	RepositoryID string
@@ -193,10 +194,23 @@ func (p *Poller) checkPRWatches(ctx context.Context) {
 // publishing PRFeedback events for status changes and merge/close events
 // (the on-demand sync path intentionally doesn't publish these).
 func (p *Poller) tryBatchedPRWatchCheck(ctx context.Context, watches []*PRWatch) bool {
-	results, err := p.service.SyncWatchesBatched(ctx, watches)
-	if err != nil {
-		p.logger.Debug("batched PR watch check failed", zap.Error(err))
-		return false
+	byWorkspace := make(map[string][]*PRWatch)
+	for _, watch := range watches {
+		if watch == nil || watch.WorkspaceID == "" {
+			p.logger.Warn("PR watch is missing workspace ownership", zap.String("watch_id", watchID(watch)))
+			return false
+		}
+		byWorkspace[watch.WorkspaceID] = append(byWorkspace[watch.WorkspaceID], watch)
+	}
+	results := make([]PRWatchSyncResult, 0, len(watches))
+	for workspaceID, workspaceWatches := range byWorkspace {
+		workspaceResults, err := p.service.SyncWorkspaceWatchesBatched(ctx, workspaceID, workspaceWatches)
+		if err != nil {
+			p.logger.Debug("batched PR watch check failed",
+				zap.String("workspace_id", workspaceID), zap.Error(err))
+			return false
+		}
+		results = append(results, workspaceResults...)
 	}
 	for _, r := range results {
 		if !r.Found || r.Status == nil {
@@ -228,6 +242,13 @@ func (p *Poller) tryBatchedPRWatchCheck(ctx context.Context, watches []*PRWatch)
 	return true
 }
 
+func watchID(watch *PRWatch) string {
+	if watch == nil {
+		return ""
+	}
+	return watch.ID
+}
+
 // splitPRWatches partitions watches into "we know the PR number" and "still
 // searching for one on this branch" buckets so each gets its own batched
 // query shape. Used by Service.SyncWatchesBatched.
@@ -249,7 +270,7 @@ func (p *Poller) checkSinglePRWatch(ctx context.Context, watch *PRWatch) {
 		return
 	}
 
-	status, hasNew, err := p.service.CheckPRWatch(ctx, watch)
+	status, hasNew, err := p.service.CheckPRWatchForWorkspace(ctx, watch)
 	if err != nil {
 		p.logger.Debug("failed to check PR watch",
 			zap.String("id", watch.ID), zap.Error(err))
@@ -265,7 +286,6 @@ func (p *Poller) checkSinglePRWatch(ctx context.Context, watch *PRWatch) {
 			zap.String("task_id", watch.TaskID), zap.Error(syncErr))
 		return // Keep watch so the next cycle can retry
 	}
-
 	// When the tracked PR is merged or closed, reset the watch back to the
 	// "searching" state (pr_number=0) rather than deleting it. This lets the
 	// poller discover a follow-up PR opened on the same branch (e.g. the user
@@ -273,6 +293,17 @@ func (p *Poller) checkSinglePRWatch(ctx context.Context, watch *PRWatch) {
 	// intervention. The watch is only deleted when its owning session is gone.
 	if status.PR != nil && (status.PR.State == prStateMerged || status.PR.State == prStateClosed) {
 		p.publishPRStatusEvent(ctx, watch, status)
+		hold, holdErr := p.service.ShouldHoldTerminalPRWatch(
+			ctx, watch.TaskID, watch.RepositoryID, watch.PRNumber, status.PR.State,
+		)
+		if holdErr != nil {
+			p.logger.Warn("failed to check terminal PR automation",
+				zap.String("task_id", watch.TaskID), zap.Error(holdErr))
+			return
+		}
+		if hold {
+			return
+		}
 		if resetErr := p.service.store.UpdatePRWatchPRNumber(ctx, watch.ID, 0); resetErr != nil {
 			p.logger.Error("failed to reset completed PR watch",
 				zap.String("id", watch.ID), zap.Error(resetErr))
@@ -295,11 +326,15 @@ func (p *Poller) checkSinglePRWatch(ctx context.Context, watch *PRWatch) {
 // detectPRForWatch searches GitHub for a PR on the watch's branch.
 // If found, updates the watch with the PR number and creates the TaskPR association.
 func (p *Poller) detectPRForWatch(ctx context.Context, watch *PRWatch) {
-	if p.service.client == nil {
+	if watch == nil || watch.WorkspaceID == "" {
+		p.logger.Warn("cannot detect PR for watch without workspace ownership",
+			zap.String("watch_id", watchID(watch)))
 		return
 	}
 
-	pr, err := p.service.client.FindPRByBranch(ctx, watch.Owner, watch.Repo, watch.Branch)
+	pr, err := p.service.FindPRByBranchForWorkspace(
+		ctx, watch.WorkspaceID, watch.Owner, watch.Repo, watch.Branch,
+	)
 	if err != nil {
 		p.logger.Debug("failed to search for PR by branch",
 			zap.String("watch_id", watch.ID),
@@ -380,8 +415,8 @@ func (p *Poller) reconcileWatches(ctx context.Context) {
 		return
 	}
 	for _, task := range tasks {
-		if _, ensureErr := p.service.EnsurePRWatch(
-			ctx, task.SessionID, task.TaskID, task.RepositoryID, task.Owner, task.Repo, task.Branch,
+		if _, ensureErr := p.service.EnsurePRWatchForWorkspace(
+			ctx, task.WorkspaceID, task.SessionID, task.TaskID, task.RepositoryID, task.Owner, task.Repo, task.Branch,
 		); ensureErr != nil {
 			p.logger.Error("failed to ensure PR watch",
 				zap.String("session_id", task.SessionID), zap.Error(ensureErr))

@@ -46,6 +46,7 @@ type CreateTaskRequest struct {
 	Repositories   []TaskRepositoryInput  `json:"repositories,omitempty"`
 	Position       int                    `json:"position"`
 	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	DeferredLaunch map[string]interface{} `json:"deferred_launch,omitempty"`
 	PlanMode       bool                   `json:"plan_mode,omitempty"`
 	IsEphemeral    bool                   `json:"is_ephemeral,omitempty"` // Ephemeral tasks are hidden from kanban, used for quick chat
 	ParentID       string                 `json:"parent_id,omitempty"`
@@ -69,6 +70,10 @@ type UpdateTaskRequest struct {
 	Repositories   []TaskRepositoryInput  `json:"repositories,omitempty"`
 	Position       *int                   `json:"position,omitempty"`
 	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	// ParentID nests the task under another task ("subtask"). A nil pointer
+	// leaves the relationship untouched; a pointer to "" clears it (un-nests
+	// back to a root task); a non-empty value nests it under that parent.
+	ParentID *string `json:"parent_id,omitempty"`
 }
 
 // CreateWorkflowRequest contains the data for creating a new workflow
@@ -97,6 +102,7 @@ type CreateWorkspaceRequest struct {
 	DefaultEnvironmentID        *string `json:"default_environment_id,omitempty"`
 	DefaultAgentProfileID       *string `json:"default_agent_profile_id,omitempty"`
 	DefaultConfigAgentProfileID *string `json:"default_config_agent_profile_id,omitempty"`
+	BootstrapKanbanWorkflow     bool
 }
 
 // UpdateWorkspaceRequest contains the data for updating a workspace
@@ -142,6 +148,13 @@ type CreateRepositoryRequest struct {
 	CleanupScript          string `json:"cleanup_script"`
 	DevScript              string `json:"dev_script"`
 	CopyFiles              string `json:"copy_files"`
+}
+
+// InitializeLocalRepositoryRequest contains the data for creating and registering a new local repository.
+type InitializeLocalRepositoryRequest struct {
+	WorkspaceID string `json:"workspace_id"`
+	Name        string `json:"name"`
+	ParentPath  string `json:"parent_path"`
 }
 
 // UpdateRepositoryRequest contains the data for updating a repository
@@ -253,6 +266,7 @@ type CreateMessageRequest struct {
 	TaskSessionID string                 `json:"session_id"`
 	TaskID        string                 `json:"task_id,omitempty"`
 	TurnID        string                 `json:"turn_id"`
+	CompletedTurn bool                   `json:"-"`
 	Content       string                 `json:"content"`
 	AuthorType    string                 `json:"author_type,omitempty"` // "user" or "agent", defaults to "user"
 	AuthorID      string                 `json:"author_id,omitempty"`

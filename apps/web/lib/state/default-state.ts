@@ -12,10 +12,13 @@ import {
   defaultLinearState,
   defaultOfficeState,
   defaultFeaturesState,
+  defaultAuthState,
   defaultAutomationsState,
   defaultSystemState,
+  defaultReviewState,
 } from "./slices";
 import { getStoredQuickChatNames } from "@/lib/local-storage";
+import type { HydrationState } from "./store";
 import { migrateView } from "./slices/ui/ui-slice";
 
 export const defaultState = {
@@ -49,6 +52,7 @@ export const defaultState = {
   activeModel: defaultSessionState.activeModel,
   taskPlans: defaultSessionState.taskPlans,
   walkthroughs: defaultSessionState.walkthroughs,
+  taskReview: defaultReviewState.taskReview,
   queue: defaultSessionState.queue,
   terminal: defaultSessionRuntimeState.terminal,
   shell: defaultSessionRuntimeState.shell,
@@ -68,6 +72,7 @@ export const defaultState = {
   promptUsage: defaultSessionRuntimeState.promptUsage,
   sessionPollMode: defaultSessionRuntimeState.sessionPollMode,
   githubStatus: defaultGitHubState.githubStatus,
+  githubAppRegistrations: defaultGitHubState.githubAppRegistrations,
   taskPRs: defaultGitHubState.taskPRs,
   taskIssues: defaultGitHubState.taskIssues,
   pendingPrUrlByTaskId: defaultGitHubState.pendingPrUrlByTaskId,
@@ -89,6 +94,7 @@ export const defaultState = {
   linearIssueWatches: defaultLinearState.linearIssueWatches,
   office: defaultOfficeState.office,
   features: defaultFeaturesState.features,
+  auth: defaultAuthState.auth,
   automations: defaultAutomationsState.automations,
   automationRuns: defaultAutomationsState.automationRuns,
   system: defaultSystemState.system,
@@ -99,6 +105,7 @@ export const defaultState = {
   mobileKanban: defaultUIState.mobileKanban,
   mobileSession: defaultUIState.mobileSession,
   chatInput: defaultUIState.chatInput,
+  reviewPRSelection: defaultUIState.reviewPRSelection,
   documentPanel: defaultUIState.documentPanel,
   systemHealth: defaultUIState.systemHealth,
   quickChat: defaultUIState.quickChat,
@@ -114,7 +121,7 @@ export type DefaultState = typeof defaultState;
 
 function mergeCodeHostFields(
   d: DefaultState,
-  s: Partial<DefaultState>,
+  s: HydrationState,
 ): Pick<
   DefaultState,
   | "taskMRs"
@@ -141,7 +148,7 @@ function mergeCodeHostFields(
   };
 }
 
-function mergeQuickChatState(initialState: Partial<DefaultState>): DefaultState["quickChat"] {
+function mergeQuickChatState(initialState: HydrationState): DefaultState["quickChat"] {
   const quickChat = { ...defaultState.quickChat, ...initialState.quickChat };
   if (!initialState.quickChat?.sessions) return quickChat;
 
@@ -159,7 +166,7 @@ function mergeQuickChatState(initialState: Partial<DefaultState>): DefaultState[
   };
 }
 
-function mergeSidebarViewState(initialState: Partial<DefaultState>): DefaultState["sidebarViews"] {
+function mergeSidebarViewState(initialState: HydrationState): DefaultState["sidebarViews"] {
   const sidebarViews = { ...defaultState.sidebarViews, ...initialState.sidebarViews };
   const userSettings = initialState.userSettings;
   const serverViews = userSettings?.sidebarViews?.map(migrateView) ?? [];
@@ -176,7 +183,7 @@ function mergeSidebarViewState(initialState: Partial<DefaultState>): DefaultStat
 }
 
 function mergeSidebarTaskPrefsState(
-  initialState: Partial<DefaultState>,
+  initialState: HydrationState,
 ): DefaultState["sidebarTaskPrefs"] {
   const sidebarTaskPrefs = {
     ...defaultState.sidebarTaskPrefs,
@@ -198,13 +205,49 @@ function mergeSidebarTaskPrefsState(
   };
 }
 
-export function mergeInitialState(initialState?: Partial<DefaultState>): DefaultState {
-  if (!initialState) return defaultState;
+function mergeReviewPRSelectionState(
+  initialState: HydrationState,
+): DefaultState["reviewPRSelection"] {
+  return {
+    ...defaultState.reviewPRSelection,
+    ...initialState.reviewPRSelection,
+    selectedKeyByTaskId: {
+      ...defaultState.reviewPRSelection.selectedKeyByTaskId,
+      ...initialState.reviewPRSelection?.selectedKeyByTaskId,
+    },
+  };
+}
 
+function mergeSessionFailureNotification(initialState: HydrationState) {
+  return initialState.sessionFailureNotification ?? defaultState.sessionFailureNotification;
+}
+
+/**
+ * Merges the agent-authored review artifacts (walkthroughs and code-review
+ * findings). Extracted so mergeInitialState stays under the function line cap.
+ */
+function mergeAgentReviewArtifacts(initialState: HydrationState) {
+  return {
+    walkthroughs: { ...defaultState.walkthroughs, ...initialState.walkthroughs },
+    taskReview: { ...defaultState.taskReview, ...initialState.taskReview },
+  };
+}
+
+function mergeGitHubState(initialState: HydrationState) {
+  return {
+    githubStatus: { ...defaultState.githubStatus, ...initialState.githubStatus },
+    githubAppRegistrations: {
+      ...defaultState.githubAppRegistrations,
+      ...initialState.githubAppRegistrations,
+    },
+  };
+}
+
+export function mergeInitialState(initialState?: HydrationState): DefaultState {
+  if (!initialState) return defaultState;
   return {
     ...defaultState,
     ...initialState,
-    // Ensure nested objects are properly merged
     kanban: { ...defaultState.kanban, ...initialState.kanban },
     kanbanMulti: { ...defaultState.kanbanMulti, ...initialState.kanbanMulti },
     workflows: { ...defaultState.workflows, ...initialState.workflows },
@@ -240,7 +283,7 @@ export function mergeInitialState(initialState?: Partial<DefaultState>): Default
     pendingModel: { ...defaultState.pendingModel, ...initialState.pendingModel },
     activeModel: { ...defaultState.activeModel, ...initialState.activeModel },
     taskPlans: { ...defaultState.taskPlans, ...initialState.taskPlans },
-    walkthroughs: { ...defaultState.walkthroughs, ...initialState.walkthroughs },
+    ...mergeAgentReviewArtifacts(initialState),
     queue: { ...defaultState.queue, ...initialState.queue },
     terminal: { ...defaultState.terminal, ...initialState.terminal },
     shell: { ...defaultState.shell, ...initialState.shell },
@@ -257,7 +300,7 @@ export function mergeInitialState(initialState?: Partial<DefaultState>): Default
     sessionModels: { ...defaultState.sessionModels, ...initialState.sessionModels },
     promptUsage: { ...defaultState.promptUsage, ...initialState.promptUsage },
     sessionPollMode: { ...defaultState.sessionPollMode, ...initialState.sessionPollMode },
-    githubStatus: { ...defaultState.githubStatus, ...initialState.githubStatus },
+    ...mergeGitHubState(initialState),
     taskPRs: { ...defaultState.taskPRs, ...initialState.taskPRs },
     taskIssues: { ...defaultState.taskIssues, ...initialState.taskIssues },
     pendingPrUrlByTaskId: {
@@ -278,9 +321,19 @@ export function mergeInitialState(initialState?: Partial<DefaultState>): Default
     },
     office: { ...defaultState.office, ...initialState.office },
     features: { ...defaultState.features, ...initialState.features },
+    auth: { ...defaultState.auth, ...initialState.auth },
     automations: { ...defaultState.automations, ...initialState.automations },
     automationRuns: { ...defaultState.automationRuns, ...initialState.automationRuns },
     system: { ...defaultState.system, ...initialState.system },
+    ...mergeUIPanelState(initialState),
+  };
+}
+
+// Split out of mergeInitialState to stay under the per-function line limit —
+// these fields are the UI/panel slice of the merge and have no cross-field
+// dependencies on the rest of DefaultState.
+function mergeUIPanelState(initialState: HydrationState) {
+  return {
     previewPanel: { ...defaultState.previewPanel, ...initialState.previewPanel },
     rightPanel: { ...defaultState.rightPanel, ...initialState.rightPanel },
     diffs: { ...defaultState.diffs, ...initialState.diffs },
@@ -288,11 +341,11 @@ export function mergeInitialState(initialState?: Partial<DefaultState>): Default
     mobileKanban: { ...defaultState.mobileKanban, ...initialState.mobileKanban },
     mobileSession: { ...defaultState.mobileSession, ...initialState.mobileSession },
     chatInput: { ...defaultState.chatInput, ...initialState.chatInput },
+    reviewPRSelection: mergeReviewPRSelectionState(initialState),
     documentPanel: { ...defaultState.documentPanel, ...initialState.documentPanel },
     systemHealth: { ...defaultState.systemHealth, ...initialState.systemHealth },
     quickChat: mergeQuickChatState(initialState),
-    sessionFailureNotification:
-      initialState.sessionFailureNotification ?? defaultState.sessionFailureNotification,
+    sessionFailureNotification: mergeSessionFailureNotification(initialState),
     bottomTerminal: { ...defaultState.bottomTerminal, ...initialState.bottomTerminal },
     sidebarViews: mergeSidebarViewState(initialState),
     sidebarTaskPrefs: mergeSidebarTaskPrefsState(initialState),
