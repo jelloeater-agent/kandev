@@ -39,9 +39,9 @@ semicolon with `#59;` or a comma parses successfully with both LF and CRLF input
 ### Failed-render diagnostics
 
 - Add a shared failure-reporting helper in `apps/web/components/shared/mermaid-utils.ts`.
-- Emit one persistent `console.error` per rejected render with a searchable `[mermaid]` prefix. Use
-  one flat multiline string containing the parser error and full original source; append the full
-  normalized source only when it differs from the original.
+- Emit one persistent `console.error` per non-cancelled rejected render with a searchable `[mermaid]`
+  prefix. Use one flat multiline string containing the parser error and full original source; append
+  the full normalized source only when it differs from the original.
 - Call the helper from both current rejection paths:
   `apps/web/components/shared/mermaid-block.tsx` for chat Markdown and
   `apps/web/components/editors/tiptap/tiptap-mermaid-extension.ts` for task plans.
@@ -58,8 +58,8 @@ semicolon with `#59;` or a comma parses successfully with both LF and CRLF input
   through the same gate.
 - Read and capture the active task ID in both failure paths. When no task is focused, retain the
   existing unsuppressed behavior.
-- Suppress only the toast: every rejection still logs its full source and retains existing inline
-  error/recovery behavior.
+- Suppress only the toast: every non-cancelled rejection still logs its full source and retains
+  existing inline error/recovery behavior.
 
 ### Mobile parity
 
