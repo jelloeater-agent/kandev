@@ -141,7 +141,8 @@ Subscription quota tracking and per-agent cheap-model profile routing.
 | [external-vcs-file-links](ui/external-vcs-file-links.md) | shipped |
 | [task-listing-display-preferences](ui/task-listing-display-preferences.md) | shipped |
 | [task-workspace-content-search](ui/task-workspace-content-search.md) | shipped |
-| [embedded-vscode-windows-availability](ui/embedded-vscode-windows-availability.md) | shipped |
+| [embedded-vscode-executor-availability](ui/embedded-vscode-executor-availability.md) | approved |
+| [embedded-vscode-windows-availability](ui/embedded-vscode-windows-availability.md) | archived; superseded by embedded-vscode-executor-availability |
 | [ws-connectivity-warning](ui/ws-connectivity-warning.md) | approved |
 
 ## system-page/ — operational diagnostics & maintenance UI
