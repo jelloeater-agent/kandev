@@ -32,7 +32,7 @@ import {
 } from "./file-tree-utils";
 import {
   OpenInEditorMenuItems,
-  hasFileTreeEditors,
+  canOpenNodeInEditor,
   useFileTreeEditorActions,
 } from "./file-tree-editor-menu";
 
@@ -178,7 +178,7 @@ export function FileContextMenu({
   const isBulk = selectedCount > 1;
   const needsConfirmation = node.is_dir || isBulk;
   // A bulk selection would make a single-node "Open in <editor>" ambiguous.
-  const showOpenInEditor = !isBulk && hasFileTreeEditors(editorActions);
+  const showOpenInEditor = !isBulk && canOpenNodeInEditor(editorActions, node);
   const hasFileActions = !!onDeleteFile || !!onRenameFile || !!onDownloadFile;
 
   const handleConfirmDelete = useCallback(() => {

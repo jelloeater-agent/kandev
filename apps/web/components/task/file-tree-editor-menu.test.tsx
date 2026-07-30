@@ -56,7 +56,12 @@ function renderMenu({
 
 function actionsWith(editors: EditorOption[], defaultEditorId: string) {
   const openInEditor = vi.fn();
-  return { actions: { editors, defaultEditorId, openInEditor }, openInEditor };
+  const resolveTarget = vi.fn(() => ({ filePath: "resolved" }));
+  return {
+    actions: { editors, defaultEditorId, resolveTarget, openInEditor },
+    openInEditor,
+    resolveTarget,
+  };
 }
 
 describe("Open in editor context menu items", () => {
@@ -97,9 +102,24 @@ describe("Open in editor context menu items", () => {
   });
 
   it("hides the open action when no editors are available", () => {
-    renderMenu({ actions: { editors: [], defaultEditorId: "", openInEditor: vi.fn() } });
+    renderMenu({
+      actions: {
+        editors: [],
+        defaultEditorId: "",
+        resolveTarget: () => ({ filePath: "resolved" }),
+        openInEditor: vi.fn(),
+      },
+    });
 
     expect(screen.queryByTestId(OPEN_ITEM)).toBeNull();
+  });
+
+  it("hides the open action for a node that resolves to no worktree", () => {
+    const { actions } = actionsWith([editor(VSCODE_ID, "VS Code")], VSCODE_ID);
+    renderMenu({ actions: { ...actions, resolveTarget: () => null } });
+
+    expect(screen.queryByTestId(OPEN_ITEM)).toBeNull();
+    expect(screen.getByText("Delete")).toBeTruthy();
   });
 
   it("hides the open action outside a file browser that provides editors", () => {

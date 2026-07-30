@@ -586,7 +586,7 @@ export function FileBrowser({
   });
   const { openFolder, copied, copyPath, search, treeState, fullPath, displayPath } = data;
   return (
-    <FileTreeEditorProvider sessionId={sessionId}>
+    <FileTreeEditorProvider sessionId={sessionId} treeRootName={treeState.tree?.name}>
       <div
         className="flex flex-col h-full"
         ref={containerRef}

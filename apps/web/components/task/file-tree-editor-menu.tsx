@@ -19,11 +19,13 @@ import {
   getAvailableTaskTopbarEditors,
   resolveTaskTopbarEditorId,
 } from "@/components/task/editors-menu-availability";
-import { resolveFileTreeEditorTarget } from "./file-tree-editor-target";
+import { resolveFileTreeEditorTarget, type FileTreeEditorTarget } from "./file-tree-editor-target";
 
 export type FileTreeEditorActions = {
   editors: EditorOption[];
   defaultEditorId: string;
+  /** `null` when the node has no worktree the editors API can resolve against. */
+  resolveTarget: (node: FileTreeNode) => FileTreeEditorTarget | null;
   openInEditor: (node: FileTreeNode, editorId: string) => void;
 };
 
@@ -41,9 +43,12 @@ export function useFileTreeEditorActions(): FileTreeEditorActions | null {
  */
 export function FileTreeEditorProvider({
   sessionId,
+  treeRootName,
   children,
 }: {
   sessionId: string;
+  /** Name of the tree's root directory, used to tell which root it is served from. */
+  treeRootName?: string;
   children: React.ReactNode;
 }) {
   const { editors } = useEditors();
@@ -64,10 +69,15 @@ export function FileTreeEditorProvider({
     [editors, backendHostOS],
   );
 
+  const resolveTarget = useCallback(
+    (node: FileTreeNode) => resolveFileTreeEditorTarget(node.path, worktrees, treeRootName),
+    [worktrees, treeRootName],
+  );
+
   const openInEditor = useCallback(
     (node: FileTreeNode, editorId: string) => {
-      if (!editorId) return;
-      const target = resolveFileTreeEditorTarget(node.path, worktrees);
+      const target = resolveTarget(node);
+      if (!editorId || !target) return;
       void openRef.current({
         editorId,
         filePath: target.filePath,
@@ -75,16 +85,17 @@ export function FileTreeEditorProvider({
         isDirectory: node.is_dir,
       });
     },
-    [worktrees],
+    [resolveTarget],
   );
 
   const value = useMemo<FileTreeEditorActions>(
     () => ({
       editors: availableEditors,
       defaultEditorId: resolveTaskTopbarEditorId(defaultEditorId, availableEditors),
+      resolveTarget,
       openInEditor,
     }),
-    [availableEditors, defaultEditorId, openInEditor],
+    [availableEditors, defaultEditorId, resolveTarget, openInEditor],
   );
 
   return <FileTreeEditorContext.Provider value={value}>{children}</FileTreeEditorContext.Provider>;
@@ -129,7 +140,11 @@ export function OpenInEditorMenuItems({ node }: { node: FileTreeNode }) {
   );
 }
 
-export function hasFileTreeEditors(actions: FileTreeEditorActions | null): boolean {
+export function canOpenNodeInEditor(
+  actions: FileTreeEditorActions | null,
+  node: FileTreeNode,
+): boolean {
   if (!actions) return false;
-  return actions.editors.some((editor) => editor.id === actions.defaultEditorId);
+  if (!actions.editors.some((editor) => editor.id === actions.defaultEditorId)) return false;
+  return actions.resolveTarget(node) !== null;
 }
