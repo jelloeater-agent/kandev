@@ -1,0 +1,135 @@
+"use client";
+
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef } from "react";
+import { IconCode } from "@tabler/icons-react";
+import {
+  ContextMenuItem,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+} from "@kandev/ui/context-menu";
+import { useEditors } from "@/hooks/domains/settings/use-editors";
+import { useOpenSessionInEditor } from "@/hooks/use-open-session-in-editor";
+import { useSessionWorktrees } from "@/hooks/domains/session/use-session-worktrees";
+import { useAppStore } from "@/components/state-provider";
+import type { EditorOption } from "@/lib/types/http";
+import type { FileTreeNode } from "@/lib/types/backend";
+import { readBackendHostOS } from "@/src/boot-payload";
+import {
+  getAvailableTaskTopbarEditors,
+  resolveTaskTopbarEditorId,
+} from "@/components/task/editors-menu-availability";
+import { resolveFileTreeEditorTarget } from "./file-tree-editor-target";
+
+export type FileTreeEditorActions = {
+  editors: EditorOption[];
+  defaultEditorId: string;
+  openInEditor: (node: FileTreeNode, editorId: string) => void;
+};
+
+export const FileTreeEditorContext = createContext<FileTreeEditorActions | null>(null);
+
+export function useFileTreeEditorActions(): FileTreeEditorActions | null {
+  return useContext(FileTreeEditorContext);
+}
+
+/**
+ * Supplies the Files panel context menus with the session's available editors
+ * and an opener that resolves a tree node path to the editors API's
+ * `{worktreeId, filePath}` pair. Provided once per browser rather than per row
+ * so every tree node shares a single set of editor subscriptions.
+ */
+export function FileTreeEditorProvider({
+  sessionId,
+  children,
+}: {
+  sessionId: string;
+  children: React.ReactNode;
+}) {
+  const { editors } = useEditors();
+  const defaultEditorId = useAppStore((state) => state.userSettings.defaultEditorId);
+  const worktrees = useSessionWorktrees(sessionId);
+  const openEditor = useOpenSessionInEditor(sessionId);
+  const backendHostOS = readBackendHostOS();
+
+  // `open` is a fresh closure on every render; keep the context value stable by
+  // calling through a ref instead of depending on it directly.
+  const openRef = useRef(openEditor.open);
+  useEffect(() => {
+    openRef.current = openEditor.open;
+  });
+
+  const availableEditors = useMemo(
+    () => getAvailableTaskTopbarEditors(editors, backendHostOS),
+    [editors, backendHostOS],
+  );
+
+  const openInEditor = useCallback(
+    (node: FileTreeNode, editorId: string) => {
+      if (!editorId) return;
+      const target = resolveFileTreeEditorTarget(node.path, worktrees);
+      void openRef.current({
+        editorId,
+        filePath: target.filePath,
+        worktreeId: target.worktreeId,
+        isDirectory: node.is_dir,
+      });
+    },
+    [worktrees],
+  );
+
+  const value = useMemo<FileTreeEditorActions>(
+    () => ({
+      editors: availableEditors,
+      defaultEditorId: resolveTaskTopbarEditorId(defaultEditorId, availableEditors),
+      openInEditor,
+    }),
+    [availableEditors, defaultEditorId, openInEditor],
+  );
+
+  return <FileTreeEditorContext.Provider value={value}>{children}</FileTreeEditorContext.Provider>;
+}
+
+/**
+ * "Open in <editor>" entries for a single tree node, plus a submenu with the
+ * remaining editors when more than one is available.
+ */
+export function OpenInEditorMenuItems({ node }: { node: FileTreeNode }) {
+  const actions = useFileTreeEditorActions();
+  if (!actions) return null;
+  const { editors, defaultEditorId, openInEditor } = actions;
+  const primary = editors.find((editor) => editor.id === defaultEditorId);
+  if (!primary) return null;
+  const others = editors.filter((editor) => editor.id !== primary.id);
+
+  return (
+    <>
+      <ContextMenuItem
+        data-testid="file-tree-open-in-editor"
+        onSelect={() => openInEditor(node, primary.id)}
+      >
+        <IconCode className="h-3.5 w-3.5" />
+        Open in {primary.name}
+      </ContextMenuItem>
+      {others.length > 0 && (
+        <ContextMenuSub>
+          <ContextMenuSubTrigger data-testid="file-tree-open-in-other-editor">
+            Open in other editor
+          </ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            {others.map((editor) => (
+              <ContextMenuItem key={editor.id} onSelect={() => openInEditor(node, editor.id)}>
+                {editor.name}
+              </ContextMenuItem>
+            ))}
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+      )}
+    </>
+  );
+}
+
+export function hasFileTreeEditors(actions: FileTreeEditorActions | null): boolean {
+  if (!actions) return false;
+  return actions.editors.some((editor) => editor.id === actions.defaultEditorId);
+}
