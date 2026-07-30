@@ -22,12 +22,18 @@ export function applyStoredQuickChatNames(sessions: QuickChatSession[]): QuickCh
 }
 
 /**
- * Replaces one workspace's quick-chat tabs with the server's list.
+ * Reconciles one workspace's quick-chat tabs against the server's list.
  *
  * Quick chats are shared state: they are created and closed from any device,
  * but a client only ever learned about them from its own boot payload. Without
  * this reconcile, two long-lived clients drift — each keeps tabs the other
  * never saw, and keeps tabs whose task the other already deleted.
+ *
+ * Membership is the server's call; position is not. Tabs already on screen keep
+ * their order and new ones are appended, because the server sorts by latest
+ * activity and that changes as sessions run — adopting it wholesale would
+ * reshuffle the strip under the user's cursor on every reconnect. The activity
+ * order still decides the initial restore, when there is nothing on screen yet.
  *
  * Local-only state is preserved: unstarted "New chat" setup tabs (which have no
  * backing task yet) and per-session drafts on tabs that survive.
@@ -37,19 +43,30 @@ export function reconcileQuickChatSessions(
   workspaceId: string,
   serverSessions: QuickChatSession[],
 ): QuickChatState {
-  const previousById = new Map(state.sessions.map((session) => [session.sessionId, session]));
   const otherWorkspaces = state.sessions.filter((session) => session.workspaceId !== workspaceId);
   const localSetupTabs = state.sessions.filter(
     (session) =>
       session.workspaceId === workspaceId && isQuickChatSetupSessionId(session.sessionId),
   );
-  const restored = applyStoredQuickChatNames(serverSessions).map((session) => ({
-    // Keep client-only fields (e.g. an unsent initial prompt) on surviving tabs.
-    ...previousById.get(session.sessionId),
-    ...session,
-  }));
+  const named = applyStoredQuickChatNames(serverSessions);
+  const serverById = new Map(named.map((session) => [session.sessionId, session]));
 
-  return withValidActiveSession(state, [...otherWorkspaces, ...restored, ...localSetupTabs]);
+  // Tabs still on the server, in the order this client already shows them.
+  const survivors = state.sessions
+    .filter(
+      (session) => session.workspaceId === workspaceId && serverById.has(session.sessionId),
+      // Client-only fields (e.g. an unsent draft) survive via the spread below.
+    )
+    .map((session) => ({ ...session, ...serverById.get(session.sessionId) }));
+  const survivorIds = new Set(survivors.map((session) => session.sessionId));
+  const added = named.filter((session) => !survivorIds.has(session.sessionId));
+
+  return withValidActiveSession(state, [
+    ...otherWorkspaces,
+    ...survivors,
+    ...added,
+    ...localSetupTabs,
+  ]);
 }
 
 /**

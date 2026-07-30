@@ -46,12 +46,29 @@ describe("reconcileQuickChatSessions", () => {
     expect(after.sessions.map((s) => s.sessionId)).toEqual(["a", "b"]);
   });
 
-  it("preserves the server's ordering", () => {
-    const before = state([chat("a"), chat("b")]);
-
-    const after = reconcileQuickChatSessions(before, WS, [chat("b"), chat("a")]);
+  it("takes the server's order for the initial restore", () => {
+    // Nothing on screen yet, so activity order decides where tabs land.
+    const after = reconcileQuickChatSessions(state([]), WS, [chat("b"), chat("a")]);
 
     expect(after.sessions.map((s) => s.sessionId)).toEqual(["b", "a"]);
+  });
+
+  it("does not reshuffle tabs already on screen when activity order changes", () => {
+    // The server sorts by latest activity, which moves while sessions run. If a
+    // reconnect adopted that wholesale, the strip would jump under the cursor.
+    const before = state([chat("b"), chat("a")], { activeSessionId: "b" });
+
+    const after = reconcileQuickChatSessions(before, WS, [chat("a"), chat("b")]);
+
+    expect(after.sessions.map((s) => s.sessionId)).toEqual(["b", "a"]);
+  });
+
+  it("appends chats it has not seen after the tabs already on screen", () => {
+    const before = state([chat("b"), chat("a")]);
+
+    const after = reconcileQuickChatSessions(before, WS, [chat("new"), chat("a"), chat("b")]);
+
+    expect(after.sessions.map((s) => s.sessionId)).toEqual(["b", "a", "new"]);
   });
 
   it("leaves other workspaces' tabs untouched", () => {
