@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 
-const setEmbeddedVscodeSupport = vi.fn();
+// Hoisted so the vi.mock factory below, which is registered above module
+// initialization, never closes over an uninitialized binding.
+const { setEmbeddedVscodeSupport } = vi.hoisted(() => ({
+  setEmbeddedVscodeSupport: vi.fn(),
+}));
 
 vi.mock("@/components/state-provider", () => ({
   useAppStore: (selector: (state: unknown) => unknown) => selector({ setEmbeddedVscodeSupport }),
