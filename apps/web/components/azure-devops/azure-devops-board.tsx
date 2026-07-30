@@ -78,6 +78,29 @@ function BoardCard({
   );
 }
 
+function ColumnStateSelector({
+  columnDone,
+  onChange,
+}: {
+  columnDone: boolean;
+  onChange: (columnDone: boolean) => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label>Column state</Label>
+      <Select value={String(columnDone)} onValueChange={(value) => onChange(value === "true")}>
+        <SelectTrigger data-testid="azure-board-column-done-select">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="false">In progress</SelectItem>
+          <SelectItem value="true">Done</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 function BoardActionForm({
   item,
   board,
@@ -87,7 +110,7 @@ function BoardActionForm({
 }: {
   item: AzureDevOpsBoardWorkItem;
   board: AzureDevOpsBoard;
-  onMove: (item: AzureDevOpsBoardWorkItem, columnId: string) => Promise<void>;
+  onMove: (item: AzureDevOpsBoardWorkItem, columnId: string, columnDone?: boolean) => Promise<void>;
   onAssigneeChange: (
     item: AzureDevOpsBoardWorkItem,
     action: "assign_current_user" | "unassign",
@@ -95,8 +118,10 @@ function BoardActionForm({
   onClose: () => void;
 }) {
   const [columnId, setColumnId] = useState(item.columnId);
+  const [columnDone, setColumnDone] = useState(item.columnDone);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const selectedColumn = board.columns.find((column) => column.id === columnId);
   const perform = async (action: () => Promise<void>) => {
     setSaving(true);
     setSaveError(null);
@@ -131,11 +156,14 @@ function BoardActionForm({
           </SelectContent>
         </Select>
       </div>
+      {selectedColumn?.isSplit && (
+        <ColumnStateSelector columnDone={columnDone} onChange={setColumnDone} />
+      )}
       <Button
         type="button"
         className="w-full cursor-pointer"
-        disabled={saving || columnId === item.columnId}
-        onClick={() => void perform(() => onMove(item, columnId))}
+        disabled={saving || (columnId === item.columnId && columnDone === item.columnDone)}
+        onClick={() => void perform(() => onMove(item, columnId, columnDone))}
       >
         {saving ? "Updating…" : "Move to column"}
       </Button>
@@ -180,7 +208,7 @@ function BoardEditor({
   item: AzureDevOpsBoardWorkItem | null;
   board: AzureDevOpsBoard;
   onOpenChange: (open: boolean) => void;
-  onMove: (item: AzureDevOpsBoardWorkItem, columnId: string) => Promise<void>;
+  onMove: (item: AzureDevOpsBoardWorkItem, columnId: string, columnDone?: boolean) => Promise<void>;
   onAssigneeChange: (
     item: AzureDevOpsBoardWorkItem,
     action: "assign_current_user" | "unassign",

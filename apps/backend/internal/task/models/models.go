@@ -98,6 +98,18 @@ const (
 	// (set by CreateTask, read by the orchestrator when building a session).
 	// Centralised here so the set/read sites can't drift apart.
 	MetaKeyWorkspacePath = "workspace_path"
+	// MetaKeyAutoStartGuard is a permanent marker set at create time on tasks
+	// where both the watcher's synchronous Path B (autoStartReviewTask) and the
+	// promotion's event-driven Path A (autoStartTaskForStep) could both try to
+	// launch an agent. Its presence signals that the one-shot MetaKeyAutoStartClaimed
+	// token governs who may launch. Never removed after task creation.
+	MetaKeyAutoStartGuard = "auto_start_guard"
+	// MetaKeyAutoStartClaimed is a one-shot token set alongside MetaKeyAutoStartGuard.
+	// Both auto-start paths atomically remove this key; only the first removal
+	// succeeds and that path proceeds to StartTask. The other path skips launch
+	// because the winner will (or already did) handle it.
+	// Absent on ordinary (non-watcher) auto-start tasks, which launch normally.
+	MetaKeyAutoStartClaimed = "auto_start_claimed"
 )
 
 // TaskSession.Metadata key that records how the session came into existence.
@@ -132,6 +144,10 @@ const SessionMetaKeyACPConfigBaseline = "acp_config_baseline"
 // selector state so task-detail boot hydration does not wait for WebSocket
 // reconnection. It is display metadata and is not replayed to the provider.
 const SessionMetaKeyACPModelState = "acp_model_state"
+
+// SessionMetaKeyMCPAttachmentState records bounded, safe evidence about MCP
+// attachment for this task session and its immediate prior attempts.
+const SessionMetaKeyMCPAttachmentState = "mcp_attachment_state"
 
 // SessionMetaKeyGitCredentialSnapshot records the non-secret Git credential
 // routing contract that successfully launched or resumed a session.
@@ -835,6 +851,23 @@ func (r ReviewStatus) String() string { return string(r) }
 
 // TaskSessionState represents the state of an agent session
 type TaskSessionState string
+
+// PromptableTaskSessionClaimStatus describes the outcome of atomically
+// reserving a session for a lifecycle prompt.
+type PromptableTaskSessionClaimStatus string
+
+const (
+	PromptableTaskSessionClaimed  PromptableTaskSessionClaimStatus = "claimed"
+	PromptableTaskSessionBusy     PromptableTaskSessionClaimStatus = "busy"
+	PromptableTaskSessionInactive PromptableTaskSessionClaimStatus = "inactive"
+)
+
+// PromptableTaskSessionClaim is the result of a lifecycle prompt reservation.
+// PreviousState is set only when Status is PromptableTaskSessionClaimed.
+type PromptableTaskSessionClaim struct {
+	Status        PromptableTaskSessionClaimStatus
+	PreviousState TaskSessionState
+}
 
 const (
 	// TaskSessionStateCreated - session created but agent not started

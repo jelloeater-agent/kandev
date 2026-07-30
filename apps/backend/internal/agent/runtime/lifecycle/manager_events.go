@@ -346,6 +346,12 @@ func (m *Manager) handleCompleteEvent(execution *AgentExecution, event *agentctl
 // separate DB rows mid-sentence, breaking markdown that spans the boundary.
 func (m *Manager) handleToolCallEvent(execution *AgentExecution, event agentctl.AgentEvent) agentctl.AgentEvent {
 	if event.ParentToolCallID == "" {
+		execution.setActiveTool(activeTopLevelTool{
+			ToolCallID: event.ToolCallID,
+			Name:       event.ToolName,
+			Title:      event.ToolTitle,
+			Status:     event.ToolStatus,
+		})
 		// flushMessageBuffer publishes any remaining buffered content through
 		// the streaming path itself and always returns "".
 		m.flushMessageBuffer(execution)
@@ -365,6 +371,9 @@ func (m *Manager) handleToolCallEvent(execution *AgentExecution, event agentctl.
 
 // handleToolUpdateEvent stores completed tool results in session history.
 func (m *Manager) handleToolUpdateEvent(execution *AgentExecution, event agentctl.AgentEvent) {
+	if event.ParentToolCallID == "" && isTerminalToolUpdate(event) {
+		execution.clearActiveTool(event.ToolCallID)
+	}
 	if m.historyManager != nil && execution.historyEnabled && execution.SessionID != "" && event.ToolStatus == toolStatusComplete {
 		m.flushAssistantHistory(execution)
 		if err := m.historyManager.AppendToolResult(execution.SessionID, event); err != nil {
@@ -622,6 +631,26 @@ func (m *Manager) handlePromptHandoffEvent(
 
 // handleAgentEvent processes incoming agent events from the agent
 func (m *Manager) handleAgentEvent(execution *AgentExecution, event agentctl.AgentEvent) {
+	if event.Type == streams.EventTypeMCPAttachment {
+		if event.MCPAttachmentAttempt != nil {
+			if event.MCPAttachmentAttempt.ExecutionID != "" && event.MCPAttachmentAttempt.ExecutionID != execution.ID {
+				m.logger.Warn("dropping stale MCP attachment attempt",
+					zap.String("event_execution_id", event.MCPAttachmentAttempt.ExecutionID),
+					zap.String("live_execution_id", execution.ID))
+				return
+			}
+			attempt := *event.MCPAttachmentAttempt
+			attempt.TaskID = execution.TaskID
+			attempt.SessionID = execution.SessionID
+			attempt.ExecutionID = execution.ID
+			attempt.AgentID = execution.AgentID
+			event.MCPAttachmentAttempt = &attempt
+		}
+		// Attachment diagnostics must not count as model activity or alter turn
+		// ownership. They flow directly to the orchestrator for persistence.
+		m.eventPublisher.PublishAgentStreamEvent(execution, event)
+		return
+	}
 	if event.PromptGeneration == 0 || (event.Type != toolStatusComplete && event.Type != "error") {
 		m.recordActivity(execution, event)
 	}

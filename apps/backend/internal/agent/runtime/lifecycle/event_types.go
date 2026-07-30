@@ -24,6 +24,22 @@ type AgentEventPayload struct {
 	PromptGeneration   uint64     `json:"prompt_generation,omitempty"`
 }
 
+// AgentStalledPayload describes a prompt that has stopped receiving agent events.
+// It is advisory only; the lifecycle remains running until the provider completes
+// or the user cancels the turn.
+type AgentStalledPayload struct {
+	AgentExecutionID string        `json:"agent_execution_id"`
+	TaskID           string        `json:"task_id"`
+	SessionID        string        `json:"session_id"`
+	PromptGeneration uint64        `json:"prompt_generation"`
+	LastActivityAt   time.Time     `json:"last_activity_at"`
+	StalledFor       time.Duration `json:"stalled_for"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	ToolName         string        `json:"tool_name,omitempty"`
+	ToolTitle        string        `json:"tool_title,omitempty"`
+	ToolStatus       string        `json:"tool_status,omitempty"`
+}
+
 // AgentctlEventPayload is the payload for agentctl lifecycle events (starting, ready, error).
 type AgentctlEventPayload struct {
 	TaskID            string `json:"task_id"`
@@ -182,6 +198,12 @@ type AgentStreamEventData struct {
 
 	// PlanContent contains rich markdown plan content (from "agent_plan" event).
 	PlanContent string `json:"plan_content,omitempty"`
+
+	// MCPAttachment is one safe MCP delivery or observation fact.
+	MCPAttachment *streams.MCPAttachmentEvidence `json:"mcp_attachment,omitempty"`
+
+	// MCPAttachmentAttempt starts a new backend-owned MCP evidence timeline.
+	MCPAttachmentAttempt *streams.MCPAttachmentAttempt `json:"mcp_attachment_attempt,omitempty"`
 }
 
 // AgentStreamEventPayload is the payload for agent stream events (WebSocket streaming).
@@ -525,10 +547,44 @@ func LoadSessionModelsSnapshot(raw any) (SessionModelsSnapshot, bool) {
 	return snapshot, snapshot.CurrentModelID != "" || len(snapshot.Models) > 0 || len(snapshot.ConfigOptions) > 0
 }
 
+// LoadMCPAttachmentHistory decodes typed and JSON-rehydrated MCP attachment
+// metadata. It accepts only the current schema and a current attempt so a
+// partial or malformed value cannot look like a healthy report after reload.
+func LoadMCPAttachmentHistory(raw any) (streams.MCPAttachmentHistory, bool) {
+	if raw == nil {
+		return streams.MCPAttachmentHistory{}, false
+	}
+	if history, ok := raw.(streams.MCPAttachmentHistory); ok {
+		return history, history.Valid()
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return streams.MCPAttachmentHistory{}, false
+	}
+	var history streams.MCPAttachmentHistory
+	if err := json.Unmarshal(data, &history); err != nil {
+		return streams.MCPAttachmentHistory{}, false
+	}
+	return history, history.Valid()
+}
+
 // GetSessionID returns the session ID for this event (used by event routing).
 func (p SessionModelsEventPayload) GetSessionID() string {
 	return p.SessionID
 }
+
+// SessionMCPStatusEventPayload is the persisted, safe MCP status history for
+// one task session. It is deliberately session-scoped so parallel agents never
+// overwrite each other's diagnostics.
+type SessionMCPStatusEventPayload struct {
+	TaskID    string                       `json:"task_id"`
+	SessionID string                       `json:"session_id"`
+	History   streams.MCPAttachmentHistory `json:"history"`
+	Timestamp string                       `json:"timestamp"`
+}
+
+// GetSessionID returns the task-session routing key.
+func (p SessionMCPStatusEventPayload) GetSessionID() string { return p.SessionID }
 
 // SessionInfoEventPayload is the payload for ACP session info updates.
 type SessionInfoEventPayload struct {

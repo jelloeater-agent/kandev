@@ -76,9 +76,16 @@ func TestMockClientPaginatesPullRequests(t *testing.T) {
 func TestMockClientBoardReads(t *testing.T) {
 	mock := NewMockClient()
 	mock.Seed(MockState{
-		Teams:          []Team{{ID: "team-1", Name: "Platform Team", ProjectID: "p1"}},
-		Boards:         []BoardReference{{ID: "board-1", Name: "Stories"}},
-		BoardSnapshots: map[string]BoardSnapshot{"board-1": {Board: Board{ID: "board-1"}, Items: []BoardWorkItem{{WorkItem: WorkItem{ID: 101}}}}},
+		Teams:  []Team{{ID: "team-1", Name: "Platform Team", ProjectID: "p1"}},
+		Boards: []BoardReference{{ID: "board-1", Name: "Stories"}},
+		BoardSnapshots: map[string]BoardSnapshot{
+			"board-1": {
+				Board: Board{ID: "board-1"},
+				Items: []BoardWorkItem{{
+					WorkItem: WorkItem{ID: 101, Fields: map[string]any{"System.Title": "Original"}, Tags: []string{"initial"}},
+				}},
+			},
+		},
 	})
 	teams, err := mock.ListTeams(t.Context(), "p1")
 	if err != nil || len(teams) != 1 {
@@ -93,9 +100,14 @@ func TestMockClientBoardReads(t *testing.T) {
 		t.Fatalf("snapshot = %+v, %v", snapshot, err)
 	}
 	snapshot.Items[0].Title = "Mutated caller copy"
+	snapshot.Items[0].Fields["System.Title"] = "Mutated field"
+	snapshot.Items[0].Tags[0] = "mutated-tag"
 	again, err := mock.GetBoardSnapshot(t.Context(), "p1", "team-1", "board-1")
 	if err != nil || again.Items[0].Title == "Mutated caller copy" {
 		t.Fatalf("subsequent snapshot = %+v, %v", again, err)
+	}
+	if again.Items[0].Fields["System.Title"] != "Original" || again.Items[0].Tags[0] != "initial" {
+		t.Fatalf("subsequent snapshot mutable data = %+v", again.Items[0])
 	}
 }
 

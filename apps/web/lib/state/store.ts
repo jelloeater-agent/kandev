@@ -157,6 +157,7 @@ export type AppState = KanbanSlice & {
   sessionTodos: (typeof defaultSessionRuntimeState)["sessionTodos"];
   agentCapabilities: (typeof defaultSessionRuntimeState)["agentCapabilities"];
   sessionModels: (typeof defaultSessionRuntimeState)["sessionModels"];
+  sessionMcpStatus: (typeof defaultSessionRuntimeState)["sessionMcpStatus"];
   promptUsage: (typeof defaultSessionRuntimeState)["promptUsage"];
   sessionPollMode: (typeof defaultSessionRuntimeState)["sessionPollMode"];
 
@@ -221,6 +222,7 @@ export type AppState = KanbanSlice & {
   mobileKanban: (typeof defaultUIState)["mobileKanban"];
   mobileSession: (typeof defaultUIState)["mobileSession"];
   chatInput: (typeof defaultUIState)["chatInput"];
+  transcriptAutoScroll: (typeof defaultUIState)["transcriptAutoScroll"];
   reviewPRSelection: (typeof defaultUIState)["reviewPRSelection"];
   documentPanel: (typeof defaultUIState)["documentPanel"];
   systemHealth: (typeof defaultUIState)["systemHealth"];
@@ -301,6 +303,10 @@ export type AppState = KanbanSlice & {
   upsertProcessStatus: (status: ProcessStatusEntry) => void;
   clearProcessOutput: (processId: string) => void;
   setActiveProcess: (sessionId: string, processId: string) => void;
+  setSessionMCPStatus: (
+    sessionId: string,
+    history: import("./slices/session-runtime/types").MCPAttachmentHistory,
+  ) => void;
   setPreviewOpen: (sessionId: string, open: boolean) => void;
   togglePreviewOpen: (sessionId: string) => void;
   setPreviewView: (sessionId: string, view: PreviewViewMode) => void;
@@ -317,6 +323,9 @@ export type AppState = KanbanSlice & {
   setMobileSessionReview: (sessionId: string, mrKey: string | null) => void;
   setMobileSessionTaskSwitcherOpen: (open: boolean) => void;
   setPlanMode: (sessionId: string, enabled: boolean) => void;
+  setTranscriptAutoScrollEnabled: UIA["setTranscriptAutoScrollEnabled"];
+  setTranscriptScrollTop: UIA["setTranscriptScrollTop"];
+  setTranscriptVirtuosoState: UIA["setTranscriptVirtuosoState"];
   setReviewPRSelection: UIA["setReviewPRSelection"];
   setActiveDocument: (sessionId: string, doc: UISliceTypes.ActiveDocument | null) => void;
   setSystemHealth: (response: SystemHealthResponse) => void;
@@ -518,6 +527,8 @@ export type HydrationState = Omit<Partial<AppState>, "system"> & {
   system?: Partial<AppState["system"]>;
 };
 
+/** Creates the Zustand app store, hydrating from `initialState` and
+ * composing every domain slice (kanban, ui, workspace, settings, ...). */
 export function createAppStore(initialState?: HydrationState) {
   const merged = mergeInitialState(initialState);
 

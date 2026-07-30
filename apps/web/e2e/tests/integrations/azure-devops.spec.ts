@@ -18,7 +18,7 @@ const MOCK_STATE = {
         },
         columns: [
           { id: "todo", name: "To Do" },
-          { id: "active", name: "Active" },
+          { id: "active", name: "Active", isSplit: true },
           { id: "done", name: "Done" },
         ],
       },
@@ -163,6 +163,8 @@ test("connects and browses Azure work items, PRs, and feedback", async ({
   await testPage.getByTestId("azure-board-card-101").click();
   await testPage.getByTestId("azure-board-column-select").click();
   await testPage.getByRole("option", { name: "Active" }).click();
+  await testPage.getByTestId("azure-board-column-done-select").click();
+  await testPage.getByRole("option", { name: "Done" }).click();
   await testPage.getByRole("button", { name: "Move to column" }).click();
   await expect(testPage.getByText("Handle token rotation")).toBeVisible();
 

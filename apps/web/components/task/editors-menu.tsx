@@ -22,11 +22,16 @@ import {
   buildWorktreeOptions,
   type WorktreeOption,
 } from "@/components/task/editor-worktree-options";
+import {
+  getAvailableTaskTopbarEditors,
+  resolveTaskTopbarEditorId,
+} from "@/components/task/editors-menu-availability";
 
 const menuItemClass = "cursor-pointer";
 
 type EditorsMenuProps = {
   activeSessionId: string | null;
+  embeddedVscodeSupported: boolean;
 };
 
 function useWorktreeOptions(sessionId: string | null): WorktreeOption[] {
@@ -167,30 +172,18 @@ function EditorMenuEntry({
   );
 }
 
-export function EditorsMenu({ activeSessionId }: EditorsMenuProps) {
+export function EditorsMenu({ activeSessionId, embeddedVscodeSupported }: EditorsMenuProps) {
   const openEditor = useOpenSessionInEditor(activeSessionId ?? null);
   const { editors } = useEditors();
   const defaultEditorId = useAppStore((state) => state.userSettings.defaultEditorId);
   const worktreeOptions = useWorktreeOptions(activeSessionId ?? null);
-
   const enabledEditors = useMemo(
-    () =>
-      editors.filter((editor: EditorOption) => {
-        if (!editor.enabled) return false;
-        if (editor.kind === "built_in") return editor.installed;
-        return true;
-      }),
-    [editors],
+    () => getAvailableTaskTopbarEditors(editors, embeddedVscodeSupported),
+    [editors, embeddedVscodeSupported],
   );
 
   const resolvedEditorId = useMemo(() => {
-    if (
-      defaultEditorId &&
-      enabledEditors.some((editor: EditorOption) => editor.id === defaultEditorId)
-    ) {
-      return defaultEditorId;
-    }
-    return enabledEditors[0]?.id ?? "";
+    return resolveTaskTopbarEditorId(defaultEditorId, enabledEditors);
   }, [defaultEditorId, enabledEditors]);
 
   const openWith = (editorId: string, worktreeId?: string) => {

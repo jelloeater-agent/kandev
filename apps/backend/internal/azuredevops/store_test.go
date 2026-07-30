@@ -152,6 +152,10 @@ func TestStoreDeleteTaskWorkItemsIsScoped(t *testing.T) {
 	if err := contract.DeleteTaskWorkItemsByWorkspace(ctx, "workspace-a"); err != nil {
 		t.Fatalf("delete task work items by workspace: %v", err)
 	}
+	deleted, err := contract.ListTaskWorkItemsByWorkspace(ctx, "workspace-a")
+	if err != nil || len(deleted) != 0 {
+		t.Fatalf("deleted workspace rows = %+v, err = %v", deleted, err)
+	}
 	byWorkspace, err = contract.ListTaskWorkItemsByWorkspace(ctx, "workspace-b")
 	if err != nil || len(byWorkspace["task-c"]) != 1 {
 		t.Fatalf("workspace-scoped deletion result = %+v, err = %v", byWorkspace, err)

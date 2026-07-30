@@ -153,6 +153,7 @@ export function useAzureDevOpsBoard(
   const updateItem = useCallback(
     async (item: AzureDevOpsBoardWorkItem, values: BoardWorkItemChanges) => {
       if (!workspaceId || !teamId || !boardId) return;
+      setError(null);
       const optimistic = { ...item, ...values };
       setSnapshot((current) => replaceBoardItem(current, item.id, optimistic));
       try {
@@ -181,8 +182,10 @@ export function useAzureDevOpsBoard(
   );
 
   const moveItem = useCallback(
-    async (item: AzureDevOpsBoardWorkItem, columnId: string) => {
-      if (item.columnId !== columnId) await updateItem(item, { columnId });
+    async (item: AzureDevOpsBoardWorkItem, columnId: string, columnDone = item.columnDone) => {
+      if (item.columnId !== columnId || item.columnDone !== columnDone) {
+        await updateItem(item, { columnId, columnDone });
+      }
     },
     [updateItem],
   );

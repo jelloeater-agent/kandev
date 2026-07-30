@@ -4,6 +4,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/kandev/kandev/internal/agentctl/types/streams"
 	"github.com/kandev/kandev/internal/common/logger"
 	ws "github.com/kandev/kandev/pkg/websocket"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -93,6 +95,10 @@ type Server struct {
 	mcpLogger          *zap.Logger // optional file logger for MCP debug traces
 	mu                 sync.Mutex
 	running            bool
+	attachmentMu       sync.RWMutex
+	attachmentAttempt  streams.MCPAttachmentAttempt
+	attachmentAttempts map[string]streams.MCPAttachmentAttempt
+	attachmentReporter func(streams.MCPAttachmentEvidence)
 }
 
 // New creates a new MCP server for agentctl.
@@ -152,6 +158,7 @@ func newServer(backend BackendClient, sessionID, taskID string, log *logger.Logg
 		disableAskQuestion: disableAskQuestion,
 		mode:               mcpMode,
 		logger:             log.WithFields(zap.String("component", "mcp-server")),
+		attachmentAttempts: make(map[string]streams.MCPAttachmentAttempt),
 	}
 
 	// Set up optional file logger for MCP debug traces
@@ -168,14 +175,125 @@ func newServer(backend BackendClient, sessionID, taskID string, log *logger.Logg
 		}
 	}
 
+	hooks := &server.Hooks{}
 	s.mcpServer = server.NewMCPServer(
 		"kandev-mcp",
 		"1.0.0",
 		server.WithToolCapabilities(true),
+		server.WithHooks(hooks),
 	)
+	hooks.AddOnRegisterSession(func(_ context.Context, session server.ClientSession) {
+		s.registerMCPConnection(session.SessionID())
+	})
+	hooks.AddAfterInitialize(func(ctx context.Context, _ any, _ *mcp.InitializeRequest, _ *mcp.InitializeResult) {
+		s.observeMCPConnection(mcpConnectionID(ctx), streams.MCPAttachmentEvidenceInitializeObserved, 0, "")
+	})
+	hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
+		s.observeMCPConnection(mcpConnectionID(ctx), streams.MCPAttachmentEvidenceToolsListObserved, len(result.Tools), "")
+	})
+	hooks.AddAfterCallTool(func(ctx context.Context, _ any, _ *mcp.CallToolRequest, _ *mcp.CallToolResult) {
+		s.observeMCPConnection(mcpConnectionID(ctx), streams.MCPAttachmentEvidenceToolCallObserved, 0, "")
+	})
+	hooks.AddOnError(func(ctx context.Context, _ any, _ mcp.MCPMethod, _ any, err error) {
+		s.observeMCPConnection(mcpConnectionID(ctx), streams.MCPAttachmentEvidenceExplicitError, 0, err.Error())
+	})
+	hooks.AddOnUnregisterSession(func(_ context.Context, session server.ClientSession) {
+		s.unregisterMCPConnection(session.SessionID())
+	})
 	s.registerTools()
 	s.running = true
 	return s
+}
+
+// SetAttachmentReporter routes safe MCP observations to the instance's
+// existing agent update stream. It accepts a concrete callback to keep the MCP
+// package independent of process-manager implementation details.
+func (s *Server) SetAttachmentReporter(reporter func(streams.MCPAttachmentEvidence)) {
+	s.attachmentMu.Lock()
+	defer s.attachmentMu.Unlock()
+	s.attachmentReporter = reporter
+}
+
+// SetAttachmentAttempt selects the backend-owned attempt to which subsequent
+// MCP endpoint observations belong. It is called only by the local agentctl
+// API before handing configuration to an agent adapter.
+func (s *Server) SetAttachmentAttempt(attempt streams.MCPAttachmentAttempt) {
+	s.attachmentMu.Lock()
+	defer s.attachmentMu.Unlock()
+	s.attachmentAttempt = attempt
+}
+
+func (s *Server) observeMCPConnection(connectionID string, kind streams.MCPAttachmentEvidenceKind, toolCount int, summary string) {
+	s.attachmentMu.RLock()
+	attempt, ok := s.attachmentAttempts[connectionID]
+	reporter := s.attachmentReporter
+	s.attachmentMu.RUnlock()
+	if !ok || reporter == nil || attempt.AttemptID == "" {
+		return
+	}
+	s.reportMCPConnection(reporter, attempt, connectionID, kind, toolCount, summary)
+}
+
+func (s *Server) registerMCPConnection(connectionID string) {
+	s.attachmentMu.Lock()
+	attempt := s.attachmentAttempt
+	reporter := s.attachmentReporter
+	if connectionID != "" && attempt.AttemptID != "" {
+		s.attachmentAttempts[connectionID] = attempt
+	}
+	s.attachmentMu.Unlock()
+	if reporter == nil || attempt.AttemptID == "" {
+		return
+	}
+	s.reportMCPConnection(reporter, attempt, connectionID, streams.MCPAttachmentEvidenceSessionAccepted, 0, "")
+}
+
+func (s *Server) unregisterMCPConnection(connectionID string) {
+	s.attachmentMu.Lock()
+	attempt, ok := s.attachmentAttempts[connectionID]
+	reporter := s.attachmentReporter
+	delete(s.attachmentAttempts, connectionID)
+	s.attachmentMu.Unlock()
+	if !ok || reporter == nil || attempt.AttemptID == "" {
+		return
+	}
+	s.reportMCPConnection(reporter, attempt, connectionID, streams.MCPAttachmentEvidenceConnectionClosed, 0, "")
+}
+
+func (s *Server) reportMCPConnection(
+	reporter func(streams.MCPAttachmentEvidence),
+	attempt streams.MCPAttachmentAttempt,
+	connectionID string,
+	kind streams.MCPAttachmentEvidenceKind,
+	toolCount int,
+	summary string,
+) {
+	reporter(streams.MCPAttachmentEvidence{
+		AttemptID:    attempt.AttemptID,
+		ServerName:   "kandev",
+		Kind:         kind,
+		OccurredAt:   time.Now().UTC(),
+		Source:       streams.MCPServerSourceKandev,
+		ConnectionID: opaqueMCPConnectionID(connectionID),
+		ToolCount:    toolCount,
+		Summary:      streams.SanitizeMCPErrorSummary(summary),
+	})
+}
+
+func mcpConnectionID(ctx context.Context) string {
+	session := server.ClientSessionFromContext(ctx)
+	if session == nil {
+		return ""
+	}
+	return session.SessionID()
+}
+
+func opaqueMCPConnectionID(connectionID string) string {
+	if connectionID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(connectionID))
+	return fmt.Sprintf("mcp-%x", sum[:8])
 }
 
 // RegisterRoutes adds MCP routes to the gin router at the root.
@@ -362,7 +480,7 @@ func (s *Server) registerTools() {
 		// a sibling to message_task_kandev) but NOT the task-document
 		// tools — those are office coordination plumbing.
 		s.registerKanbanTools()
-		count += 15
+		count += 17
 		if !s.disableAskQuestion {
 			s.registerInteractionTools()
 			count++
@@ -532,6 +650,25 @@ If the child has no live execution, the call succeeds idempotently with status="
 			mcp.WithArray("message_types", mcp.Description("Optional message type filters (e.g. message, tool_call, error)"), mcp.Items(map[string]any{"type": "string"})),
 		),
 		s.wrapHandler("get_task_conversation_kandev", s.getTaskConversationHandler()),
+	)
+	s.mcpServer.AddTool(
+		mcp.NewToolWithRawSchema("get_task_pr_automation_kandev",
+			"Get the current task's GitHub PR automation settings, including lifecycle notification switches.",
+			json.RawMessage(`{"type":"object","properties":{}}`),
+		),
+		s.wrapHandler("get_task_pr_automation_kandev", s.getTaskPRAutomationHandler()),
+	)
+	s.mcpServer.AddTool(
+		mcp.NewTool("update_task_pr_automation_kandev",
+			mcp.WithDescription("Update this task's PR automation options (auto-fix, auto-merge, and lifecycle notifications)."),
+			mcp.WithBoolean("auto_fix_enabled", mcp.Description("Enable or disable auto-fix when CI checks fail")),
+			mcp.WithBoolean("auto_merge_enabled", mcp.Description("Enable or disable auto-merge when PR passes all checks")),
+			mcp.WithString("auto_fix_prompt_override", mcp.Description("Custom prompt for auto-fix (empty string clears the override)")),
+			mcp.WithBoolean("prompt_on_review_requested", mcp.Description("Prompt this task's agent when a review is requested for the authenticated user")),
+			mcp.WithBoolean("prompt_on_merged", mcp.Description("Prompt this task's agent once when the linked PR becomes merged")),
+			mcp.WithBoolean("prompt_on_closed", mcp.Description("Prompt this task's agent once when the linked PR becomes closed without merge")),
+		),
+		s.wrapHandler("update_task_pr_automation_kandev", s.updateTaskPRAutomationHandler()),
 	)
 }
 

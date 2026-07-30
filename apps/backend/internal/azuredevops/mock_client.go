@@ -90,8 +90,23 @@ func (c *MockClient) GetBoardSnapshot(_ context.Context, _, _, boardID string) (
 		return nil, fmt.Errorf("azure devops mock board %q not found", boardID)
 	}
 	result := snapshot
-	result.Items = append([]BoardWorkItem(nil), snapshot.Items...)
+	result.Items = make([]BoardWorkItem, len(snapshot.Items))
+	for index, item := range snapshot.Items {
+		result.Items[index] = cloneMockBoardWorkItem(item)
+	}
 	return &result, nil
+}
+
+func cloneMockBoardWorkItem(item BoardWorkItem) BoardWorkItem {
+	clone := item
+	clone.Tags = append([]string(nil), item.Tags...)
+	if item.Fields != nil {
+		clone.Fields = make(map[string]any, len(item.Fields))
+		for key, value := range item.Fields {
+			clone.Fields[key] = value
+		}
+	}
+	return clone
 }
 
 func (c *MockClient) UpdateBoardWorkItem(_ context.Context, _, _, boardID string, id int, request BoardWorkItemUpdateRequest) (*BoardWorkItem, error) {
@@ -133,7 +148,7 @@ func (c *MockClient) UpdateBoardWorkItem(_ context.Context, _, _, boardID string
 				break
 			}
 		}
-		copy := *item
+		copy := cloneMockBoardWorkItem(*item)
 		return &copy, nil
 	}
 	return nil, mockNotFound("work item", id)
