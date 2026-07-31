@@ -60,7 +60,7 @@ func TestExecutePromptWithMCPIncludesRuntimeEnv(t *testing.T) {
 	}
 	require.NoError(t, reg.Register(ia))
 
-	var receivedEnv map[string]string
+	receivedEnv := make(chan map[string]string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/health":
@@ -72,7 +72,7 @@ func TestExecutePromptWithMCPIncludesRuntimeEnv(t *testing.T) {
 				} `json:"inference_config"`
 			}
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-			receivedEnv = request.InferenceConfig.Env
+			receivedEnv <- request.InferenceConfig.Env
 			w.Header().Set("Content-Type", "application/json")
 			require.NoError(t, json.NewEncoder(w).Encode(agentctlutil.PromptResponse{
 				Success:  true,
@@ -82,7 +82,7 @@ func TestExecutePromptWithMCPIncludesRuntimeEnv(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 	host, port := serverHostPort(t, server)
 
 	mgr := NewManager(reg, host, port, nil, log)
@@ -94,7 +94,7 @@ func TestExecutePromptWithMCPIncludesRuntimeEnv(t *testing.T) {
 
 	_, err := mgr.ExecutePromptWithMCP(context.Background(), ia.id, "", "", "test", nil)
 	require.NoError(t, err)
-	require.Equal(t, "1", receivedEnv[envKey])
+	require.Equal(t, "1", (<-receivedEnv)[envKey])
 }
 
 func TestRefreshWithCommandUsesOverrideAndPreservesCacheOnAuthFailure(t *testing.T) {
