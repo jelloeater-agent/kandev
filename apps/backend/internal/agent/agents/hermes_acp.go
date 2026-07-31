@@ -99,13 +99,10 @@ func (a *HermesACP) Runtime() *RuntimeConfig {
 		Protocol:       agent.ProtocolACP,
 		UserSkillDir:   ".hermes/skills",
 		SessionConfig: SessionConfig{
-			// ACP sessions bind the editor cwd to the Hermes task ID, so
-			// file/terminal tools stay pinned to the session's original
-			// workspace; start a fresh session when the workspace rebinds.
-			NewSessionOnWorkspaceRebind: true,
-			NativeSessionResume:         true,
-			CanRecover:                  &canRecover,
-			SessionDirTemplate:          "{home}/.hermes",
+			NativeSessionResume: true,
+			CanRecover:          &canRecover,
+			SessionDirTemplate:  "{home}/.hermes",
+			SessionDirTarget:    "/root/.hermes",
 		},
 	}
 }

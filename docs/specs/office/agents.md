@@ -312,7 +312,6 @@ Each agent type defines `ProjectSkillDir` in its `RuntimeConfig`:
 |---|---|
 | `claude-acp` (Claude Code) | `.claude/skills` |
 | `grok-acp` (Grok) | `.grok/skills` |
-| `hermes-acp` (Hermes) | `.hermes/skills` |
 | `codex-acp`, `opencode-acp`, `gemini`, `copilot-acp`, `auggie`, `amp-acp` | `.agents/skills` |
 
 Default (if unset): `.agents/skills`. Skills are written to `<worktree>/<ProjectSkillDir>/kandev-<slug>/SKILL.md`. The `kandev-` prefix distinguishes injected skills from team-committed skills already in the repo.
@@ -324,7 +323,6 @@ Before writing skills, all existing `kandev-*` directories in the target path ar
 ```
 .claude/skills/kandev-*
 .grok/skills/kandev-*
-.hermes/skills/kandev-*
 .agents/skills/kandev-*
 ```
 

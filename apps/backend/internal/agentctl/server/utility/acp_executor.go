@@ -790,6 +790,7 @@ var allowedProbeCommands = map[string]string{
 	"cursor-agent":  "cursor-agent",
 	"devin":         "devin",
 	"grok":          "grok",
+	"hermes":        "hermes",
 	"kimi":          "kimi",
 	"kiro-cli-chat": "kiro-cli-chat",
 	"mock-agent":    "mock-agent",

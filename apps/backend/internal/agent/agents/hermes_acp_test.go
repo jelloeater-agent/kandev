@@ -168,14 +168,17 @@ func TestHermesACP_SessionAndSkills(t *testing.T) {
 	if !sc.NativeSessionResume {
 		t.Error("NativeSessionResume = false, want true")
 	}
-	if !sc.NewSessionOnWorkspaceRebind {
-		t.Error("NewSessionOnWorkspaceRebind = false, want true (sessions pin cwd)")
+	if sc.NewSessionOnWorkspaceRebind {
+		t.Error("NewSessionOnWorkspaceRebind = true, want false (Hermes reloads sessions with the new cwd)")
 	}
 	if sc.CanRecover == nil || !*sc.CanRecover {
 		t.Error("CanRecover must be true")
 	}
 	if sc.SessionDirTemplate != "{home}/.hermes" {
 		t.Errorf("SessionDirTemplate = %q, want {home}/.hermes", sc.SessionDirTemplate)
+	}
+	if sc.SessionDirTarget != "/root/.hermes" {
+		t.Errorf("SessionDirTarget = %q, want /root/.hermes", sc.SessionDirTarget)
 	}
 }
 

@@ -32,7 +32,6 @@ func TestProjectSkillDir_AllAgentTypes(t *testing.T) {
 		NewOmpACP(),
 		NewDevinACP(),
 		NewGrokACP(),
-		NewHermesACP(),
 		NewMockAgent(),
 	}
 
@@ -103,7 +102,6 @@ func TestUserSkillDir_KnownProviders(t *testing.T) {
 		{"opencode", NewOpenCodeACP(), ".config/opencode/skills"},
 		{"copilot", NewCopilotACP(), ".copilot/skills"},
 		{"grok", NewGrokACP(), ".grok/skills"},
-		{"hermes", NewHermesACP(), ".hermes/skills"},
 		{"mock-agent", NewMockAgent(), ".mock-agent/skills"},
 	}
 	for _, tt := range tests {
