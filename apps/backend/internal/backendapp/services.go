@@ -12,11 +12,15 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/kandev/kandev/internal/agent/agents"
 	"github.com/kandev/kandev/internal/agent/discovery"
 	"github.com/kandev/kandev/internal/agent/hostutility"
 	"github.com/kandev/kandev/internal/agent/managedruntime"
 	"github.com/kandev/kandev/internal/agent/registry"
+	agentruntime "github.com/kandev/kandev/internal/agent/runtime"
+	dynamicruntime "github.com/kandev/kandev/internal/agent/runtime/dynamic"
 	agentsettingscontroller "github.com/kandev/kandev/internal/agent/settings/controller"
+	agentsettingsmodels "github.com/kandev/kandev/internal/agent/settings/models"
 	analyticsservice "github.com/kandev/kandev/internal/analytics/service"
 	"github.com/kandev/kandev/internal/automation"
 	"github.com/kandev/kandev/internal/azuredevops"
@@ -36,8 +40,10 @@ import (
 	"github.com/kandev/kandev/internal/repoclone"
 	"github.com/kandev/kandev/internal/secrets"
 	"github.com/kandev/kandev/internal/sentry"
+	"github.com/kandev/kandev/internal/steptelemetry"
 	systemsettings "github.com/kandev/kandev/internal/system/settings"
 	taskmodels "github.com/kandev/kandev/internal/task/models"
+	"github.com/kandev/kandev/internal/task/repository/repoerrors"
 	taskservice "github.com/kandev/kandev/internal/task/service"
 	"github.com/kandev/kandev/internal/task/share"
 	userservice "github.com/kandev/kandev/internal/user/service"
@@ -68,6 +74,7 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 	}
 	userSecretStore := secrets.NewUserVisibleStore(repos.Secrets)
 	agentSettingsController := agentsettingscontroller.NewController(repos.AgentSettings, discoveryRegistry, agentRegistry, repos.Task, log)
+	agentSettingsController.SetDynamicAgentRoutingEnabled(cfg.Features.DynamicAgentRouting)
 	agentSettingsController.SetSecretStore(userSecretStore)
 	managedRuntimeSettings, err := systemsettings.NewStore(dbPool)
 	if err != nil {
@@ -81,10 +88,41 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 	promptSvc := promptservice.NewService(repos.Prompts)
 	utilitySvc := utilityservice.NewService(repos.Utility)
 	utilitySvc.SetProfileResolver(profilebinding.New(repos.AgentSettings, func(agentID string) bool {
+		if agentID == agents.DynamicAgentID {
+			return cfg.Features.DynamicAgentRouting
+		}
 		_, ok := agentRegistry.GetInferenceAgent(agentID)
 		return ok
 	}))
+	dynamicCircuits := dynamicruntime.NewCircuitRegistry(
+		dynamicruntime.WithCircuitPersistence(repos.Task),
+	)
+	if err := dynamicCircuits.Restore(context.Background()); err != nil {
+		return nil, nil, fmt.Errorf("restore dynamic routing health: %w", err)
+	}
+	dynamicEngine := dynamicruntime.NewEngine(
+		dynamicruntime.WithPersistence(repos.Task),
+		dynamicruntime.WithStateLoader(repos.Task),
+		dynamicruntime.WithCircuitRegistry(dynamicCircuits),
+	)
+	dynamicBindingResolver, err := dynamicruntime.NewPersistentCredentialBindingResolver(
+		context.Background(), repos.Task,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("initialize dynamic routing installation key: %w", err)
+	}
+	dynamicResolver := agentruntime.NewProfileExecutionResolver(
+		repos.AgentSettings,
+		dynamicEngine,
+		cfg.Features.DynamicAgentRouting,
+	)
+	dynamicResolver.SetCredentialBindingResolver(dynamicBindingResolver)
+	utilitySvc.SetExecutionProfileResolver(dynamicResolver)
 	workflowSvc := workflowservice.NewService(repos.Workflow, log)
+	pendingActionProjectionEpoch, err := repos.Task.NextPendingActionProjectionEpoch(context.Background())
+	if err != nil {
+		return nil, nil, fmt.Errorf("allocate pending-action projection epoch: %w", err)
+	}
 	taskSvc := taskservice.NewService(
 		taskservice.Repos{
 			Workspaces:        repos.Task,
@@ -98,6 +136,8 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 			Sessions:          repos.Task,
 			GitSnapshots:      repos.Task,
 			RepoEntities:      repos.Task,
+			RepositorySets:    repos.Task,
+			BranchPolicies:    repos.Task,
 			RepositoryCleanup: repos.Task,
 			Executors:         repos.Task,
 			Environments:      repos.Task,
@@ -105,7 +145,9 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 			Reviews:           repos.Task,
 			ResourceCleanups:  repos.Task,
 			StatusSummaries:   repos.Task,
+			TaskActivity:      repos.Task,
 			SubagentContexts:  repos.Task,
+			Usage:             repos.Task,
 		},
 		eventBus,
 		log,
@@ -115,6 +157,7 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 			TaskWorktreeRoots: []string{filepath.Join(cfg.ResolvedHomeDir(), "tasks")},
 		},
 	)
+	taskSvc.SetPendingActionProjectionEpoch(pendingActionProjectionEpoch)
 	taskSvc.SetSecretStore(userSecretStore)
 	if deleter, ok := userSecretStore.(taskservice.WorkspaceSecretDeleter); ok {
 		taskSvc.SetWorkspaceSecretDeleter(deleter)
@@ -134,6 +177,14 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 	// Session history is owned by workflow service, but access is owned by the
 	// task service. Keep the authorization check at the service boundary.
 	workflowSvc.SetSessionAccessChecker(taskSvc.AuthorizeSessionAccess)
+	// Same split for the rest of the workflow-step surface: the workflow
+	// package owns steps, templates and export/import, but a workflow's owner
+	// is its workspace's owner, which only the task service can resolve.
+	workflowSvc.SetWorkflowAccessChecker(taskSvc.AuthorizeWorkflowAccess)
+	workflowSvc.SetWorkspaceAccessChecker(taskSvc.AuthorizeWorkspaceAccess)
+	// A step's queue_run action names the task it starts work on, so the
+	// step-write API accepts task IDs as well.
+	workflowSvc.SetTaskAccessChecker(taskSvc.AuthorizeTaskAccess)
 
 	// Wire the ADR 0015 audit-trail writer for manual step transitions.
 	// workflowSvc.CreateStepTransition already matches
@@ -148,12 +199,13 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 	// Wire agent profile resolver/matcher for workflow export/import
 	workflowSvc.SetAgentProfileFuncs(
 		buildAgentProfileResolver(repos),
-		buildAgentProfileMatcher(repos),
+		buildAgentProfileMatcher(repos, log),
 	)
 
 	githubSvc := initGitHubService(cfg, dbPool, eventBus, repos.Secrets, log)
 	if githubSvc != nil {
 		taskSvc.SetTaskStatusSummaryPRReader(&githubTaskStatusSummaryPRReader{gh: githubSvc})
+		githubSvc.SetComparisonTargetObserver(taskSvc)
 		githubSvc.SetPromptResolver(promptSvc)
 		taskSvc.SetContributionDestinationPreparer(&githubContributionDestinationPreparer{service: githubSvc, taskSvc: taskSvc})
 		if brokerErr := githubSvc.ConfigureCredentialBroker(&githubBrokerScopeAuthorizer{repo: repos.Task, provider: githubSvc}); brokerErr != nil {
@@ -163,6 +215,7 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 	gitlabSvc, gitlabCleanup := initGitLabService(dbPool, eventBus, repos.Secrets, log)
 	if gitlabSvc != nil {
 		gitlabSvc.SetPromptResolver(promptSvc)
+		gitlabSvc.SetComparisonTargetObserver(taskSvc)
 	}
 	azureDevOpsSvc := initAzureDevOpsService(dbPool, eventBus, repos.Secrets, log)
 	if azureDevOpsSvc != nil {
@@ -180,16 +233,23 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 		// caller; without it the check stays a no-op. An un-stamped local
 		// build passes "dev", which the service treats as "don't enforce".
 		pluginsSvc.SetKandevVersion(version)
-		pluginsSvc.SetDataSources(taskSvc, taskSvc, workflowSvc, agentSettingsController, analyticsservice.New(repos.Analytics), taskSvc, pluginsTaskWriterAdapter{svc: taskSvc})
+		pluginsSvc.SetDataSources(taskSvc, taskSvc, workflowSvc, agentSettingsController, analyticsservice.New(repos.Analytics), taskSvc, taskSvc, pluginsTaskWriterAdapter{svc: taskSvc})
+		// Separate from SetDataSources: githubSvc is optional (nil when github
+		// is unconfigured), and a nil source leaves tasks with no PullRequests
+		// rather than failing every task read.
+		if githubSvc != nil {
+			pluginsSvc.SetTaskPRSource(githubSvc)
+		}
+		taskSvc.SetRepositorySelectionResolver(pluginRepositorySelectionResolver{inspector: pluginsSvc})
 	}
-	gitCredentialBroker := newGitCredentialBroker(githubSvc, pluginsSvc, repos.Task)
+	gitCredentialBroker := newGitCredentialBroker(githubSvc, pluginsSvc, repos.Task, cfg.GitHubCredentialBroker.ReissueSigningKey)
 	if pluginsSvc != nil {
 		pluginsSvc.SetGitCredentialLeaseRevoker(gitCredentialBroker.RevokeProvider)
 	}
 	if githubSvc != nil {
 		githubSvc.SetCredentialBroker(github.NewCredentialBrokerFromBroker(gitCredentialBroker))
 	}
-	shareHTTP := initShareHandlers(dbPool, repos.Task, githubSvc, log, version)
+	shareHTTP := initShareHandlers(dbPool, repos.Task, taskSvc, githubSvc, log, version)
 
 	// Plumb code-host branch listing into the task service so provider-backed
 	// ("Remote") repos serve branches from their owning provider rather than relying
@@ -221,7 +281,9 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 		automationComponents.Service.SetWorkspaceAuthorizer(taskSvc.AuthorizeWorkspaceAccess)
 		// A UI filter is not an authorization boundary: reject a workflow owned
 		// by another workspace even when a request names it directly.
-		automationComponents.Service.SetWorkflowLocator(&automationWorkflowLocatorAdapter{svc: taskSvc})
+		automationWorkflowLocator := &automationWorkflowLocatorAdapter{svc: taskSvc, workflows: workflowSvc}
+		automationComponents.Service.SetWorkflowLocator(automationWorkflowLocator)
+		automationComponents.Service.SetWorkflowStepLocator(automationWorkflowLocator)
 		automationComponents.Service.SetTaskOriginLookup(&automationTaskOriginLookupAdapter{svc: taskSvc, log: log})
 		// Profile deletion disables the automations bound to a profile before
 		// the row goes, but nothing ever checked that the binding pointed at a
@@ -229,10 +291,22 @@ func provideServices(cfg *config.Config, log *logger.Logger, repos *Repositories
 		// that never existed produced the same orphan without any delete
 		// involved.
 		automationComponents.Service.SetAgentProfileLookup(&automationAgentProfileLookupAdapter{store: repos.AgentSettings})
+		// YAML export descriptor resolution (AC-29): each Set* below is
+		// satisfied directly by an existing repository's Tx-accepting method,
+		// so the export's single read transaction can pass straight through
+		// without an adapter shim.
+		automationComponents.Service.SetExportAgentProfileLookup(repos.AgentSettings)
+		automationComponents.Service.SetExportExecutorProfileLookup(repos.Task)
+		automationComponents.Service.SetExportWorkflowLookup(repos.Task)
+		automationComponents.Service.SetExportWorkflowStepLookup(repos.Workflow)
+		automationComponents.Service.SetExportRepositoryLookup(repos.Task)
+		automationComponents.Service.SetExportWorkspaceLookup(&automationExportWorkspaceLookupAdapter{svc: taskSvc})
 	}
 
 	services := &Services{
 		ManagedRuntimeSelections: managedRuntimeSelections,
+		DynamicProfileResolver:   dynamicResolver,
+		DynamicBindingResolver:   dynamicBindingResolver,
 		Task:                     taskSvc,
 		User:                     userSvc,
 		Editor:                   editorSvc,
@@ -389,11 +463,11 @@ func isCanonicalKandevRepositoryInput(
 	repository *taskmodels.Repository,
 ) bool {
 	if repository != nil {
-		return repository.Provider == "github" &&
+		return repository.Provider == gitCredentialGitHubProviderID &&
 			isPublicGitHubProviderHost(repository.ProviderHost) &&
 			repository.ProviderOwner == canonicalKandevOwner && repository.ProviderName == canonicalKandevName
 	}
-	return input != nil && input.Provider == "github" &&
+	return input != nil && input.Provider == gitCredentialGitHubProviderID &&
 		isPublicGitHubProviderHost(input.ProviderHost) &&
 		input.ProviderOwner == canonicalKandevOwner && input.ProviderName == canonicalKandevName
 }
@@ -712,6 +786,15 @@ func (a *startStepResolverAdapter) ResolveFirstStep(ctx context.Context, workflo
 	return step.ID, nil
 }
 
+// ResolveAutoStartStep implements taskservice.StartStepResolver.
+func (a *startStepResolverAdapter) ResolveAutoStartStep(ctx context.Context, workflowID string) (string, error) {
+	step, err := a.svc.ResolveAutoStartStep(ctx, workflowID)
+	if err != nil {
+		return "", err
+	}
+	return step.ID, nil
+}
+
 // githubSecretAdapter adapts secrets.SecretStore to github.SecretProvider and github.SecretManager.
 type githubSecretAdapter struct {
 	store secrets.SecretStore
@@ -973,12 +1056,13 @@ func initSentryService(dbPool *db.Pool, eventBus bus.EventBus, secretsStore secr
 func initShareHandlers(
 	dbPool *db.Pool,
 	taskRepo share.TaskReader,
+	authorizer share.TaskAccessAuthorizer,
 	githubSvc *github.Service,
 	log *logger.Logger,
 	version string,
 ) *share.HTTPHandlers {
 	h, _, err := share.Provide(
-		dbPool.Writer(), dbPool.Reader(), taskRepo, githubSvc, log,
+		dbPool.Writer(), dbPool.Reader(), taskRepo, authorizer, githubSvc, log,
 		share.Config{KandevVersion: version},
 	)
 	if err != nil {
@@ -1072,6 +1156,8 @@ type pluginTaskWriteService interface {
 	CreateTask(ctx context.Context, req *taskservice.CreateTaskRequest) (taskservice.CreateTaskResult, error)
 	UpdateTask(ctx context.Context, id string, req *taskservice.UpdateTaskRequest) (*taskmodels.Task, error)
 	DeleteTask(ctx context.Context, id string) error
+	GetTask(ctx context.Context, id string) (*taskmodels.Task, error)
+	MoveTaskWithOptions(ctx context.Context, id, workflowID, workflowStepID string, position int, opts taskservice.MoveTaskOptions) (*taskservice.MoveTaskResult, error)
 }
 
 type pluginsTaskWriterAdapter struct {
@@ -1097,6 +1183,7 @@ func (a pluginsTaskWriterAdapter) CreateTask(ctx context.Context, in plugins.Tas
 		Metadata:       metadata,
 		Repositories:   repositories,
 		PlanMode:       in.PlanMode,
+		StartAgent:     in.StartAgent,
 	})
 	if err != nil {
 		return nil, err
@@ -1204,10 +1291,20 @@ func firstPluginPRNumber(values ...*int64) int {
 }
 
 func (a pluginsTaskWriterAdapter) UpdateTask(ctx context.Context, in plugins.TaskUpdateInput) (*taskmodels.Task, error) {
+	// workflow_step_id is rejected on this path regardless of value (including
+	// a present but empty string) — Update never calls publishTaskMovedEvent,
+	// so writing the column directly would move the card without firing
+	// on_enter actions like auto-start. Use Move instead, which routes through
+	// MoveTaskWithOptions. Checked before the state validation below so a
+	// request that also carries an invalid state is still named as a
+	// rejected move, not a state error.
+	if in.WorkflowStepID != nil {
+		return nil, status.Error(codes.InvalidArgument,
+			"workflow_step_id cannot be set via UpdateTask: use MoveTask to transition a task between workflow steps")
+	}
 	req := &taskservice.UpdateTaskRequest{
-		Title:          in.Title,
-		Description:    in.Description,
-		WorkflowStepID: in.WorkflowStepID,
+		Title:       in.Title,
+		Description: in.Description,
 	}
 	if in.State != nil {
 		// v1.TaskState is a string type, so the cast can't fail — validate the
@@ -1221,6 +1318,131 @@ func (a pluginsTaskWriterAdapter) UpdateTask(ctx context.Context, in plugins.Tas
 		req.State = &state
 	}
 	return a.svc.UpdateTask(ctx, in.ID, req)
+}
+
+func (a pluginsTaskWriterAdapter) MoveTask(ctx context.Context, in plugins.TaskMoveInput) (*plugins.TaskMoveResult, error) {
+	workflowID, err := a.resolvePluginMoveWorkflowID(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := taskservice.MoveTaskOptions{
+		StepHistoryTrigger: wfmodels.StepTransitionTriggerPluginMove,
+		StepHistoryActor:   wfmodels.StepTransitionActorSystem,
+	}
+	if in.WorkflowID == nil {
+		// workflowID above was inherited from a separate GetTask pre-read
+		// (resolvePluginMoveWorkflowID), not named explicitly by the plugin.
+		// Guard against a concurrent reassignment landing between that read
+		// and the write below: MoveTaskWithOptions re-checks this against the
+		// task's WorkflowID from its own fresh GetTask and fails the move
+		// instead of silently reverting the concurrent change.
+		opts.ExpectedWorkflowID = &workflowID
+	}
+
+	// Attach attribution before calling MoveTaskWithOptions: that method only
+	// falls back to its own default attribution when none is already present
+	// on the context (steptelemetry.HasTrigger), so setting it here — exactly
+	// like BulkMoveTasks does — survives untouched into the recorded ledger row.
+	ctx = steptelemetry.WithAttribution(ctx, steptelemetry.Attribution{
+		Trigger:   steptelemetry.TriggerPluginMove,
+		ActorKind: steptelemetry.ActorIntegration,
+		ActorID:   in.Source,
+	})
+
+	result, err := a.svc.MoveTaskWithOptions(ctx, in.TaskID, workflowID, in.WorkflowStepID, int(in.Position), opts)
+	if err != nil {
+		return nil, classifyPluginMoveError(err)
+	}
+	return &plugins.TaskMoveResult{
+		Task:         result.Task,
+		Transitioned: result.Transitioned,
+		FromStepID:   result.FromStepID,
+	}, nil
+}
+
+// resolvePluginMoveWorkflowID resolves the effective workflow id for a plugin
+// move: an explicit WorkflowID is used as-is; a nil WorkflowID inherits the
+// task's current workflow, requiring a lookup MoveTaskWithOptions doesn't do
+// on its own (it takes a plain workflow id with no "inherit current" case).
+//
+// A task with no current workflow resolves to "", passed through rather than
+// rejected here (AC-005.11 still ends in InvalidArgument, just not from this
+// function) — the binding precedence ladder requires the task's own state
+// (archived/active-session, AC-001.7/001.8) to be checked before its
+// destination (AC-001.6/005.11) is judged. Those state checks live inside
+// MoveTaskWithOptions' validateTaskMove, called after this function returns,
+// so failing fast here on an empty workflow id would answer InvalidArgument
+// for an archived task instead of FailedPrecondition. Passing "" through
+// instead lets validateTaskMove's GetWorkflow("") fail naturally — after the
+// state gates — with a "workflow not found" error classifyPluginMoveError
+// already maps to InvalidArgument.
+func (a pluginsTaskWriterAdapter) resolvePluginMoveWorkflowID(ctx context.Context, in plugins.TaskMoveInput) (string, error) {
+	if in.WorkflowID != nil {
+		return *in.WorkflowID, nil
+	}
+	task, err := a.svc.GetTask(ctx, in.TaskID)
+	if err != nil {
+		if errors.Is(err, repoerrors.ErrTaskNotFound) {
+			// classifyPluginMoveError's fixed "task not found" message, not a
+			// %q-interpolated one: MoveTask returns this error directly to the
+			// plugin without routing it through that classifier (see the
+			// caller), so building the status here has to match its no-leaked-
+			// identifiers convention itself rather than relying on a wrapper
+			// that never runs for this branch.
+			return "", classifyPluginMoveError(err)
+		}
+		// Do not forward repository or driver details across the plugin gRPC
+		// boundary. The classifier preserves cancellation codes and maps every
+		// other unexpected lookup failure to a fixed Internal status.
+		return "", classifyPluginMoveError(err)
+	}
+	return task.WorkflowID, nil
+}
+
+// classifyPluginMoveError maps MoveTaskWithOptions' bare validation errors to
+// the plugin MoveTask RPC's binding error-mapping table. It intentionally does
+// NOT reuse mcp/handlers.classifyMoveTaskError: that classifier lowercases and
+// buckets archived/active-session/different-workspace/step-not-in-workflow
+// into a single Conflict code, but this table requires FailedPrecondition for
+// the first two and InvalidArgument for the latter two.
+//
+// Every branch returns a fixed, generic message rather than the underlying
+// err.Error() text: validateTaskMove's messages are meant for trusted
+// board/MCP callers and can name internal identifiers, so forwarding them
+// verbatim to a plugin (an external, less-trusted caller) over the gRPC
+// status would leak implementation detail the plugin has no legitimate need
+// for. This mirrors classifyMoveTaskError's own fixed-message convention.
+func classifyPluginMoveError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return status.Error(codes.Canceled, "move task canceled")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.DeadlineExceeded, "move task deadline exceeded")
+	}
+	if errors.Is(err, repoerrors.ErrTaskNotFound) {
+		return status.Error(codes.NotFound, "task not found")
+	}
+	if errors.Is(err, taskservice.ErrWorkflowResolutionConflict) {
+		return status.Error(codes.Aborted, "task workflow changed concurrently, retry the move")
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "archived tasks cannot be moved"):
+		return status.Error(codes.FailedPrecondition, "task is archived and cannot be moved")
+	case strings.Contains(msg, "task has an active session"):
+		return status.Error(codes.FailedPrecondition, "task has an active session and cannot be moved")
+	case strings.Contains(msg, "workflow not found"),
+		strings.Contains(msg, "workflow step not found"),
+		strings.Contains(msg, "target workflow is in a different workspace"),
+		strings.Contains(msg, "target workflow step does not belong to target workflow"):
+		return status.Error(codes.InvalidArgument, "invalid move_task request: unknown or mismatched workflow, step, or workspace")
+	default:
+		return status.Error(codes.Internal, "failed to move task")
+	}
 }
 
 // validPluginTaskState reports whether state is a state a plugin may set via
@@ -1296,26 +1518,93 @@ func buildAgentProfileResolver(repos *Repositories) wfmodels.AgentProfileResolve
 	}
 }
 
-// buildAgentProfileMatcher creates a matcher that finds profiles by agent name, model, and mode for import.
-func buildAgentProfileMatcher(repos *Repositories) wfmodels.AgentProfileMatcher {
-	return func(agentName, model, mode string) string {
-		agents, err := repos.AgentSettings.ListAgents(context.Background())
-		if err != nil {
-			return ""
+// agentProfileStillMatches reports whether the profile with id still has the
+// exact (agent_display_name, model, mode) triple, ignoring Enabled and
+// WorkspaceID - those only gate candidate *selection*, not a binding that
+// already exists.
+func agentProfileStillMatches(repos *Repositories, id, agentName, model, mode string) bool {
+	p, err := repos.AgentSettings.GetAgentProfile(context.Background(), id)
+	if err != nil || p == nil {
+		return false
+	}
+	return p.AgentDisplayName == agentName && p.Model == model && p.Mode == mode
+}
+
+// buildAgentProfileMatcher creates a matcher that finds profiles by agent
+// name, model, and mode for import.
+//
+// The (agent_display_name, model, mode) triple is not unique: duplicating a
+// profile through the UI produces a byte-identical triple for the copy.
+// Candidates are filtered to enabled, global (non-workspace-scoped) profiles,
+// and ties are broken by oldest CreatedAt (then ID for a total order). Oldest
+// wins so that duplicating a profile can never steal an existing synced
+// workflow step's binding - a copy is always newer than its source.
+//
+// currentID, when non-empty, is checked first: if that profile still has the
+// exact descriptor, it's kept as-is without re-running candidate selection -
+// even when it's disabled or workspace-scoped. Reconciliation must not treat
+// "profile got disabled" as "profile needs a new binding" (profile-disable.md
+// promises existing bindings survive disabling); candidate selection only
+// applies when picking a profile for new work.
+func buildAgentProfileMatcher(repos *Repositories, log *logger.Logger) wfmodels.AgentProfileMatcher {
+	return func(agentName, model, mode, currentID string) string {
+		if currentID != "" && agentProfileStillMatches(repos, currentID, agentName, model, mode) {
+			return currentID
 		}
-		for _, agent := range agents {
-			profiles, pErr := repos.AgentSettings.ListAgentProfiles(context.Background(), agent.ID)
-			if pErr != nil {
-				continue
-			}
-			for _, p := range profiles {
-				if p.AgentDisplayName == agentName && p.Model == model && p.Mode == mode {
-					return p.ID
-				}
-			}
-		}
+		return selectAgentProfileCandidate(repos, log, agentName, model, mode)
+	}
+}
+
+// selectAgentProfileCandidate scans enabled, global profiles for an exact
+// (agent_display_name, model, mode) match and returns the oldest one (see
+// buildAgentProfileMatcher), logging when the triple was ambiguous.
+func selectAgentProfileCandidate(repos *Repositories, log *logger.Logger, agentName, model, mode string) string {
+	agents, err := repos.AgentSettings.ListAgents(context.Background())
+	if err != nil {
 		return ""
 	}
+	var best *agentsettingsmodels.AgentProfile
+	matches := 0
+	for _, agent := range agents {
+		profiles, pErr := repos.AgentSettings.ListAgentProfiles(context.Background(), agent.ID)
+		if pErr != nil {
+			continue
+		}
+		for _, p := range profiles {
+			if p.AgentDisplayName != agentName || p.Model != model || p.Mode != mode {
+				continue
+			}
+			if !p.Enabled || p.WorkspaceID != "" {
+				continue
+			}
+			matches++
+			if best == nil || isOlderAgentProfileMatch(p, best) {
+				best = p
+			}
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	if matches > 1 {
+		log.Debug("agent profile matcher: multiple candidates for workflow step sync",
+			zap.String("agent_display_name", agentName),
+			zap.String("model", model),
+			zap.String("mode", mode),
+			zap.Int("candidates", matches),
+			zap.String("selected_profile_id", best.ID))
+	}
+	return best.ID
+}
+
+// isOlderAgentProfileMatch reports whether candidate should replace current
+// as the matcher's selection: earlier CreatedAt wins, ties broken by ID so
+// the result is stable across repeated calls.
+func isOlderAgentProfileMatch(candidate, current *agentsettingsmodels.AgentProfile) bool {
+	if !candidate.CreatedAt.Equal(current.CreatedAt) {
+		return candidate.CreatedAt.Before(current.CreatedAt)
+	}
+	return candidate.ID < current.ID
 }
 
 // codeHostBranchListerAdapter routes first-party GitHub repositories directly

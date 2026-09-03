@@ -1,11 +1,12 @@
 "use client";
 
 import Link from "@/components/routing/app-link";
-import { IconAlertTriangle, IconRefresh } from "@tabler/icons-react";
+import { IconAlertTriangle, IconInfoCircle, IconRefresh } from "@tabler/icons-react";
 import { Alert, AlertDescription, AlertTitle } from "@kandev/ui/alert";
 import { Button } from "@kandev/ui/button";
 import { useTranslation } from "react-i18next";
 import { t } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
 
 // EnsureSessionErrorInfo wraps a parsed ensure error so UI can offer a targeted action for the missing-agent-profile case.
 export type EnsureSessionErrorInfo = {
@@ -16,6 +17,7 @@ export type EnsureSessionErrorInfo = {
 };
 
 // Matches the backend's exact validation message in task_http_handlers.go / task_ws_handlers.go.
+// i18n-exempt: matches the backend's exact validation message. See the comment above.
 const AGENT_PROFILE_MISSING_HINT = "agent_profile_id is required";
 
 export function describeEnsureError(
@@ -46,19 +48,40 @@ export function describeEnsureError(
   };
 }
 
+type RecoveryAction = {
+  label: string;
+  onClick: () => void;
+  testId: string;
+  disabled?: boolean;
+};
+
 type BannerProps = {
   error: Error | null;
   onRetry: () => void;
   workspaceId?: string | null;
+  action?: RecoveryAction;
+  secondaryAction?: RecoveryAction;
+  retryDisabled?: boolean;
+  testId?: string;
+  compact?: boolean;
 };
 
 /** Slim banner for the task page, rendered above the layout. */
-export function EnsureSessionErrorBanner({ error, onRetry, workspaceId }: BannerProps) {
+export function EnsureSessionErrorBanner({
+  error,
+  onRetry,
+  workspaceId,
+  action,
+  secondaryAction,
+  retryDisabled,
+  testId = "ensure-session-error-banner",
+  compact = false,
+}: BannerProps) {
   const { t } = useTranslation();
   const info = describeEnsureError(error, workspaceId);
   if (!info) return null;
   return (
-    <div className="px-3 pt-2" data-testid="ensure-session-error-banner">
+    <div className={cn(!compact && "px-3 pt-2")} data-testid={testId}>
       <Alert variant="destructive">
         <IconAlertTriangle />
         <AlertTitle>{info.title}</AlertTitle>
@@ -74,11 +97,36 @@ export function EnsureSessionErrorBanner({ error, onRetry, workspaceId }: Banner
                 {info.action.label}
               </Link>
             ) : null}
+            {action ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="min-h-11 cursor-pointer px-2 text-xs"
+                onClick={action.onClick}
+                disabled={action.disabled}
+                data-testid={action.testId}
+              >
+                {action.label}
+              </Button>
+            ) : null}
+            {secondaryAction ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="min-h-11 cursor-pointer px-2 text-xs"
+                onClick={secondaryAction.onClick}
+                disabled={secondaryAction.disabled}
+                data-testid={secondaryAction.testId}
+              >
+                {secondaryAction.label}
+              </Button>
+            ) : null}
             <Button
               variant="outline"
               size="sm"
-              className="h-6 cursor-pointer px-2 text-xs"
+              className="min-h-11 cursor-pointer px-2 text-xs"
               onClick={onRetry}
+              disabled={retryDisabled}
               data-testid="ensure-session-error-retry"
             >
               <IconRefresh className="size-3" />
@@ -91,8 +139,61 @@ export function EnsureSessionErrorBanner({ error, onRetry, workspaceId }: Banner
   );
 }
 
+/** Non-blocking result notice used when the workspace remains available read-only. */
+export function SessionRecoveryNotice({ message }: { message: string }) {
+  return (
+    <div className="px-3 pt-2" data-testid="session-recovery-notice">
+      <Alert>
+        <IconInfoCircle />
+        <AlertDescription>{message}</AlertDescription>
+      </Alert>
+    </div>
+  );
+}
+
+/** Shared inline rendering for automatic resume failures and read-only notices. */
+export function SessionRecoveryFeedback({
+  error,
+  notice,
+  onRetry,
+  workspaceId,
+  action,
+  secondaryAction,
+  retryDisabled,
+  testId = "session-recovery-error",
+}: {
+  error: string | null;
+  notice: string | null;
+  onRetry: () => void;
+  workspaceId?: string | null;
+  action?: RecoveryAction;
+  secondaryAction?: RecoveryAction;
+  retryDisabled?: boolean;
+  testId?: string;
+}) {
+  return (
+    <>
+      <EnsureSessionErrorBanner
+        error={error ? new Error(error) : null}
+        onRetry={onRetry}
+        workspaceId={workspaceId}
+        action={action}
+        secondaryAction={secondaryAction}
+        retryDisabled={retryDisabled}
+        testId={testId}
+      />
+      {notice ? <SessionRecoveryNotice message={notice} /> : null}
+    </>
+  );
+}
+
 /** Full-panel centered state for the kanban preview's empty-sessions slot. */
-export function EnsureSessionErrorEmptyState({ error, onRetry, workspaceId }: BannerProps) {
+export function EnsureSessionErrorEmptyState({
+  error,
+  onRetry,
+  workspaceId,
+  retryDisabled,
+}: BannerProps) {
   const { t } = useTranslation();
   const info = describeEnsureError(error, workspaceId);
   if (!info) return null;
@@ -118,6 +219,7 @@ export function EnsureSessionErrorEmptyState({ error, onRetry, workspaceId }: Ba
           size="sm"
           className="cursor-pointer"
           onClick={onRetry}
+          disabled={retryDisabled}
           data-testid="ensure-session-error-retry"
         >
           {t("task:retry")}

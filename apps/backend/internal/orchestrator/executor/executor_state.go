@@ -214,15 +214,16 @@ func (e *Executor) applyProfile(ctx context.Context, profileID string, cfg *exec
 	if policyJSON := strings.TrimSpace(profile.McpPolicy); policyJSON != "" {
 		metadata["executor_mcp_policy"] = policyJSON
 	}
-	applyProfileConfigToMetadata(profile.Config, metadata)
+	applyProfileConfigToMetadata(cfg.ExecutorType, profile.Config, metadata)
 }
 
 // Profile.Config / metadata keys shared with executor_credentials.go.
 // Hoisted to constants so the table below doesn't duplicate string
 // literals that exist elsewhere in the package.
 const (
-	profileKeyRemoteCredentials = "remote_credentials"
-	profileKeyRemoteAuthSecrets = "remote_auth_secrets"
+	profileKeyRemoteCredentials  = "remote_credentials"
+	profileKeyRemoteAuthSecrets  = "remote_auth_secrets"
+	profileKeyAgentConfigBundles = "agent_config_bundles"
 )
 
 // profileConfigPassthroughKeys are profile.Config keys copied verbatim
@@ -232,6 +233,7 @@ var profileConfigPassthroughKeys = []string{
 	"sprites_network_policy_rules",
 	profileKeyRemoteCredentials,
 	profileKeyRemoteAuthSecrets,
+	profileKeyAgentConfigBundles,
 	"remote_auth_target_home",
 	"git_user_name",
 	"git_user_email",
@@ -255,12 +257,29 @@ var profileConfigRenameKeys = map[string]string{
 var profileConfigAuthoritativeKeys = []string{
 	lifecycle.MetadataKeySSHWorkdirRoot,
 	lifecycle.MetadataKeySSHShell,
+	// Reclaiming the remote task directory is destructive and irreversible.
+	// A task that could supply ssh_reclaim_task_dir in its own metadata
+	// would be arming a deletion on a host its profile never opted in, so
+	// the profile value wins unconditionally — including when it is empty,
+	// which the reader treats as disabled.
+	lifecycle.MetadataKeySSHReclaimTaskDir,
+}
+
+var kubernetesProfileConfigAuthoritativeKeys = []string{
+	lifecycle.MetadataKeyKubernetesProfilePlatform,
+	lifecycle.MetadataKeyKubernetesProfileMainContainer,
+	lifecycle.MetadataKeyKubernetesPodTemplateYAML,
+	lifecycle.MetadataKeyKubernetesWorkspaceMode,
+	lifecycle.MetadataKeyKubernetesWorkspaceSize,
+	lifecycle.MetadataKeyKubernetesWorkspaceStorageClass,
+	lifecycle.MetadataKeyKubernetesWorkspaceAccessModes,
+	lifecycle.MetadataKeyKubernetesWorkspaceClaimName,
 }
 
 // applyProfileConfigToMetadata projects profile.Config keys into the
 // launch metadata. Pulled out so the policy (passthrough vs rename vs
 // authoritative) is declarative and testable in isolation.
-func applyProfileConfigToMetadata(profileConfig map[string]string, metadata map[string]interface{}) {
+func applyProfileConfigToMetadata(executorType string, profileConfig map[string]string, metadata map[string]interface{}) {
 	for _, k := range profileConfigPassthroughKeys {
 		if v := profileConfig[k]; v != "" {
 			metadata[k] = v
@@ -276,6 +295,13 @@ func applyProfileConfigToMetadata(profileConfig map[string]string, metadata map[
 		// task-supplied value in metadata. The reader-side fall-through
 		// to a default handles the empty case.
 		metadata[k] = profileConfig[k]
+	}
+	if models.ExecutorType(executorType) == models.ExecutorTypeKubernetes {
+		for _, k := range kubernetesProfileConfigAuthoritativeKeys {
+			// Kubernetes profile config is admin-owned launch policy. Empty
+			// mode-inapplicable values must also clear task metadata.
+			metadata[k] = profileConfig[k]
+		}
 	}
 }
 

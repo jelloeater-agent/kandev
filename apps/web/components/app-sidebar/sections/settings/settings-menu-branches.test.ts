@@ -14,6 +14,7 @@ import {
 
 const WORKSPACE_ID = "ws-1";
 const WORKSPACES_HREF = "/settings/workspaces";
+const EXECUTORS_HREF = "/settings/executors";
 const WORKSPACES = [{ id: WORKSPACE_ID, name: "Main Workspace" }];
 const ORDERED_WORKSPACES = [
   { id: "ws-first", name: "First" },
@@ -48,6 +49,10 @@ function hrefsOf(nodes: readonly SettingsMenuNode[]): Array<string | null> {
 /** The Integrations tab among a workspace node's children. */
 function integrationsTabOf(tabs: readonly SettingsMenuNode[]): SettingsMenuNode | undefined {
   return tabs.find((node) => node.href?.endsWith("/integrations"));
+}
+
+function integrationSlugsOf(tabs: readonly SettingsMenuNode[]): Array<string | undefined> {
+  return (integrationsTabOf(tabs)?.children ?? []).map((node) => node.integrationSlug);
 }
 
 describe("buildWorkspacesBranch", () => {
@@ -87,7 +92,7 @@ describe("buildWorkspacesBranch", () => {
   it("appends registered provider integrations using the native workspace route", () => {
     const IntegrationIcon = () => null;
     const [workspace] = buildWorkspacesBranch(WORKSPACES, null, undefined, [
-      { id: "bitbucket", label: "Bitbucket", icon: IntegrationIcon },
+      { id: "bitbucket", pluginId: "plugin-bitbucket", label: "Bitbucket", icon: IntegrationIcon },
     ]);
     const integration = integrationsTabOf(workspace.children ?? [])?.children?.find(
       (node) => node.key === `workspace:${WORKSPACE_ID}:integrations:bitbucket`,
@@ -98,6 +103,37 @@ describe("buildWorkspacesBranch", () => {
       label: { text: "Bitbucket" },
       icon: IntegrationIcon,
     });
+  });
+
+  it("filters plugin integrations per workspace and keeps unknown state visible", () => {
+    const IntegrationIcon = () => null;
+    const workspaces = [
+      { id: "workspace-disabled", name: "Disabled" },
+      { id: "workspace-enabled", name: "Enabled" },
+      { id: "workspace-unknown", name: "Unknown" },
+    ];
+    const enabledByWorkspace: Record<string, boolean | undefined> = {
+      "workspace-disabled": false,
+      "workspace-enabled": true,
+    };
+    const [disabled, enabled, unknown] = buildWorkspacesBranch(
+      workspaces,
+      null,
+      undefined,
+      [
+        {
+          id: "bitbucket",
+          pluginId: "plugin-bitbucket",
+          label: "Bitbucket",
+          icon: IntegrationIcon,
+        },
+      ],
+      (_integrationId, workspaceId) => enabledByWorkspace[workspaceId],
+    );
+
+    expect(integrationSlugsOf(disabled.children ?? [])).not.toContain("bitbucket");
+    expect(integrationSlugsOf(enabled.children ?? [])).toContain("bitbucket");
+    expect(integrationSlugsOf(unknown.children ?? [])).toContain("bitbucket");
   });
 
   it("gives every tab and every integration its own mark", () => {
@@ -291,6 +327,34 @@ describe("buildExecutorsBranch", () => {
       "/settings/executor/exec-1/profile/exec-profile-1",
     ]);
   });
+
+  it("makes a configured Kubernetes executor disclosure-only and links its profile root", () => {
+    const [executor] = buildExecutorsBranch([
+      {
+        id: "cluster/primary",
+        name: "Kubernetes",
+        type: "k8s",
+        profiles: [{ id: "profile/primary", name: "Primary" }],
+      },
+    ]);
+
+    expect(executor.href).toBeNull();
+    expect(hrefsOf(executor.children ?? [])).toEqual(["/settings/executors/profile%2Fprimary"]);
+  });
+
+  it("keeps the Kubernetes connection route reachable for an executor without profiles", () => {
+    const [executor] = buildExecutorsBranch([
+      {
+        id: "cluster/primary",
+        name: "Kubernetes",
+        type: "k8s",
+        profiles: [],
+      },
+    ]);
+
+    expect(executor.href).toBe("/settings/executors/k8s/cluster%2Fprimary");
+    expect(executor.children).toEqual([]);
+  });
 });
 
 describe("findActiveNodePath", () => {
@@ -343,6 +407,32 @@ describe("findActiveNodePath", () => {
     ]);
   });
 
+  it("reaches a Kubernetes profile through its disclosure-only executor", () => {
+    const kubernetesForest = [
+      buildBranchRoot(
+        {
+          href: EXECUTORS_HREF,
+          labelKey: "common:executors",
+          activePrefixes: ["/settings/executors/", "/settings/executor/"],
+        },
+        buildExecutorsBranch([
+          {
+            id: "cluster-primary",
+            name: "Kubernetes",
+            type: "k8s",
+            profiles: [{ id: "profile-primary", name: "Primary" }],
+          },
+        ]),
+      ),
+    ];
+
+    expect(findActiveNodePath(kubernetesForest, `${EXECUTORS_HREF}/profile-primary`)).toEqual([
+      settingsMenuRowKey(EXECUTORS_HREF),
+      "executor:cluster-primary",
+      "executor:cluster-primary:profile:profile-primary",
+    ]);
+  });
+
   it("stops at the row when the route has no node — the row stays active", () => {
     // The install catalogue is not an agent, and the flat profile spelling has
     // no executor to nest under. Both are the row's own pages.
@@ -350,7 +440,7 @@ describe("findActiveNodePath", () => {
       settingsMenuRowKey("/settings/agents"),
     ]);
     expect(findActiveNodePath(forest, "/settings/executors/exec-profile-1")).toEqual([
-      settingsMenuRowKey("/settings/executors"),
+      settingsMenuRowKey(EXECUTORS_HREF),
     ]);
   });
 
@@ -358,7 +448,7 @@ describe("findActiveNodePath", () => {
     // `/settings/executor/<id>` is not under `/settings/executors`, but the
     // Executors row owns it — and so must its branch.
     expect(findActiveNodePath(forest, "/settings/executor/exec-1")).toEqual([
-      settingsMenuRowKey("/settings/executors"),
+      settingsMenuRowKey(EXECUTORS_HREF),
       "executor:exec-1",
     ]);
   });

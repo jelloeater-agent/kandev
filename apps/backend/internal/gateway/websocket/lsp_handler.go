@@ -69,11 +69,15 @@ var lspUpgrader = gorillaws.Upgrader{
 }
 
 // NewLSPHandler creates a new LSPHandler.
-func NewLSPHandler(lifecycleMgr *lifecycle.Manager, userService LSPUserService, log *logger.Logger) *LSPHandler {
+func NewLSPHandler(lifecycleMgr *lifecycle.Manager, userService LSPUserService, log *logger.Logger, configuredMax ...int) *LSPHandler {
+	capacity := newLSPCapacityLimiterFromEnv()
+	if len(configuredMax) > 0 {
+		capacity = newLSPCapacityLimiter(configuredMax[0])
+	}
 	return &LSPHandler{
 		lifecycleMgr: lifecycleMgr,
 		userService:  userService,
-		capacity:     newLSPCapacityLimiterFromEnv(),
+		capacity:     capacity,
 		logger:       log.WithFields(zap.String("component", "lsp_handler")),
 	}
 }
@@ -123,14 +127,16 @@ func (h *LSPHandler) HandleLSPConnection(c *gin.Context) {
 		return
 	}
 	defer h.capacity.Release()
-	agentctlClient := execution.GetAgentCtlClient()
+	agentctlClient, releaseClient := execution.AcquireAgentCtlClient()
 	if agentctlClient == nil {
+		releaseClient()
 		h.logger.Warn("LSP: execution has no agentctl client", zap.String("session_id", sessionID))
 		h.closeWithCode(c, lspCloseSessionNotFound, "agentctl unavailable")
 		return
 	}
 	browserConn, upgradeErr := lspUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if upgradeErr != nil {
+		releaseClient()
 		h.logger.Error("LSP: failed to upgrade to WebSocket",
 			zap.String("session_id", sessionID),
 			zap.Error(upgradeErr))
@@ -140,6 +146,7 @@ func (h *LSPHandler) HandleLSPConnection(c *gin.Context) {
 
 	autoInstall := h.shouldAutoInstall(c.Request.Context(), language)
 	upstreamConn, resp, dialErr := agentctlClient.DialLSP(c.Request.Context(), language, autoInstall)
+	releaseClient()
 	if dialErr != nil {
 		status := 0
 		if resp != nil {

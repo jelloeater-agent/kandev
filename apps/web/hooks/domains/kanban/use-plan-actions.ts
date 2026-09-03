@@ -5,6 +5,7 @@ import { useToast } from "@/components/toast-provider";
 import { getWebSocketClient } from "@/lib/ws/connection";
 import { setChatDraftContent } from "@/lib/local-storage";
 import { moveTask } from "@/lib/api/domains/kanban-api";
+import { getTaskMoveErrorDetail } from "@/components/task/task-move-error-message";
 import { useContextFilesStore } from "@/lib/state/context-files-store";
 import { useLayoutStore } from "@/lib/state/layout-store";
 import { useDockviewStore } from "@/lib/state/dockview-store";
@@ -85,7 +86,16 @@ export function useNextWorkflowStep(taskId: string | null) {
       return true;
     } catch (err) {
       console.error("Failed to proceed to next step:", err);
-      toast({ description: t("task:failedToProceedToNextStep"), variant: "error" });
+      // The backend refuses some transitions (an active session, a WIP limit)
+      // and says why in the response. Reporting only the headline left the user
+      // on a phone with no way to see the reason short of devtools.
+      const title = t("task:failedToProceedToNextStep");
+      const detail = getTaskMoveErrorDetail(err, title, t);
+      toast({
+        title,
+        ...(detail !== null && { description: detail }),
+        variant: "error",
+      });
       setMoveFromSessionId(null);
       return false;
     }
@@ -96,6 +106,7 @@ export function useNextWorkflowStep(taskId: string | null) {
   return { proceedStepName, nextStepIsWorkStep, proceed, isMoving };
 }
 
+// i18n-exempt: system block sent verbatim to the agent.
 const IMPLEMENT_PLAN_SYSTEM_BLOCK = `<kandev-system>
 IMPLEMENT PLAN: The user has approved the plan and wants you to implement it now.
 Read the current plan using the get_task_plan_kandev MCP tool.
@@ -104,6 +115,7 @@ After completing the implementation, provide a summary of what was done.
 </kandev-system>`;
 
 export function buildImplementPlanContent(userText: string): string {
+  // i18n-exempt: becomes the message content sent to the agent and stored in the transcript.
   const visibleText = userText.trim() || "Implement the plan";
   return `${visibleText}\n\n${IMPLEMENT_PLAN_SYSTEM_BLOCK}`;
 }

@@ -7,6 +7,10 @@ import { WORKSPACE_INTEGRATIONS } from "@/lib/settings-discovery/catalog/integra
 import { WORKSPACES_SETTINGS_HREF } from "@/lib/settings-discovery/catalog/workspaces";
 import { INTEGRATION_ICONS } from "@/lib/settings/integration-icons";
 import {
+  executorConnectionSettingsPath,
+  executorProfileSettingsPath,
+} from "@/lib/settings/executor-settings-routes";
+import {
   WORKSPACE_SETTINGS_TABS,
   workspaceSettingsHref,
 } from "@/lib/settings/workspace-settings-tabs";
@@ -75,11 +79,12 @@ export type SettingsMenuNode = {
    */
   badge?: "active" | "disabled" | "not-installed";
   /**
-   * An integration row, by catalog slug. Whether it is connected is not known
-   * here — it takes a network probe — so the node names the integration and the
-   * renderer resolves the badge.
+   * An integration row, by a catalog slug or a plugin registration id. Whether
+   * it is connected is not known here — it takes a network probe or a plugin
+   * state lookup — so the node names the integration and the renderer resolves
+   * the badge.
    */
-  integrationSlug?: IntegrationSlug;
+  integrationSlug?: IntegrationSlug | string;
   /**
    * Set on the Integrations row: its children need one shared probe of this
    * workspace, run only while the branch is open.
@@ -100,6 +105,7 @@ export type SettingsMenuNode = {
 export type BranchWorkspace = { id: string; name: string };
 export type BranchIntegrationContribution = {
   id: string;
+  pluginId: string;
   label: string;
   icon: ComponentType<{ className?: string }>;
 };
@@ -160,6 +166,7 @@ function integrationNodes(
   integrationsHref: string,
   visibleSlugs?: ReadonlySet<IntegrationSlug>,
   contributions: ReadonlyArray<BranchIntegrationContribution> = [],
+  pluginEnabled?: (integrationId: string, workspaceId: string) => boolean | undefined,
 ): SettingsMenuNode[] {
   // Configured status gates the badge only, never the row itself — the branch
   // always lists every integration regardless of credentials, so the filter
@@ -174,12 +181,15 @@ function integrationNodes(
     icon: INTEGRATION_ICONS[slug],
     integrationSlug: slug,
   }));
-  const registered = contributions.map(({ id, label, icon }) => ({
-    key: `workspace:${workspaceId}:integrations:${id}`,
-    href: `${integrationsHref}/${id}`,
-    label: { text: label } as const,
-    icon,
-  }));
+  const registered = contributions
+    .filter(({ id }) => pluginEnabled?.(id, workspaceId) !== false)
+    .map(({ id, label, icon }) => ({
+      key: `workspace:${workspaceId}:integrations:${id}`,
+      href: `${integrationsHref}/${id}`,
+      label: { text: label } as const,
+      icon,
+      integrationSlug: id,
+    }));
   return [...builtIns, ...registered];
 }
 
@@ -204,6 +214,7 @@ export function buildWorkspacesBranch(
    */
   visibleIntegrationSlugsFor?: (workspaceId: string) => ReadonlySet<IntegrationSlug> | undefined,
   integrationContributions: ReadonlyArray<BranchIntegrationContribution> = [],
+  pluginIntegrationEnabled?: (integrationId: string, workspaceId: string) => boolean | undefined,
 ): SettingsMenuNode[] {
   return orderWorkspacesForDisplay(workspaces, activeWorkspaceId).map((workspace) => {
     const integrationsHref = workspaceSettingsHref(workspace.id, "integrations");
@@ -231,6 +242,7 @@ export function buildWorkspacesBranch(
                   integrationsHref,
                   visibleIntegrationSlugsFor?.(workspace.id),
                   integrationContributions,
+                  pluginIntegrationEnabled,
                 ),
                 integrationsWorkspaceId: workspace.id,
               }
@@ -299,25 +311,28 @@ export function buildAgentsBranch(
 /**
  * One node per executor, holding its profiles.
  *
- * Uses the executor-scoped spellings (`/settings/executor/<id>` and
- * `/settings/executor/<id>/profile/<id>`) rather than the flat
- * `/settings/executors/<profileId>` the Executors page links to. Both are live
- * routes for the same profile, but only the scoped pair has an executor
- * breadcrumb — so it is the one whose crumb chain matches the branch the user
- * clicked through.
+ * Most executors use the scoped legacy spellings so their executor breadcrumb
+ * matches the branch. A configured Kubernetes executor only discloses its
+ * profile children: connection, diagnostics, sessions and workload settings
+ * all live on that profile page. Its standalone connection route remains
+ * reachable only when there is no profile to recover through.
  */
 export function buildExecutorsBranch(executors: ReadonlyArray<BranchExecutor>): SettingsMenuNode[] {
   return executors.map((executor) => {
-    const executorHref = `/settings/executor/${encodeURIComponent(executor.id)}`;
+    const profiles = executor.profiles ?? [];
+    const executorHref =
+      executor.type === "k8s" && profiles.length > 0
+        ? null
+        : executorConnectionSettingsPath(executor);
     return {
       key: `executor:${executor.id}`,
       href: executorHref,
       label: { text: executor.name },
       icon: getExecutorIcon(executor.type),
       // Same split as agents: the executor ships with kandev, the profiles do not.
-      children: (executor.profiles ?? []).map((profile) => ({
+      children: profiles.map((profile) => ({
         key: `executor:${executor.id}:profile:${profile.id}`,
-        href: `${executorHref}/profile/${profile.id}`,
+        href: executorProfileSettingsPath(executor, profile.id),
         label: { text: profile.name },
         isUserRecord: true,
       })),
@@ -328,7 +343,8 @@ export function buildExecutorsBranch(executors: ReadonlyArray<BranchExecutor>): 
 /** True when `pathname` is this node's page or lives underneath it. */
 function nodeOwns(node: SettingsMenuNode, pathname: string): boolean {
   if (node.href && (pathname === node.href || pathname.startsWith(`${node.href}/`))) return true;
-  return (node.ownsPrefixes ?? []).some((prefix) => pathname.startsWith(prefix));
+  if ((node.ownsPrefixes ?? []).some((prefix) => pathname.startsWith(prefix))) return true;
+  return (node.children ?? []).some((child) => nodeOwns(child, pathname));
 }
 
 /**

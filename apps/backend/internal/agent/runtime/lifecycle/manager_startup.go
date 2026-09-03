@@ -12,7 +12,6 @@ import (
 
 	"github.com/kandev/kandev/internal/agent/agents"
 	"github.com/kandev/kandev/internal/agent/runtime/activity"
-	agentctl "github.com/kandev/kandev/internal/agent/runtime/agentctl"
 	"github.com/kandev/kandev/internal/common/appctx"
 	"github.com/kandev/kandev/internal/events"
 	"github.com/kandev/kandev/internal/task/models"
@@ -84,7 +83,21 @@ func (m *Manager) routePassthrough(ctx context.Context, execution *AgentExecutio
 // StartAgentProcess configures and starts the agent subprocess for an execution.
 // This must be called after Launch() to actually start the agent (e.g., auggie, codex).
 // The command is built internally based on the execution's agent profile.
-func (m *Manager) StartAgentProcess(ctx context.Context, executionID string) (retErr error) {
+func (m *Manager) StartAgentProcess(ctx context.Context, executionID string) error {
+	execution, exists := m.executionStore.Get(executionID)
+	if !exists {
+		return fmt.Errorf("execution %q not found", executionID)
+	}
+	if execution.SessionID == "" {
+		return m.startAgentProcess(ctx, executionID)
+	}
+	_, err := m.doCoalescedExecution(ctx, execution.SessionID, func(sharedCtx context.Context) (interface{}, error) {
+		return nil, m.startAgentProcess(sharedCtx, executionID)
+	})
+	return err
+}
+
+func (m *Manager) startAgentProcess(ctx context.Context, executionID string) (retErr error) {
 	execution, exists := m.executionStore.Get(executionID)
 	if !exists {
 		return fmt.Errorf("execution %q not found", executionID)
@@ -123,8 +136,10 @@ func (m *Manager) StartAgentProcess(ctx context.Context, executionID string) (re
 	if isPassthrough {
 		return m.startPassthroughExecution(operationCtx, execution, profileInfo)
 	}
-
-	if execution.agentctl == nil {
+	execution.beginStartupAttempt()
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	releaseClient()
+	if client == nil {
 		return fmt.Errorf("execution %q has no agentctl client", executionID)
 	}
 
@@ -138,7 +153,13 @@ func (m *Manager) StartAgentProcess(ctx context.Context, executionID string) (re
 	}
 
 	// Wait for agentctl to be ready
-	if err := execution.agentctl.WaitForReady(operationCtx, 60*time.Second); err != nil {
+	client, releaseClient = execution.AcquireAgentCtlClient()
+	if client == nil {
+		return fmt.Errorf("execution %q has no agentctl client", executionID)
+	}
+	err = client.WaitForReady(operationCtx, 60*time.Second)
+	releaseClient()
+	if err != nil {
 		m.updateExecutionError(executionID, "agentctl not ready: "+err.Error())
 		return fmt.Errorf("agentctl not ready: %w", err)
 	}
@@ -181,11 +202,16 @@ func (m *Manager) StartAgentProcess(ctx context.Context, executionID string) (re
 			zap.String("command", bootCommand))
 	}
 
-	return m.initializeAgentSession(operationCtx, execution, bootCommand, agentDisplayName, taskDescription)
+	return m.initializeAgentSession(operationCtx, execution, bootCommand, agentDisplayName, taskDescription, approvalPolicy)
 }
 
 func (m *Manager) preflightRemoteContributionPushes(ctx context.Context, execution *AgentExecution) error {
-	if execution == nil || execution.agentctl == nil {
+	if execution == nil {
+		return nil
+	}
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if client == nil {
 		return nil
 	}
 	bindings, err := remoteContributionsFromMetadata(execution.MetadataSnapshot())
@@ -201,7 +227,7 @@ func (m *Manager) preflightRemoteContributionPushes(ctx context.Context, executi
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		result, err := execution.agentctl.GitPushPreflight(ctx, key)
+		result, err := client.GitPushPreflight(ctx, key)
 		if err != nil {
 			return fmt.Errorf("repository %q: %w", key, err)
 		}
@@ -217,7 +243,7 @@ func (m *Manager) preflightRemoteContributionPushes(ctx context.Context, executi
 }
 
 // pollAgentStderr polls the agent's stderr buffer every 2 seconds and updates the boot message.
-func (m *Manager) pollAgentStderr(execution *AgentExecution, client *agentctl.Client, msg *models.Message, stopCh chan struct{}) {
+func (m *Manager) pollAgentStderr(execution *AgentExecution, msg *models.Message, stopCh chan struct{}) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -230,7 +256,13 @@ func (m *Manager) pollAgentStderr(execution *AgentExecution, client *agentctl.Cl
 		case <-ticker.C:
 			baseCtx := execution.SessionTraceContext()
 			ctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
+			client, releaseClient := execution.AcquireAgentCtlClient()
+			if client == nil {
+				cancel()
+				continue
+			}
 			lines, err := client.GetAgentStderr(ctx)
+			releaseClient()
 			cancel()
 			if err != nil {
 				m.logger.Debug("failed to poll agent stderr", zap.Error(err))
@@ -253,7 +285,7 @@ func (m *Manager) pollAgentStderr(execution *AgentExecution, client *agentctl.Cl
 }
 
 // finalizeBootMessage stops the polling goroutine and updates the boot message with final status.
-func (m *Manager) finalizeBootMessage(execution *AgentExecution, msg *models.Message, stopCh chan struct{}, client *agentctl.Client, status string) {
+func (m *Manager) finalizeBootMessage(execution *AgentExecution, msg *models.Message, stopCh chan struct{}, status string) {
 	if msg == nil || m.bootMessageService == nil {
 		return
 	}
@@ -264,10 +296,16 @@ func (m *Manager) finalizeBootMessage(execution *AgentExecution, msg *models.Mes
 	}
 
 	// Final stderr fetch
-	if client != nil && execution != nil {
+	if execution != nil {
 		baseCtx := execution.SessionTraceContext()
 		ctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
-		lines, err := client.GetAgentStderr(ctx)
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		var lines []string
+		var err error
+		if client != nil {
+			lines, err = client.GetAgentStderr(ctx)
+			releaseClient()
+		}
 		cancel()
 		if err == nil && len(lines) > 0 {
 			msg.Content = strings.Join(lines, "\n")
@@ -318,9 +356,13 @@ func (m *Manager) buildEnvForExecution(ctx context.Context, executionID string, 
 	}
 
 	if profileInfo != nil {
-		m.mergeAgentProfileEnvFromInfo(ctx, profileInfo, env)
+		if err := m.mergeAgentProfileEnvFromInfo(ctx, profileInfo, env); err != nil {
+			return nil, fmt.Errorf("resolve agent profile environment: %w", err)
+		}
 	} else {
-		m.mergeAgentProfileEnv(ctx, executionProfileID(req), env)
+		if err := m.mergeAgentProfileEnv(ctx, executionProfileID(req), env); err != nil {
+			return nil, fmt.Errorf("resolve agent profile environment: %w", err)
+		}
 	}
 
 	// Add standard variables for recovery after backend restart
@@ -405,11 +447,18 @@ func (m *Manager) waitForAgentctlReady(execution *AgentExecution) {
 	ctx, cancel := appctx.Detached(context.Background(), m.stopCh, 60*time.Second)
 	defer cancel()
 
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	if client == nil {
+		m.updateExecutionError(execution.ID, "agentctl client is unavailable")
+		return
+	}
 	m.logger.Debug("waiting for agentctl to be ready",
 		zap.String("execution_id", execution.ID),
-		zap.String("url", execution.agentctl.BaseURL()))
+		zap.String("url", client.BaseURL()))
 
-	if err := execution.agentctl.WaitForReady(ctx, 60*time.Second); err != nil {
+	err := client.WaitForReady(ctx, 60*time.Second)
+	releaseClient()
+	if err != nil {
 		m.logger.Error("agentctl not ready",
 			zap.String("execution_id", execution.ID),
 			zap.Duration("duration", time.Since(opStart)),
@@ -441,7 +490,12 @@ func (m *Manager) waitForAgentctlReady(execution *AgentExecution) {
 	// agent starting on an already-prepared workspace, or by lazy recovery
 	// after a restart, would otherwise have none — and their branch diff stat
 	// would silently fall back to an integration branch.
-	m.pushTaskBaseBranches(ctx, execution.TaskID, execution.ID, execution.GetAgentCtlClient())
+	client, releaseClient = execution.AcquireAgentCtlClient()
+	if client != nil {
+		m.pushTaskBaseBranches(ctx, execution.TaskID, execution.ID, client)
+		m.pushTaskComparisonTargets(ctx, execution.TaskID, execution.ID, client)
+		releaseClient()
+	}
 	// Use the timeout context for event publishing instead of a fresh Background context
 	m.eventPublisher.PublishAgentctlEvent(ctx, events.AgentctlReady, execution, "")
 }

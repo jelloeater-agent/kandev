@@ -1,7 +1,26 @@
+import type { Page } from "@playwright/test";
 import { test, expect } from "../../fixtures/test-base";
 import { SETTINGS_TAKEOVER_TESTID, setSettingsMenuMode } from "../../helpers/settings-menu";
 
-// Covers docs/specs/integrations/enable-disable-toggle.md's nav-visibility
+function sidebarGitHubRow(testPage: Page) {
+  const sidebar = testPage.getByTestId("app-sidebar");
+  return sidebar.locator('a[href="/github"]:not([data-testid="integration-header-shortcut"])');
+}
+
+async function expandIntegrationsSection(testPage: Page) {
+  const sidebar = testPage.getByTestId("app-sidebar");
+  const integrationsToggle = sidebar.getByRole("button", {
+    name: "Integrations",
+    exact: true,
+  });
+  await expect(integrationsToggle).toHaveCount(1, { timeout: 10_000 });
+  if ((await integrationsToggle.getAttribute("aria-expanded")) !== "true") {
+    await integrationsToggle.click();
+  }
+  await expect(integrationsToggle).toHaveAttribute("aria-expanded", "true");
+}
+
+// Covers docs/specs/integrations/requirements/enable-disable-toggle.md's nav-visibility
 // scenarios: with "Hide disabled integrations from left panel navigation"
 // off (the default), a disabled-but-configured integration still shows in
 // the sidebar; turning the setting on hides it; turning it back off (or
@@ -10,6 +29,7 @@ test.describe("hide disabled integrations from left panel navigation", () => {
   test("off by default keeps a disabled integration visible; on hides it; re-enabling reveals it", async ({
     testPage,
     apiClient,
+    seedData,
   }) => {
     // Make GitHub configured/healthy so it is eligible to appear in the nav
     // regardless of its enabled state.
@@ -17,14 +37,19 @@ test.describe("hide disabled integrations from left panel navigation", () => {
     await apiClient.mockGitHubSetUser("test-user");
 
     await testPage.goto("/settings/integrations");
+    const hideDisabledSwitch = testPage.locator("#hide-disabled-integrations-in-nav");
+    if ((await hideDisabledSwitch.getAttribute("aria-checked")) === "true") {
+      await hideDisabledSwitch.click();
+    }
+    await expect(hideDisabledSwitch).toHaveAttribute("aria-checked", "false");
 
     const githubSwitch = testPage.locator("#github-enabled");
+    if ((await githubSwitch.getAttribute("aria-checked")) === "false") {
+      await githubSwitch.click();
+    }
     await expect(githubSwitch).toHaveAttribute("aria-checked", "true");
     await githubSwitch.click();
     await expect(githubSwitch).toHaveAttribute("aria-checked", "false");
-
-    const hideDisabledSwitch = testPage.locator("#hide-disabled-integrations-in-nav");
-    await expect(hideDisabledSwitch).toHaveAttribute("aria-checked", "false");
 
     await testPage
       .getByTestId("settings-floating-save")
@@ -35,7 +60,11 @@ test.describe("hide disabled integrations from left panel navigation", () => {
     // Leave Settings — the sidebar's Integrations section only renders
     // outside the Settings takeover.
     await testPage.goto("/tasks");
-    const githubNavLink = testPage.getByRole("link", { name: "GitHub", exact: true });
+    // The header also exposes an always-visible GitHub shortcut. Scope this
+    // assertion to the actual sidebar row so it tests the setting's contract
+    // instead of a separate shortcut surface.
+    await expandIntegrationsSection(testPage);
+    const githubNavLink = sidebarGitHubRow(testPage);
     await expect(githubNavLink).toBeVisible({ timeout: 10_000 });
 
     // The Settings left panel's per-workspace Integrations tree is also part
@@ -44,8 +73,10 @@ test.describe("hide disabled integrations from left panel navigation", () => {
     // The tree is opt-in — `flat`, the default menu mode, renders no branches
     // at all — so choose a tree mode before asserting on its rows.
     await setSettingsMenuMode(testPage, "accordion");
-    const { workspaces } = await apiClient.listWorkspaces();
-    const workspaceId = workspaces[0].id;
+    // The setting above is scoped to the worker's seeded workspace. Do not
+    // use the first workspace returned by the API: another test can create a
+    // workspace earlier in the worker, and its GitHub state is independent.
+    const workspaceId = seedData.workspaceId;
     const integrationsPath = `/settings/workspaces/${workspaceId}/integrations`;
     await testPage.goto(integrationsPath);
     const settingsTree = testPage.getByTestId(SETTINGS_TAKEOVER_TESTID);
@@ -71,7 +102,7 @@ test.describe("hide disabled integrations from left panel navigation", () => {
     await expect(testPage.getByTestId("settings-floating-save")).not.toBeVisible();
 
     await testPage.goto("/tasks");
-    await expect(testPage.getByRole("link", { name: "GitHub", exact: true })).not.toBeVisible();
+    await expect(sidebarGitHubRow(testPage)).toHaveCount(0);
 
     // The Settings left-panel Integrations tree hides it as well.
     await testPage.goto(integrationsPath);
@@ -89,8 +120,7 @@ test.describe("hide disabled integrations from left panel navigation", () => {
     await expect(testPage.getByTestId("settings-floating-save")).not.toBeVisible();
 
     await testPage.goto("/tasks");
-    await expect(testPage.getByRole("link", { name: "GitHub", exact: true })).toBeVisible({
-      timeout: 10_000,
-    });
+    await expandIntegrationsSection(testPage);
+    await expect(sidebarGitHubRow(testPage)).toBeVisible({ timeout: 10_000 });
   });
 });

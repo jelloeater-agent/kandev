@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,24 @@ import (
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 )
 
+type rejectingLaunchAttachmentClaimer struct {
+	wantErr     error
+	taskID      string
+	sessionID   string
+	attachments []v1.MessageAttachment
+}
+
+func (c *rejectingLaunchAttachmentClaimer) ClaimMessageAttachments(
+	_ context.Context,
+	taskID, sessionID string,
+	attachments []v1.MessageAttachment,
+) error {
+	c.taskID = taskID
+	c.sessionID = sessionID
+	c.attachments = attachments
+	return c.wantErr
+}
+
 func TestExecutionToLaunchResponseReportsAgentProfile(t *testing.T) {
 	response := executionToLaunchResponse("task-1", &executor.TaskExecution{
 		SessionID:        "session-1",
@@ -24,6 +43,26 @@ func TestExecutionToLaunchResponseReportsAgentProfile(t *testing.T) {
 	})
 	if got, want := response.AgentProfileID, "effective-profile"; got != want {
 		t.Fatalf("agent_profile_id = %v, want %v", got, want)
+	}
+}
+
+func TestExecutionToLaunchResponseHandlesNilExecution(t *testing.T) {
+	// A guarded automatic launch can return a successful no-op without an
+	// execution. The response helper is defensive for callers that use it
+	// directly or through another launch path.
+	response := executionToLaunchResponse("task-1", nil)
+	if response == nil {
+		t.Fatal("expected a response")
+		return
+	}
+	if !response.Success {
+		t.Fatal("expected a successful no-op response")
+	}
+	if response.TaskID != "task-1" {
+		t.Fatalf("task_id = %q, want task-1", response.TaskID)
+	}
+	if response.SessionID != "" {
+		t.Fatalf("session_id = %q, want empty", response.SessionID)
 	}
 }
 
@@ -132,6 +171,51 @@ func TestResolveIntent(t *testing.T) {
 				t.Errorf("ResolveIntent() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLaunchSession_RejectsAttachmentClaimBeforeStart(t *testing.T) {
+	wantErr := errors.New("attachment is not available")
+	claimer := &rejectingLaunchAttachmentClaimer{wantErr: wantErr}
+	service := &Service{}
+	service.SetLaunchAttachmentClaimer(claimer)
+
+	attachment := v1.MessageAttachment{AttachmentID: "attachment-1", Name: "notes.txt"}
+	_, err := service.LaunchSession(context.Background(), &LaunchSessionRequest{
+		TaskID:      "task-1",
+		SessionID:   "session-1",
+		Intent:      IntentStartCreated,
+		Prompt:      "read the attachment",
+		Attachments: []v1.MessageAttachment{attachment},
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("LaunchSession error = %v, want %v", err, wantErr)
+	}
+	if claimer.taskID != "task-1" || claimer.sessionID != "session-1" {
+		t.Fatalf("claim scope = (%q, %q), want (task-1, session-1)", claimer.taskID, claimer.sessionID)
+	}
+	if len(claimer.attachments) != 1 || claimer.attachments[0].AttachmentID != attachment.AttachmentID {
+		t.Fatalf("claimed attachments = %+v", claimer.attachments)
+	}
+}
+
+func TestLaunchSession_RejectsMismatchedTaskSessionBeforeAttachmentClaim(t *testing.T) {
+	claimer := &rejectingLaunchAttachmentClaimer{wantErr: errors.New("claimer must not run")}
+	service := &Service{repo: &pairStubRepo{sessionTaskID: "task-other"}}
+	service.SetLaunchAttachmentClaimer(claimer)
+
+	_, err := service.LaunchSession(context.Background(), &LaunchSessionRequest{
+		TaskID:      "task-1",
+		SessionID:   "session-1",
+		Intent:      IntentStartCreated,
+		Prompt:      "read the attachment",
+		Attachments: []v1.MessageAttachment{{AttachmentID: "attachment-1"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not belong to task") {
+		t.Fatalf("LaunchSession error = %v, want task/session mismatch", err)
+	}
+	if claimer.taskID != "" || len(claimer.attachments) != 0 {
+		t.Fatalf("attachment claimer ran for mismatched pair: %+v", claimer)
 	}
 }
 

@@ -4,16 +4,49 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/kandev/kandev/internal/auth/authn"
+	"github.com/kandev/kandev/internal/orchestrator"
 	"github.com/kandev/kandev/internal/task/dto"
 	"github.com/kandev/kandev/internal/task/models"
 	"github.com/kandev/kandev/internal/task/service"
+	usermodels "github.com/kandev/kandev/internal/user/models"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 	ws "github.com/kandev/kandev/pkg/websocket"
 )
+
+type blockingAgentProfileRecentUseRecorder struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingAgentProfileRecentUseRecorder) RecordAgentProfileRecentUse(
+	context.Context,
+	usermodels.AgentProfileRecentUseContext,
+	string,
+) (*usermodels.AgentProfileRecentUse, error) {
+	close(r.started)
+	<-r.release
+	return nil, nil
+}
+
+type successfulWSLaunchOrchestrator struct{}
+
+func (successfulWSLaunchOrchestrator) LaunchSession(context.Context, *orchestrator.LaunchSessionRequest) (*orchestrator.LaunchSessionResponse, error) {
+	return &orchestrator.LaunchSessionResponse{
+		Success:        true,
+		SessionID:      "session-1",
+		AgentProfileID: "profile-1",
+	}, nil
+}
+
+func (successfulWSLaunchOrchestrator) EnsureSession(context.Context, string, ...orchestrator.EnsureSessionOptions) (*orchestrator.EnsureSessionResponse, error) {
+	return nil, nil
+}
 
 // wsTaskRepo owns everything as "user-b" and records every write, so a request
 // made as "user-a" both fails and leaves no trace.
@@ -422,4 +455,82 @@ func TestWSListTasksSurfacesUnknownWorkflow(t *testing.T) {
 	payload := wsWorkflowError(t, resp)
 	require.Equal(t, string(ws.ErrorCodeInternalError), payload.Code)
 	require.Equal(t, "Failed to list tasks", payload.Message)
+}
+
+// TestWSCreateTask_PlanModeStartAgentPreservesPlanMode pins the task.create
+// contract on the WS handler. plan_mode describes the execution prompt and
+// must survive task persistence and the deferred launch intent.
+func TestWSCreateTask_PlanModeStartAgentPreservesPlanMode(t *testing.T) {
+	repo := &wsTaskRepo{}
+	h := newWSTaskHandlers(t, repo)
+
+	resp, err := h.wsCreateTask(context.Background(), wsWorkflowRequest(t, ws.ActionTaskCreate, map[string]any{
+		"workspace_id":     "ws-b",
+		"workflow_id":      "wf-b",
+		"title":            "Plan then boot",
+		"agent_profile_id": "profile-1",
+		"start_agent":      true,
+		"plan_mode":        true,
+	}))
+
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type, "body: %s", resp.Payload)
+	require.Len(t, repo.created, 1, "task.create must persist the task")
+	captured := repo.created[0]
+	require.NotNil(t, captured.Metadata, "task metadata must hold the deferred intent")
+
+	deferredRaw, ok := captured.Metadata[models.MetaKeyDeferredLaunch]
+	require.True(t, ok, "start_agent=true must persist a deferred_launch intent")
+	deferred, ok := deferredRaw.(map[string]interface{})
+	require.True(t, ok, "deferred_launch intent must be a map[string]interface{}")
+	pmFlag, present := deferred["plan_mode"]
+	require.True(t, present, "the deferred intent must carry the plan_mode key (to assert the !StartAgent guard)")
+	assert.Equal(t, true, pmFlag,
+		"plan_mode=true must remain true in the deferred launch intent")
+}
+
+func TestWSCreateTaskDoesNotWaitForRecentUsePersistence(t *testing.T) {
+	repo := &wsTaskRepo{}
+	h := newWSTaskHandlers(t, repo)
+	recorder := &blockingAgentProfileRecentUseRecorder{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.orchestrator = successfulWSLaunchOrchestrator{}
+	h.agentProfileRecentUseRecorder = recorder
+	defer close(recorder.release)
+
+	result := make(chan struct {
+		response *ws.Message
+		err      error
+	}, 1)
+	go func() {
+		response, err := h.wsCreateTask(asUser("user-b"), wsWorkflowRequest(t, ws.ActionTaskCreate, map[string]any{
+			"workspace_id":     "ws-b",
+			"workflow_id":      "wf-b",
+			"title":            "Async recency",
+			"description":      "Start without waiting for preference persistence",
+			"start_agent":      true,
+			"agent_profile_id": "profile-1",
+		}))
+		result <- struct {
+			response *ws.Message
+			err      error
+		}{response: response, err: err}
+	}()
+
+	select {
+	case <-recorder.started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("recent-use recorder was not invoked")
+	}
+
+	select {
+	case got := <-result:
+		require.NoError(t, got.err)
+		require.NotNil(t, got.response)
+		require.Equal(t, ws.MessageTypeResponse, got.response.Type)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("successful task.create waited for best-effort recent-use persistence")
+	}
 }

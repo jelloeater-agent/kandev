@@ -18,6 +18,7 @@ const (
 	QueuedByAgent    = "agent"
 	QueuedByWorkflow = "workflow"
 	QueuedByServer   = "server"
+	QueuedByMoveTask = "mcp-move-task"
 )
 
 // IsReservedQueuedBy reports identities owned by backend dispatch paths.
@@ -71,6 +72,11 @@ const MetadataLifecycleReserved = "lifecycle_reserved_in_flight"
 // agent entries may only merge when their sender task ids match, so the merge
 // never mixes prompts issued by different agents.
 const MetadataSenderTaskID = "sender_task_id"
+
+// MetadataDeferredMoveID identifies the hand-off prompt created for one
+// deferred workflow move. The orchestrator uses it to remove only stale move
+// prompts after a replay.
+const MetadataDeferredMoveID = "deferred_move_id"
 
 // QueueFullErrorCode is the well-known WS / MCP error code surfaced when an
 // insert would exceed the per-session cap. Shared between the user-side WS
@@ -196,6 +202,7 @@ type QueueStatus struct {
 	Entries []QueuedMessage `json:"entries"`
 	Count   int             `json:"count"`
 	Max     int             `json:"max"`
+	AutoRun bool            `json:"auto_run"`
 	// MergeEnabled mirrors Service.MergeEnabled so clients can hide the
 	// "Merge with above" affordance without a separate settings fetch.
 	MergeEnabled bool `json:"merge_enabled"`
@@ -205,6 +212,10 @@ type QueueStatus struct {
 // move_task_kandev) while its turn is still active. Applied by handleAgentReady
 // once the turn ends.
 type PendingMove struct {
+	// MoveID identifies one deferred move request across queue snapshots. A
+	// rollback can restore a previously consumed snapshot, so the orchestrator
+	// needs a durable identity to reject that stale replay.
+	MoveID         string    `json:"move_id"`
 	TaskID         string    `json:"task_id"`
 	WorkflowID     string    `json:"workflow_id"`
 	WorkflowStepID string    `json:"workflow_step_id"`
@@ -217,4 +228,46 @@ type PendingMove struct {
 	// distinct from the session owning this queue, which is only the execution
 	// context used to apply the deferred move.
 	SenderSessionID string `json:"sender_session_id,omitempty"`
+}
+
+// PendingMoveTTL bounds how long a deferred move may stay armed before it is
+// treated as stale and dropped instead of applied.
+//
+// A pending move only exists to bridge two moments: the agent called
+// move_task_kandev while its turn was still running, and that same turn ended.
+// In a healthy system those are seconds to minutes apart. A row that outlives
+// this window did not survive a slow turn — its turn never ended cleanly (crash,
+// restart, parked session), and the board state it was authored against is gone.
+// Replaying it then relocates a card against a board that has moved on.
+//
+// 24h is deliberately orders of magnitude above the legitimate window, so no
+// healthy move is ever caught by it, while being far below the multi-day replay
+// that motivated the TTL.
+//
+// It is a code constant rather than an env var or runtime flag, matching the
+// precedent set by the idle-session reaper's thresholds: the orchestrator has no
+// other runtime configuration of this shape, and the value is bounded by a
+// fail-closed invariant rather than by deployment shape.
+const PendingMoveTTL = 24 * time.Hour
+
+// IsStaleAt reports whether the move has been armed longer than ttl.
+//
+// A zero or future QueuedAt is never stale. An unset timestamp column or a
+// clock skew must not be able to mass-expire the table; the same rejection the
+// idle-session reaper applies to zero/future UpdatedAt.
+func (m *PendingMove) IsStaleAt(now time.Time, ttl time.Duration) bool {
+	if m == nil || ttl <= 0 {
+		return false
+	}
+	if m.QueuedAt.IsZero() || m.QueuedAt.After(now) {
+		return false
+	}
+	return now.Sub(m.QueuedAt) > ttl
+}
+
+// PendingMoveRecord pairs a deferred move with the session it is keyed to.
+// Used by the sweep, which works across sessions rather than looking one up.
+type PendingMoveRecord struct {
+	SessionID string
+	Move      PendingMove
 }

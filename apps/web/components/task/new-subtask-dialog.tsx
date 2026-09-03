@@ -170,6 +170,7 @@ function useSubtaskDialogState(parentTaskId: string, parentSessions: TaskSession
 }
 
 function useSessionOptions(taskId: string) {
+  const { t } = useTranslation();
   const { sessions, loadSessions } = useTaskSessions(taskId);
   const agentProfiles = useAppStore((s) => s.agentProfiles.items);
   useEffect(() => {
@@ -183,10 +184,10 @@ function useSessionOptions(taskId: string) {
     return sorted.map((s, idx) => {
       const profile = agentProfiles.find((p: { id: string }) => p.id === s.agent_profile_id);
       const parts = profile?.label.split(" \u2022 ");
-      const name = parts?.[1] || parts?.[0] || "Agent";
+      const name = parts?.[1] || parts?.[0] || t("task:panelAgent");
       return { id: s.id, label: name, index: idx + 1, agentName: profile?.agent_name };
     });
-  }, [sessions, agentProfiles]);
+  }, [sessions, agentProfiles, t]);
 }
 
 function useExecutorProfiles(
@@ -385,11 +386,23 @@ function NewSubtaskForm({
   const handlers = useDialogHandlers(fs, availableRepositories);
   useGitHubUrlErrorEffect(fs, isOpen);
   useDiscoverReposEffect(fs, isOpen, workspaceId, false, toast);
-  const profileOptions = useAgentProfileOptions(agentProfiles);
+  const profileOptions = useAgentProfileOptions(agentProfiles, "task_create");
   const sessionOptions = useSessionOptions(parentTaskId);
   const allExecutorProfiles = useExecutorProfiles(executors);
   const executorProfileOptions = useExecutorProfileOptions(allExecutorProfiles);
   useExecutorDefault(allExecutorProfiles, fs.executorProfileId, fs.setExecutorProfileId);
+  const selectedExecutorProfile = executorProfileOptions.find(
+    (profile) => profile.value === fs.executorProfileId,
+  );
+  const isLocalExecutor = Boolean(
+    selectedExecutorProfile?.executorType === "local" ||
+    selectedExecutorProfile?.executorType === "local_pc",
+  );
+  const freshBranchAvailable =
+    workspaceMode === "new_workspace" &&
+    !fs.useRemote &&
+    isLocalExecutor &&
+    fs.repositories.length === 1;
   const promptZone = useSubtaskPromptZone({
     parentTaskId,
     workspaceId,
@@ -423,6 +436,7 @@ function NewSubtaskForm({
     title,
     autoTitle,
     autopilot: fs.autopilot,
+    isLocalExecutor,
     setIsCreating,
     onClose,
     workspaceMode,
@@ -441,7 +455,12 @@ function NewSubtaskForm({
     executorProfileOptions,
     agentProfileId: fs.agentProfileId || defaultProfileId,
     workspaceMode,
-    onWorkspaceModeChange: setWorkspaceMode,
+    onWorkspaceModeChange: (mode: SubtaskWorkspaceMode) => {
+      if (mode !== "new_workspace") fs.setFreshBranchEnabled(false);
+      setWorkspaceMode(mode);
+    },
+    isLocalExecutor,
+    freshBranchAvailable,
     contextValue,
     onContextChange: handleContextChange,
     hasInitialPrompt: !!initialPrompt,

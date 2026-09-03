@@ -73,20 +73,34 @@ func (s *Service) syncWatchesBatchedWithClient(
 		return nil, err
 	}
 	numbered, searching := splitPRWatches(watches)
-	statusByKey, err := s.fetchBatchedWatchStatuses(ctx, exec, cacheScope, numbered, searching)
+	statuses, err := s.fetchBatchedWatchStatuses(ctx, exec, cacheScope, numbered, searching)
 	if err != nil {
 		return nil, err
+	}
+	if statuses == nil {
+		statuses = &batchedWatchStatuses{}
 	}
 
 	results := make([]PRWatchSyncResult, 0, len(watches))
 	now := time.Now().UTC()
 	for _, w := range numbered {
-		results = append(results, s.applyBatchedNumberedWatch(ctx, cacheScope, w, statusByKey, now))
+		results = append(results, s.applyBatchedNumberedWatch(ctx, cacheScope, w, statuses.byKey, now))
 	}
 	for _, w := range searching {
-		results = append(results, s.applyBatchedSearchingWatch(ctx, client, cacheScope, w, statusByKey, now))
+		results = append(results, s.applyBatchedSearchingWatch(ctx, client, cacheScope, w, statuses, now))
 	}
 	return results, nil
+}
+
+// batchedWatchStatuses is the shared, read-only result of one batched fetch.
+//
+// byKey holds every PR the batch resolved, keyed by prStatusCacheKey for
+// numbered watches and graphqlBranchKey for searching ones. branchResolvedEmpty
+// holds the branch keys the batch answered definitively as "no open PR" — see
+// branchBatchResult for why that distinction matters.
+type batchedWatchStatuses struct {
+	byKey               map[string]*PRStatus
+	branchResolvedEmpty map[string]struct{}
 }
 
 // fetchBatchedWatchStatuses runs the numbered- and branch-keyed GraphQL
@@ -112,7 +126,7 @@ func (s *Service) syncWatchesBatchedWithClient(
 // the fetch can't outlive the request budget.
 func (s *Service) fetchBatchedWatchStatuses(
 	ctx context.Context, exec GraphQLExecutor, cacheScope string, numbered, searching []*PRWatch,
-) (map[string]*PRStatus, error) {
+) (*batchedWatchStatuses, error) {
 	key := scopedCacheKey(cacheScope, batchedFetchSingleflightKey(numbered, searching))
 	fetchCtx, cancelFetch := derivedFetchContext(ctx)
 	defer cancelFetch()
@@ -122,8 +136,11 @@ func (s *Service) fetchBatchedWatchStatuses(
 		// GraphQL call is in flight wins over the post-fetch
 		// markRepoAsMissing writes — see Service.markRepoAsMissing.
 		repoErrGen := s.repoErrorGenSnapshot()
-		combined := make(map[string]*PRStatus, len(numbered)+len(searching))
-		if err := s.fetchBatchedPRStatuses(fetchCtx, exec, cacheScope, numbered, combined, repoErrGen); err != nil {
+		combined := &batchedWatchStatuses{
+			byKey:               make(map[string]*PRStatus, len(numbered)+len(searching)),
+			branchResolvedEmpty: make(map[string]struct{}, len(searching)),
+		}
+		if err := s.fetchBatchedPRStatuses(fetchCtx, exec, cacheScope, numbered, combined.byKey, repoErrGen); err != nil {
 			return nil, err
 		}
 		if err := s.fetchBatchedBranchStatuses(fetchCtx, exec, cacheScope, searching, combined, repoErrGen); err != nil {
@@ -137,7 +154,7 @@ func (s *Service) fetchBatchedWatchStatuses(
 	if v == nil {
 		return nil, nil
 	}
-	return v.(map[string]*PRStatus), nil
+	return v.(*batchedWatchStatuses), nil
 }
 
 // batchedFetchSingleflightKey builds a deterministic key from the sorted
@@ -196,7 +213,7 @@ func (s *Service) fetchBatchedPRStatuses(
 // fetchBatchedBranchStatuses runs the branch-keyed batch with the same
 // negative-cache filter and missing-repo absorption as the numbered path.
 func (s *Service) fetchBatchedBranchStatuses(
-	ctx context.Context, exec GraphQLExecutor, cacheScope string, searching []*PRWatch, combined map[string]*PRStatus,
+	ctx context.Context, exec GraphQLExecutor, cacheScope string, searching []*PRWatch, combined *batchedWatchStatuses,
 	repoErrGen uint64,
 ) error {
 	refs := make([]graphQLBranchRef, 0, len(searching))
@@ -210,12 +227,20 @@ func (s *Service) fetchBatchedBranchStatuses(
 		return nil
 	}
 	out, err := runBatchedBranchQuery(ctx, exec, refs)
-	out, err = s.absorbMissingReposErr(out, err, cacheScope, repoErrGen)
+	statuses, err := s.absorbMissingReposErr(out.Statuses, err, cacheScope, repoErrGen)
 	if err != nil {
 		return fmt.Errorf("batched branch query: %w", err)
 	}
-	for k, v := range out {
-		combined[k] = v
+	for k, v := range statuses {
+		combined.byKey[k] = v
+	}
+	// Only carry the definitive negatives that survived error absorption. A
+	// purely-missing-repos error keeps its partial decode; anything else made
+	// absorbMissingReposErr return early above.
+	if statuses != nil {
+		for k := range out.ResolvedEmpty {
+			combined.branchResolvedEmpty[k] = struct{}{}
+		}
 	}
 	return nil
 }
@@ -275,6 +300,15 @@ func (s *Service) applyBatchedNumberedWatch(
 	if err := s.store.UpdatePRWatchTimestamps(ctx, w.ID, now, commentAt, status.ChecksState, status.ReviewState); err != nil {
 		s.logger.Error("failed to update PR watch timestamps", zap.String("id", w.ID), zap.Error(err))
 	}
+	// A numbered watch found its PR before this fix existed (or before the
+	// discovering session's own group redirect took effect) keeps the
+	// observing member's task_id forever — watches are never re-pointed once
+	// they have a PR (see apps/backend/CLAUDE.md's "PR status sync coverage").
+	// Resolve the effective owner here, the same way associatePRWithTask does
+	// for the association write, so this loop keeps syncing the owner's
+	// github_task_prs row instead of silently updating nothing.
+	effectiveTaskID := s.reconcileTaskPROwnership(ctx, w.SessionID, w.TaskID, w.RepositoryID, w.PRNumber)
+
 	// Gap-fill: a numbered watch can exist even when its exact task_pr row was
 	// never created. This targeted read is unconditional because the common
 	// existing-row path is cheap, and the missing-row path must repair before
@@ -282,20 +316,23 @@ func (s *Service) applyBatchedNumberedWatch(
 	// creation event; the following SyncTaskPR may publish a second event when
 	// status fields changed. That double event is harmless because clients
 	// re-fetch the task PR state.
-	if existing, err := s.store.GetTaskPRByRepoAndNumber(ctx, w.TaskID, w.RepositoryID, w.PRNumber); err != nil {
+	if existing, err := s.store.GetTaskPRByRepoAndNumber(ctx, effectiveTaskID, w.RepositoryID, w.PRNumber); err != nil {
 		s.logger.Error("failed to load exact task PR",
-			zap.String("task_id", w.TaskID), zap.String("repository_id", w.RepositoryID),
+			zap.String("task_id", effectiveTaskID), zap.String("repository_id", w.RepositoryID),
 			zap.Int("pr_number", w.PRNumber), zap.Error(err))
 		return PRWatchSyncResult{Watch: w, Status: status, Found: true, SyncFailed: true}
 	} else if existing == nil && status.PR != nil {
-		if _, assocErr := s.AssociatePRWithTaskForWorkspace(ctx, w.WorkspaceID, w.TaskID, w.RepositoryID, status.PR); assocErr != nil {
+		if _, assocErr := s.associatePRWithTaskForSession(
+			ctx, w.WorkspaceID, w.SessionID, w.TaskID, w.RepositoryID, status.PR,
+			false, false, TaskPRSourceWatch,
+		); assocErr != nil {
 			s.logger.Error("failed to associate numbered PR with task",
 				zap.String("task_id", w.TaskID), zap.Int("pr_number", w.PRNumber), zap.Error(assocErr))
 			return PRWatchSyncResult{Watch: w, Status: status, Found: true, SyncFailed: true}
 		}
 	}
-	if syncErr := s.SyncTaskPR(ctx, w.TaskID, status); syncErr != nil {
-		s.logger.Error("failed to sync task PR", zap.String("task_id", w.TaskID), zap.Error(syncErr))
+	if syncErr := s.SyncTaskPR(ctx, effectiveTaskID, status); syncErr != nil {
+		s.logger.Error("failed to sync task PR", zap.String("task_id", effectiveTaskID), zap.Error(syncErr))
 		// SyncFailed=true so poller skips publishing PR feedback while the
 		// task_pr row is still stale — old applyPRStatus path early-returned
 		// on this error for the same reason.
@@ -305,7 +342,7 @@ func (s *Service) applyBatchedNumberedWatch(
 	// same branch can be detected without manual intervention.
 	if status.PR != nil && (status.PR.State == prStateMerged || status.PR.State == prStateClosed) {
 		hold, holdErr := s.ShouldHoldTerminalPRWatch(
-			ctx, w.TaskID, w.RepositoryID, w.PRNumber, status.PR.State,
+			ctx, effectiveTaskID, w.RepositoryID, w.PRNumber, status.PR.State,
 		)
 		if holdErr != nil {
 			s.logger.Error("failed to check terminal PR automation", zap.String("id", w.ID), zap.Error(holdErr))
@@ -322,12 +359,54 @@ func (s *Service) applyBatchedNumberedWatch(
 	return PRWatchSyncResult{Watch: w, Status: status, Found: true, Changed: changed}
 }
 
+// lookupSearchingWatchPR resolves the PR for a searching watch the batched
+// query returned nothing for. Returns (nil, nil) when there is no PR to
+// promote — including when the probe was skipped.
+//
+// The batched query already asked GitHub `pullRequests(states: OPEN,
+// headRefName: <branch>)` for this exact repository and branch. When it came
+// back resolved-and-empty, re-asking through client.FindPRByBranch spends one
+// more API call per watch per cycle to receive the same answer — and since a
+// branch without a PR keeps that shape indefinitely, that call repeats forever.
+// That redundancy was the dominant GitHub GraphQL consumer in production: 42
+// searching watches burned ~150 points/minute against a 5000/hour budget, which
+// parked the poller on `github rate-limited` roughly 40 minutes into every
+// reset window. So on a definitive negative only the fork PARENT — a different
+// repository the batch never asked about — is still worth a look, and that
+// lookup is itself cached per (scope, owner, repo).
+//
+// An alias that did not resolve, or a branch carrying several open PRs that
+// selectBatchedBranchPRNode refused to guess between, is not a definitive
+// negative and keeps the full fork-network fallback.
+//
+// Either way the probe is throttled on the watch's own last_checked_at exactly
+// as triggerPRDetection's is, so a watch costs at most one upstream probe per
+// freshness window no matter how many callers sync it — the frontend retries
+// every 5s, and that throttle previously guarded only the legacy per-watch
+// path this one replaced. The 60s poller always clears the window, so
+// detection latency is unchanged.
+func (s *Service) lookupSearchingWatchPR(
+	ctx context.Context, client Client, cacheScope string, w *PRWatch,
+	branchKey string, statuses *batchedWatchStatuses, lastChecked *time.Time,
+) (*PR, error) {
+	if lastChecked != nil && time.Since(*lastChecked) < PRSyncFreshnessWindow {
+		return nil, nil
+	}
+	if _, definitive := statuses.branchResolvedEmpty[branchKey]; definitive {
+		return s.findPRInForkParent(ctx, client, cacheScope, w.Owner, w.Repo, w.Branch)
+	}
+	return s.findPRByBranchInForkNetwork(ctx, client, cacheScope, w.Owner, w.Repo, w.Branch)
+}
+
 // applyBatchedSearchingWatch mirrors Poller.applyDetectedPR on the service
 // side. A searching watch (pr_number=0) is promoted to a known PR when the
 // branch lookup returns one; otherwise we just bump last_checked_at.
 func (s *Service) applyBatchedSearchingWatch(
-	ctx context.Context, client Client, cacheScope string, w *PRWatch, statusByKey map[string]*PRStatus, now time.Time,
+	ctx context.Context, client Client, cacheScope string, w *PRWatch, statuses *batchedWatchStatuses, now time.Time,
 ) PRWatchSyncResult {
+	// Read the previous probe time before the stamp below overwrites it —
+	// lookupSearchingWatchPR throttles on it.
+	lastChecked := w.LastCheckedAt
 	// Timestamps get bumped on both the "no PR found" and "PR detected"
 	// paths, so hoist the single call above the branch to make that
 	// invariant obvious.
@@ -335,9 +414,10 @@ func (s *Service) applyBatchedSearchingWatch(
 	if s.isRepoCachedAsMissingForScope(cacheScope, w.Owner, w.Repo) {
 		return PRWatchSyncResult{Watch: w, SyncFailed: true}
 	}
-	status, ok := statusByKey[graphqlBranchKey(w.Owner, w.Repo, w.Branch)]
+	branchKey := graphqlBranchKey(w.Owner, w.Repo, w.Branch)
+	status, ok := statuses.byKey[branchKey]
 	if !ok || status == nil || status.PR == nil {
-		pr, err := findPRByBranchInForkNetwork(ctx, client, w.Owner, w.Repo, w.Branch)
+		pr, err := s.lookupSearchingWatchPR(ctx, client, cacheScope, w, branchKey, statuses, lastChecked)
 		if err != nil {
 			s.logger.Debug("failed to search parent repository for PR",
 				zap.String("watch_id", w.ID), zap.String("branch", w.Branch), zap.Error(err))
@@ -358,7 +438,10 @@ func (s *Service) applyBatchedSearchingWatch(
 			zap.String("watch_id", w.ID), zap.Int("pr_number", status.PR.Number), zap.Error(err))
 		return PRWatchSyncResult{Watch: w, Status: status, Found: true}
 	}
-	if _, err := s.AssociatePRWithTaskForWorkspace(ctx, w.WorkspaceID, w.TaskID, w.RepositoryID, status.PR); err != nil {
+	if _, err := s.associatePRWithTaskForSession(
+		ctx, w.WorkspaceID, w.SessionID, w.TaskID, w.RepositoryID, status.PR,
+		false, false, TaskPRSourceWatch,
+	); err != nil {
 		s.logger.Error("failed to associate detected PR with task",
 			zap.String("task_id", w.TaskID), zap.Int("pr_number", status.PR.Number), zap.Error(err))
 		return PRWatchSyncResult{Watch: w, Status: status, Found: true}

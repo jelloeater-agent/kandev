@@ -2,6 +2,8 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -24,10 +26,38 @@ import (
 )
 
 const (
-	modelConfigOptionID      = "model"
-	attachmentDeliveryPath   = "path"
-	attachmentDeliveryPrompt = "prompt"
+	modelConfigOptionID                = "model"
+	attachmentDeliveryPath             = "path"
+	attachmentDeliveryPrompt           = "prompt"
+	pendingDispatchedPromptWaitTimeout = 10 * time.Second
 )
+
+// ErrSteerNotDispatched reports that a steer found no active prompt generation
+// to reuse. The orchestrator must run the ordinary prompt admission path when
+// it receives this result because a new turn may have become promptable.
+var ErrSteerNotDispatched = errors.New("steer was not dispatched")
+
+// ErrSteerAttachmentMaterialization wraps an attachment delivery failure that
+// happened before agentctl accepted the steer. The orchestrator uses this
+// identity to release the steer slot and retry a queued successor drain.
+var ErrSteerAttachmentMaterialization = errors.New("steer attachment materialization failed")
+
+// PendingDispatchedPromptTimeoutError reports that a successor prompt could
+// not observe completion of an earlier dispatch-only prompt within the
+// bounded admission interval. The pending gate remains set so cancellation
+// escalation remains the only path that can release the predecessor.
+type PendingDispatchedPromptTimeoutError struct {
+	ExecutionID string
+	Timeout     time.Duration
+}
+
+func (e *PendingDispatchedPromptTimeoutError) Error() string {
+	return fmt.Sprintf(
+		"pending dispatched prompt completion timed out for execution %q after %s",
+		e.ExecutionID,
+		e.Timeout,
+	)
+}
 
 // SessionManager handles ACP session initialization and management
 type SessionManager struct {
@@ -36,7 +66,7 @@ type SessionManager struct {
 	streamManager        *StreamManager
 	executionStore       *ExecutionStore
 	promptStarter        func(executionID string) (uint64, error)
-	initialPromptFailure func(executionID string)
+	initialPromptFailure func(failure InitialPromptFailure)
 	historyManager       *SessionHistoryManager
 	attachmentReader     AttachmentReader
 	stopCh               <-chan struct{} // For graceful shutdown coordination
@@ -50,6 +80,21 @@ type SessionManager struct {
 	// predecessor in the admitted-but-undispatched window so a racing steer's
 	// ordering can be observed deterministically.
 	beforePromptDispatchHook func()
+}
+
+// InitialPromptFailure captures the immutable prompt identity at the point
+// where initial delivery fails, before a successor can begin.
+type InitialPromptFailure struct {
+	ExecutionID      string
+	SessionID        string
+	PromptGeneration uint64
+	TurnID           string
+	Err              error
+}
+
+type sendPromptCallbacks struct {
+	onDispatched func()
+	onFailure    func(InitialPromptFailure)
 }
 
 // NewSessionManager creates a new SessionManager
@@ -79,7 +124,7 @@ func (sm *SessionManager) SetPromptStarter(starter func(executionID string) (uin
 	sm.promptStarter = starter
 }
 
-func (sm *SessionManager) SetInitialPromptFailureHandler(handler func(executionID string)) {
+func (sm *SessionManager) SetInitialPromptFailureHandler(handler func(failure InitialPromptFailure)) {
 	sm.initialPromptFailure = handler
 }
 
@@ -366,23 +411,23 @@ func (sm *SessionManager) InitializeAndPromptWithLayers(
 	}
 
 	execution.ACPSessionID = result.SessionID
+	if !cacheFreshSessionModelState(execution) && (profileModel != "" || runtimeModel != "") {
+		waitForFreshSessionModelState(ctx, sm.logger, execution)
+	}
 	providerDefaultConfig := execution.GetModelState()
 
-	// No-silent-model-fallback: decide the effective model up front under the
-	// profile's policy (a gone model fails the launch explicitly unless a
-	// fallback model or the legacy auto-fallback toggle is configured), then
-	// hand the decided model to the layers so it is applied exactly once.
-	// Previously SetModel failures were best-effort — the session continued
-	// on the provider default, which is the implicit switch this feature
-	// eliminates. The gate is the effective model (which includes the
-	// persisted runtime override), not the profile's start model: a profile
-	// with no model and a session with a runtime model must still enforce
-	// strict failure / the configured fallback.
+	// Decide the effective model up front under the executor-authoritative
+	// policy, then hand the decided model to the layers so it is applied once.
+	// The gate is the effective model (which includes the persisted runtime
+	// override), not only the profile's start model.
 	effectiveModel := sm.applyStartModelPolicyToEffectiveModel(
 		ctx, execution, result.SessionID, profileModel, runtimeModel, startModelPolicy,
 	)
 	if effectiveModel.err != nil {
 		return effectiveModel.err
+	}
+	if effectiveModel.decision.Warning {
+		sm.publishModelSelectionWarningEvent(execution, result.SessionID, effectiveModel.decision)
 	}
 	// The layers apply the policy-decided model; the runtime override is
 	// neutralized because the decision already accounted for it. When the
@@ -394,7 +439,7 @@ func (sm *SessionManager) InitializeAndPromptWithLayers(
 	// Only mark the launch initialized once the start-model policy has
 	// succeeded — a strict unavailable model fails here, and a failed launch
 	// must not look initialized.
-	execution.sessionInitialized = true
+	execution.setSessionInitialized(true)
 
 	finalConfigID, profileModelApplied, profileModeApplied, profileConfigOptionsApplied := sm.applyProfileSessionLayers(
 		ctx, execution, result.SessionID, profileModel, profileMode, profileConfigOptions,
@@ -426,13 +471,8 @@ func (sm *SessionManager) InitializeAndPromptWithLayers(
 
 // applyStartModelPolicyToEffectiveModel resolves the effective model (profile
 // start model, overridden by the persisted runtime model) and applies the
-// profile's no-silent-model-fallback policy to it: strict profiles fail a gone
-// model explicitly, fallback-model profiles switch to the configured fallback
-// (publishing the fallback event), and auto-fallback keeps legacy behavior.
-// Returns the decided model (fallback when one was applied), the model
-// actually applied by the policy, whether the policy handled model selection,
-// or the policy error. The caller neutralizes the runtime override afterwards
-// because the decision already accounted for it.
+// executor-authoritative policy. The caller neutralizes the runtime override
+// afterwards because the decision already accounted for it.
 func (sm *SessionManager) applyStartModelPolicyToEffectiveModel(
 	ctx context.Context,
 	execution *AgentExecution,
@@ -443,13 +483,16 @@ func (sm *SessionManager) applyStartModelPolicyToEffectiveModel(
 	model        string
 	appliedModel string
 	handled      bool
+	decision     ModelSelectionDecision
 	err          error
 }) {
 	effective.model = profileModel
 	if runtimeModel != "" {
 		effective.model = runtimeModel
 	}
-	if effective.model == "" || execution.agentctl == nil {
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if effective.model == "" || client == nil {
 		return effective
 	}
 	// The policy owns this model decision even when it deliberately continues
@@ -457,8 +500,8 @@ func (sm *SessionManager) applyStartModelPolicyToEffectiveModel(
 	// profile layers must not retry an outcome that was already handled.
 	effective.handled = true
 	startModelPolicy.Model = effective.model
-	appliedModel, usingFallback, policyErr := applyStartModelPolicy(
-		ctx, sm.logger, execution.agentctl,
+	decision, policyErr := applyStartModelPolicy(
+		ctx, sm.logger, client,
 		execution.GetModelState(), startModelPolicy,
 	)
 	if policyErr != nil {
@@ -468,10 +511,13 @@ func (sm *SessionManager) applyStartModelPolicyToEffectiveModel(
 		effective.err = policyErr
 		return effective
 	}
-	effective.appliedModel = appliedModel
-	if usingFallback {
-		sm.publishModelFallbackEvent(execution, acpSessionID, appliedModel)
-		effective.model = appliedModel
+	effective.decision = decision
+	if decision.Outcome == ModelSelectionOutcomeApplied ||
+		decision.Outcome == ModelSelectionOutcomeExplicitFallback {
+		effective.appliedModel = decision.EffectiveModel
+	}
+	if decision.Outcome == ModelSelectionOutcomeExplicitFallback {
+		effective.model = decision.EffectiveModel
 	}
 	return effective
 }
@@ -487,15 +533,20 @@ func (sm *SessionManager) initializeACPConnection(
 	)
 	execution.SetSessionSpan(sessionSpan)
 	ctx = trace.ContextWithSpan(ctx, sessionSpan)
-	if execution.agentctl != nil {
-		execution.agentctl.SetTraceContext(execution.SessionTraceContext())
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	if client != nil {
+		client.SetTraceContext(execution.SessionTraceContext())
+	} else {
+		return ctx, nil, fmt.Errorf("execution %q has no agentctl client", execution.ID)
 	}
 	ctx, initSpan := tracing.TraceSessionInit(ctx, execution.TaskID, execution.SessionID, execution.ID)
 	defer initSpan.End()
 
 	rt := agentConfig.Runtime()
+	agentctlURL := client.BaseURL()
+	releaseClient()
 	sm.logger.Info("initializing ACP session",
-		zap.String("execution_id", execution.ID), zap.String("agentctl_url", execution.agentctl.BaseURL()),
+		zap.String("execution_id", execution.ID), zap.String("agentctl_url", agentctlURL),
 		zap.String("agent_type", agentConfig.ID()), zap.String("existing_acp_session_id", execution.ACPSessionID),
 		zap.Bool("native_session_resume", rt.SessionConfig.NativeSessionResume))
 	if sm.streamManager != nil {
@@ -508,7 +559,12 @@ func (sm *SessionManager) initializeACPConnection(
 			return ctx, nil, fmt.Errorf("timeout waiting for agent stream to connect")
 		}
 	}
-	result, err := sm.InitializeSession(ctx, execution.agentctl, agentConfig, execution.ACPSessionID, execution.WorkspacePath, mcpServers)
+	client, releaseClient = execution.AcquireAgentCtlClient()
+	if client == nil {
+		return ctx, nil, fmt.Errorf("execution %q has no agentctl client", execution.ID)
+	}
+	result, err := sm.InitializeSession(ctx, client, agentConfig, execution.ACPSessionID, execution.WorkspacePath, mcpServers)
+	releaseClient()
 	if err != nil {
 		// loadSession already logged the root cause. context.Canceled is
 		// caller teardown, so keep this outer boundary at WARN too —
@@ -539,7 +595,9 @@ func (sm *SessionManager) applyProfileSessionLayers(
 	modelPolicyHandled bool,
 	policyAppliedModel string,
 ) (string, string, string, map[string]string) {
-	if execution.agentctl == nil {
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if client == nil {
 		return "", "", "", nil
 	}
 	finalConfigID := ""
@@ -561,7 +619,7 @@ func (sm *SessionManager) applyProfileSessionLayers(
 				sm.logger.Info("profile model applied by start-model policy",
 					zap.String("execution_id", execution.ID), zap.String("model", policyAppliedModel))
 			}
-		} else if err := execution.agentctl.SetModel(ctx, profileModel); err != nil {
+		} else if err := client.SetModel(ctx, profileModel); err != nil {
 			sm.logger.Warn("failed to set profile model via ACP",
 				zap.String("execution_id", execution.ID), zap.String("model", profileModel), zap.Error(err))
 		} else {
@@ -572,7 +630,7 @@ func (sm *SessionManager) applyProfileSessionLayers(
 		}
 	}
 	if profileMode != "" {
-		if err := execution.agentctl.SetMode(ctx, acpSessionID, profileMode); err != nil {
+		if err := client.SetMode(ctx, acpSessionID, profileMode); err != nil {
 			sm.logger.Warn("failed to set profile mode via ACP",
 				zap.String("execution_id", execution.ID), zap.String("mode", profileMode), zap.Error(err))
 		} else {
@@ -584,7 +642,7 @@ func (sm *SessionManager) applyProfileSessionLayers(
 	sanitizedOptions := profileconfig.SanitizeConfigOptions(profileConfigOptions)
 	for _, configID := range sortedConfigOptionKeys(sanitizedOptions) {
 		value := sanitizedOptions[configID]
-		if err := execution.agentctl.SetConfigOption(ctx, configID, value); err != nil {
+		if err := client.SetConfigOption(ctx, configID, value); err != nil {
 			sm.logger.Warn("failed to set profile config option via ACP",
 				zap.String("execution_id", execution.ID), zap.String("config_id", configID),
 				zap.String("value", value), zap.Error(err))
@@ -610,11 +668,13 @@ func (sm *SessionManager) applyRuntimeSessionLayers(
 	runtimeConfigOptions map[string]string,
 ) (string, []string) {
 	failed := make([]string, 0)
-	if execution.agentctl == nil {
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if client == nil {
 		return finalConfigID, failed
 	}
 	if runtimeModel != "" && runtimeModel != profileModel {
-		if err := execution.agentctl.SetModel(ctx, runtimeModel); err != nil {
+		if err := client.SetModel(ctx, runtimeModel); err != nil {
 			failed = append(failed, "model")
 			sm.logger.Warn("failed to set runtime model via ACP",
 				zap.String("execution_id", execution.ID), zap.String("model", runtimeModel), zap.Error(err))
@@ -628,16 +688,26 @@ func (sm *SessionManager) applyRuntimeSessionLayers(
 		}
 	}
 	if runtimeMode != "" && runtimeMode != profileMode {
-		if err := execution.agentctl.SetMode(ctx, acpSessionID, runtimeMode); err != nil {
+		if err := client.SetMode(ctx, acpSessionID, runtimeMode); err != nil {
 			failed = append(failed, "mode")
 			sm.logger.Warn("failed to set runtime mode via ACP",
 				zap.String("execution_id", execution.ID), zap.String("mode", runtimeMode), zap.Error(err))
 		}
 	}
-	sanitizedOptions := profileconfig.SanitizeConfigOptions(runtimeConfigOptions)
+	// Fail safe: when the current agent's option catalog is not yet known, we
+	// cannot verify which persisted options it supports, so replay nothing
+	// rather than sending a prior agent's keys (spec failure mode: unknown
+	// catalog must not send unverified options). This covers flat-model-list
+	// agents whose startup wait exits on the model list before any config
+	// options settle.
+	modelState := execution.GetModelState()
+	var sanitizedOptions map[string]string
+	if _, catalogKnown := capturedRuntimeConfigOptionCatalog(modelState); catalogKnown {
+		sanitizedOptions = sanitizeRuntimeConfigOptionsWithCatalog(runtimeConfigOptions, modelState)
+	}
 	for _, configID := range sortedConfigOptionKeys(sanitizedOptions) {
 		value := sanitizedOptions[configID]
-		if err := execution.agentctl.SetConfigOption(ctx, configID, value); err != nil {
+		if err := client.SetConfigOption(ctx, configID, value); err != nil {
 			failed = append(failed, configID)
 			sm.logger.Warn("failed to set runtime config option via ACP",
 				zap.String("execution_id", execution.ID), zap.String("config_id", configID),
@@ -668,7 +738,7 @@ func (sm *SessionManager) publishSettledConfigOptions(
 		return
 	}
 	baselineCandidate, live, ready := execution.SettleConfigOptions(finalConfigID, providerDefaultConfig)
-	if !ready || len(baselineCandidate.ConfigOptions) == 0 || live == nil {
+	if !ready || baselineCandidate == nil || live == nil {
 		return
 	}
 	sm.eventPublisher.PublishAgentStreamEvent(execution, agentctl.AgentEvent{
@@ -698,6 +768,48 @@ func (sm *SessionManager) publishModelFallbackEvent(
 		SessionID:     acpSessionID,
 		FallbackModel: fallbackModel,
 	})
+}
+
+// publishModelSelectionWarningEvent emits the provider-neutral decision and
+// keeps the legacy fallback event as a compatibility projection for clients
+// that still listen for session_model_fallback.
+func (sm *SessionManager) publishModelSelectionWarningEvent(
+	execution *AgentExecution,
+	acpSessionID string,
+	decision ModelSelectionDecision,
+) {
+	if sm.eventPublisher == nil || execution == nil || !decision.Warning {
+		return
+	}
+	decisionIDBytes := sha256.Sum256([]byte(strings.Join([]string{
+		execution.ID,
+		acpSessionID,
+		decision.RequestedModel,
+		decision.Reason,
+		decision.EffectiveModel,
+	}, "|")))
+	warning := &streams.ModelSelectionWarning{
+		Kind:              "model_selection_warning",
+		DecisionID:        hex.EncodeToString(decisionIDBytes[:]),
+		Reason:            decision.Reason,
+		RequestedModel:    decision.RequestedModel,
+		EffectiveModel:    decision.EffectiveModel,
+		AgentID:           execution.AgentID,
+		ExecutorType:      string(execution.RuntimeName),
+		ExecutorProfileID: execution.metadataString(MetadataKeyExecutorProfileID),
+	}
+	if decision.Outcome == ModelSelectionOutcomeExplicitFallback {
+		warning.FallbackModel = decision.EffectiveModel
+	}
+	sm.eventPublisher.PublishAgentStreamEvent(execution, agentctl.AgentEvent{
+		Type:                  streams.EventTypeSessionModelSelectionWarning,
+		SessionID:             acpSessionID,
+		CurrentModelID:        warning.EffectiveModel,
+		ModelSelectionWarning: warning,
+	})
+	if warning.FallbackModel != "" {
+		sm.publishModelFallbackEvent(execution, acpSessionID, warning.FallbackModel)
+	}
 }
 
 func (sm *SessionManager) publishWorkflowSessionConfigFailures(
@@ -830,7 +942,16 @@ func (sm *SessionManager) dispatchInitialPrompt(ctx context.Context, execution *
 		go func() {
 			promptCtx, cancel := appctx.Detached(ctx, sm.stopCh, 0)
 			defer cancel()
-			_, err := sm.SendPrompt(promptCtx, execution, effectivePrompt, false, acpAttachments, false)
+			_, err := sm.sendPrompt(
+				promptCtx,
+				execution,
+				effectivePrompt,
+				false,
+				acpAttachments,
+				false,
+				sendPromptCallbacks{onFailure: sm.initialPromptFailure},
+				false,
+			)
 			if err != nil {
 				// During graceful shutdown the agent subprocess is terminated,
 				// so an in-flight initial prompt fails with a transport death
@@ -845,9 +966,6 @@ func (sm *SessionManager) dispatchInitialPrompt(ctx context.Context, execution *
 					sm.logger.Error("initial prompt failed",
 						zap.String("execution_id", execution.ID),
 						zap.Error(err))
-				}
-				if sm.initialPromptFailure != nil {
-					sm.initialPromptFailure(execution.ID)
 				}
 			}
 		}()
@@ -913,10 +1031,19 @@ func (sm *SessionManager) waitForPromptDone(
 	stallTicker := time.NewTicker(time.Minute)
 	defer stallTicker.Stop()
 	stallReported := false
+	startupGeneration := execution.startupAttemptSnapshot()
 
 	for {
 		select {
 		case signal := <-execution.promptDoneCh:
+			if signal.StartupGeneration != startupGeneration &&
+				(signal.StartupGeneration != 0 || startupGeneration != 0) {
+				sm.logger.Debug("ignoring completion signal for superseded startup generation",
+					zap.String("execution_id", execution.ID),
+					zap.Uint64("signal_startup_generation", signal.StartupGeneration),
+					zap.Uint64("active_startup_generation", startupGeneration))
+				continue
+			}
 			if signal.PromptGeneration != 0 &&
 				promptGeneration != 0 &&
 				signal.PromptGeneration != promptGeneration {
@@ -969,16 +1096,16 @@ func (sm *SessionManager) waitForPromptDone(
 			return nil, ctx.Err()
 
 		case <-stallTicker.C:
-			execution.lastActivityAtMu.Lock()
-			elapsed := time.Since(execution.lastActivityAt)
-			lastActivity := execution.lastActivityAt
-			execution.lastActivityAtMu.Unlock()
+			lastActivity, agentEventSeen, activityEpoch := execution.promptActivitySnapshot()
+			elapsed := time.Since(lastActivity)
+			neverStarted := !agentEventSeen
 
 			if elapsed >= 5*time.Minute && !stallReported {
 				sm.logger.Warn("agent stall detected: no events received",
 					zap.String("execution_id", execution.ID),
 					zap.Duration("elapsed_since_last_event", elapsed),
-					zap.Time("last_activity", lastActivity))
+					zap.Time("last_activity", lastActivity),
+					zap.Bool("never_started", neverStarted))
 				if sm.eventPublisher != nil {
 					sm.eventPublisher.PublishAgentStalled(
 						ctx,
@@ -986,6 +1113,8 @@ func (sm *SessionManager) waitForPromptDone(
 						promptGeneration,
 						lastActivity,
 						elapsed,
+						activityEpoch,
+						neverStarted,
 					)
 				}
 				stallReported = true
@@ -1049,7 +1178,7 @@ func (sm *SessionManager) SendPrompt(
 	attachments []v1.MessageAttachment,
 	dispatchOnly bool,
 ) (*PromptResult, error) {
-	return sm.sendPrompt(ctx, execution, prompt, validateStatus, attachments, dispatchOnly, nil, false)
+	return sm.sendPrompt(ctx, execution, prompt, validateStatus, attachments, dispatchOnly, sendPromptCallbacks{}, false)
 }
 
 // SendPromptWithDispatchCallback reports the point at which agentctl accepted
@@ -1063,7 +1192,16 @@ func (sm *SessionManager) SendPromptWithDispatchCallback(
 	dispatchOnly bool,
 	onDispatched func(),
 ) (*PromptResult, error) {
-	return sm.sendPrompt(ctx, execution, prompt, validateStatus, attachments, dispatchOnly, onDispatched, false)
+	return sm.sendPrompt(
+		ctx,
+		execution,
+		prompt,
+		validateStatus,
+		attachments,
+		dispatchOnly,
+		sendPromptCallbacks{onDispatched: onDispatched},
+		false,
+	)
 }
 
 // activePromptGeneration returns the dispatched, in-flight prompt generation a
@@ -1092,6 +1230,7 @@ func (sm *SessionManager) markPromptDispatched(execution *AgentExecution, genera
 	if generation != 0 && execution.promptGeneration == generation &&
 		execution.promptCompletionGeneration != generation {
 		execution.dispatchedPromptGeneration = generation
+		execution.armPromptActivity()
 	}
 }
 
@@ -1114,8 +1253,9 @@ func (sm *SessionManager) markPromptDispatched(execution *AgentExecution, genera
 //
 // Delivery is opportunistic: with no live turn to fold into (idle, a turn that
 // was admitted but not yet dispatched, one that already completed, or a
-// disconnected stream) there is nothing to steer, so it falls back to an
-// ordinary prompt delivered in submission order rather than dropping the message.
+// disconnected stream) there is nothing to steer. The orchestrator receives
+// ErrSteerNotDispatched and re-enters ordinary prompt admission in submission
+// order rather than sending around the queue.
 func (sm *SessionManager) SendPromptSteerWithDispatchCallback(
 	ctx context.Context,
 	execution *AgentExecution,
@@ -1125,19 +1265,41 @@ func (sm *SessionManager) SendPromptSteerWithDispatchCallback(
 	dispatchOnly bool,
 	onDispatched func(),
 ) (*PromptResult, error) {
-	if execution.agentctl == nil {
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	releaseClient()
+	if client == nil {
 		return nil, fmt.Errorf("execution %q has no agentctl client", execution.ID)
 	}
 	if validateStatus && execution.Status != v1.AgentStatusRunning && execution.Status != v1.AgentStatusReady {
 		return nil, fmt.Errorf("execution %q is not ready for prompts (status: %s)", execution.ID, execution.Status)
 	}
 
-	steered, err := sm.tryDispatchSteer(ctx, execution, prompt, attachments)
+	// Avoid an upload when there is no generation to steer into. This is only an
+	// optimization; the lock-guarded dispatch below remains authoritative for
+	// the race where the active generation completes during materialization.
+	if sm.activePromptGeneration(execution) == 0 {
+		return nil, ErrSteerNotDispatched
+	}
+
+	// Resolve claimed descriptors before the steer takes promptLifecycleMu.
+	// Materialization streams file bytes to agentctl and dispatchSteerLocked holds
+	// that lock under a bounded timeout, so uploading inside it would let a large
+	// attachment block the lifecycle lock for the length of a network write.
+	//
+	// A failure here returns instead of falling back: the ordinary prompt route
+	// would carry the same unresolved descriptor, and the agent would receive a
+	// reference to bytes that are absent from the session.
+	materialized, err := sm.materializeAttachments(ctx, execution, attachments)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrSteerAttachmentMaterialization, err)
+	}
+
+	steered, err := sm.tryDispatchSteer(ctx, execution, prompt, materialized)
 	if err != nil {
 		return nil, err
 	}
 	if !steered {
-		return sm.sendPrompt(ctx, execution, prompt, validateStatus, attachments, dispatchOnly, onDispatched, false)
+		return nil, ErrSteerNotDispatched
 	}
 	if onDispatched != nil {
 		onDispatched()
@@ -1153,8 +1315,8 @@ func (sm *SessionManager) SendPromptSteerWithDispatchCallback(
 // round-trip (agentctl acks before it runs the prompt), but sendStreamRequest has
 // no deadline of its own, so a half-open connection could otherwise pin the lock
 // — wedging this execution's completion claims and new prompts — until the stream
-// tears down. A timeout lands on the error path, which is send-safe under the
-// no-resend fallback. Exposed as a var so tests can shorten it.
+// tears down. A timeout lands on the error path without retrying the steer.
+// Exposed as a var so tests can shorten it.
 var steerDispatchTimeout = 5 * time.Second
 
 // tryDispatchSteer selects the active dispatched generation and issues the steer
@@ -1173,7 +1335,8 @@ var steerDispatchTimeout = 5 * time.Second
 // stalled connection, and the history append is done after the lock is released.
 //
 // Returns (false, nil) when there is nothing to steer into — no live generation,
-// or the stream is not connected — so the caller degrades to an ordinary prompt.
+// or the stream is not connected — so the orchestrator can admit an ordinary
+// prompt.
 // It deliberately uses the single fast RPC, not dispatchPrompt's reconnect path:
 // a disconnected stream means there is no live turn to fold into, and reconnect
 // can block for seconds, which must not run under the lifecycle lock.
@@ -1231,9 +1394,12 @@ func (sm *SessionManager) dispatchSteerLocked(
 }
 
 // recordSteerActivity mirrors the ordinary prompt path's history append and
-// activity-timestamp bump for a steer that actually dispatched. Kept off the
-// fallback path so a steer that degrades to an ordinary prompt is not recorded
-// twice.
+// activity-timestamp bump for a steer that actually dispatched. A no-dispatch
+// result never reaches this method, so ordinary fallback is not recorded twice.
+//
+// Deliberately does not touch agentEventSincePrompt: a steer is user input
+// injected into an already-running turn, not agent output, so it must not
+// mask a stalled agent as having produced something.
 func (sm *SessionManager) recordSteerActivity(execution *AgentExecution, prompt string) {
 	if sm.historyManager != nil && execution.historyEnabled && execution.SessionID != "" {
 		if err := sm.historyManager.AppendUserMessage(execution.SessionID, prompt); err != nil {
@@ -1252,11 +1418,15 @@ func (sm *SessionManager) sendPrompt(
 	validateStatus bool,
 	attachments []v1.MessageAttachment,
 	dispatchOnly bool,
-	onDispatched func(),
+	callbacks sendPromptCallbacks,
 	steer bool,
 ) (*PromptResult, error) {
-	if execution.agentctl == nil {
-		return nil, fmt.Errorf("execution %q has no agentctl client", execution.ID)
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	releaseClient()
+	if client == nil {
+		err := fmt.Errorf("execution %q has no agentctl client", execution.ID)
+		sm.reportPromptFailure(execution, 0, err, callbacks.onFailure)
+		return nil, err
 	}
 
 	// Agentctl acknowledges prompt dispatch before the adapter's session/prompt
@@ -1291,22 +1461,53 @@ func (sm *SessionManager) sendPrompt(
 
 	preparedCtx, effectivePrompt, promptGeneration, err := sm.preparePrompt(ctx, execution, prompt, validateStatus, attachments)
 	if err != nil {
+		sm.reportPromptFailure(execution, promptGeneration, err, callbacks.onFailure)
 		return nil, err
 	}
 	materializedAttachments, err := sm.materializeAttachments(preparedCtx, execution, attachments)
 	if err != nil {
+		sm.reportPromptFailure(execution, promptGeneration, err, callbacks.onFailure)
 		return nil, err
 	}
 	if sm.beforePromptDispatchHook != nil {
 		sm.beforePromptDispatchHook()
 	}
 	if err := sm.triggerPrompt(preparedCtx, execution, effectivePrompt, materializedAttachments, promptGeneration, steer); err != nil {
+		sm.reportPromptFailure(execution, promptGeneration, err, callbacks.onFailure)
 		return nil, err
 	}
 	// The generation is now accepted by agentctl and in flight, so a concurrent
 	// steer may reuse it. (The steer path never marks — it reuses, not owns.)
 	sm.markPromptDispatched(execution, promptGeneration)
-	return sm.finishAcceptedPrompt(preparedCtx, execution, dispatchOnly, onDispatched, promptGeneration)
+	result, err := sm.finishAcceptedPrompt(
+		preparedCtx,
+		execution,
+		dispatchOnly,
+		callbacks.onDispatched,
+		promptGeneration,
+	)
+	if err != nil {
+		sm.reportPromptFailure(execution, promptGeneration, err, callbacks.onFailure)
+	}
+	return result, err
+}
+
+func (sm *SessionManager) reportPromptFailure(
+	execution *AgentExecution,
+	promptGeneration uint64,
+	err error,
+	handler func(InitialPromptFailure),
+) {
+	if handler == nil {
+		return
+	}
+	handler(InitialPromptFailure{
+		ExecutionID:      execution.ID,
+		SessionID:        execution.SessionID,
+		PromptGeneration: promptGeneration,
+		TurnID:           execution.promptTurnIDSnapshot(),
+		Err:              err,
+	})
 }
 
 // materializeAttachments resolves claimed backend descriptors into the active
@@ -1341,7 +1542,12 @@ func (sm *SessionManager) materializeAttachments(
 		if err != nil {
 			return nil, fmt.Errorf("open attachment %q: %w", attachment.AttachmentID, err)
 		}
-		materialized, materializeErr := execution.agentctl.MaterializeAttachment(
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		if client == nil {
+			_ = reader.Close()
+			return nil, fmt.Errorf("execution %q has no agentctl client", execution.ID)
+		}
+		materialized, materializeErr := client.MaterializeAttachment(
 			ctx,
 			execution.ACPSessionID,
 			attachment.AttachmentID,
@@ -1350,6 +1556,7 @@ func (sm *SessionManager) materializeAttachments(
 			sizeBytes,
 			reader,
 		)
+		releaseClient()
 		closeErr := reader.Close()
 		if materializeErr != nil {
 			return nil, fmt.Errorf("materialize attachment %q: %w", attachment.AttachmentID, materializeErr)
@@ -1432,9 +1639,6 @@ func (sm *SessionManager) preparePrompt(
 			sm.logger.Warn("failed to store user message to history", zap.Error(err))
 		}
 	}
-	execution.lastActivityAtMu.Lock()
-	execution.lastActivityAt = time.Now()
-	execution.lastActivityAtMu.Unlock()
 	return ctx, effectivePrompt, promptGeneration, nil
 }
 
@@ -1461,15 +1665,30 @@ func (sm *SessionManager) triggerPrompt(
 }
 
 func waitForPendingDispatchedPrompt(ctx context.Context, execution *AgentExecution) error {
-	if !execution.dispatchedPromptPending {
+	if !execution.dispatchedPromptPending.Load() {
 		return nil
 	}
+	timer := time.NewTimer(pendingDispatchedPromptWaitTimeout)
+	defer timer.Stop()
 	select {
 	case <-execution.promptDoneCh:
-		execution.dispatchedPromptPending = false
+		execution.dispatchedPromptPending.Store(false)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-timer.C:
+		// Prefer a completion that arrived at the timeout boundary. If no
+		// signal is available, retain the gate for cancellation escalation.
+		select {
+		case <-execution.promptDoneCh:
+			execution.dispatchedPromptPending.Store(false)
+			return nil
+		default:
+			return &PendingDispatchedPromptTimeoutError{
+				ExecutionID: execution.ID,
+				Timeout:     pendingDispatchedPromptWaitTimeout,
+			}
+		}
 	}
 }
 
@@ -1481,7 +1700,7 @@ func (sm *SessionManager) finishAcceptedPrompt(
 	promptGeneration uint64,
 ) (*PromptResult, error) {
 	if dispatchOnly {
-		execution.dispatchedPromptPending = true
+		execution.dispatchedPromptPending.Store(true)
 	}
 	if onDispatched != nil {
 		onDispatched()
@@ -1504,10 +1723,15 @@ func (sm *SessionManager) callAgentctlPrompt(
 	promptGeneration uint64,
 	steer bool,
 ) error {
-	if steer {
-		return execution.agentctl.PromptSteer(ctx, prompt, attachments, promptGeneration)
+	client, releaseClient := execution.AcquireAgentCtlClient()
+	defer releaseClient()
+	if client == nil {
+		return fmt.Errorf("execution %q has no agentctl client", execution.ID)
 	}
-	return execution.agentctl.Prompt(ctx, prompt, attachments, promptGeneration)
+	if steer {
+		return client.PromptSteer(ctx, prompt, attachments, promptGeneration)
+	}
+	return client.Prompt(ctx, prompt, attachments, promptGeneration)
 }
 
 func (sm *SessionManager) dispatchPrompt(
@@ -1559,7 +1783,13 @@ func (sm *SessionManager) retryPromptAfterReconnect(
 
 	var lastErr error
 	for {
-		if !execution.agentctl.HasAgentStream() {
+		client, releaseClient := execution.AcquireAgentCtlClient()
+		if client == nil {
+			return fmt.Errorf("execution %q has no agentctl client", execution.ID)
+		}
+		hasAgentStream := client.HasAgentStream()
+		releaseClient()
+		if !hasAgentStream {
 			ready := make(chan struct{})
 			sm.streamManager.connectUpdatesStreamAsync(execution, ready)
 
@@ -1573,7 +1803,13 @@ func (sm *SessionManager) retryPromptAfterReconnect(
 			}
 		}
 
-		if execution.agentctl.HasAgentStream() {
+		client, releaseClient = execution.AcquireAgentCtlClient()
+		if client == nil {
+			return fmt.Errorf("execution %q has no agentctl client", execution.ID)
+		}
+		hasAgentStream = client.HasAgentStream()
+		releaseClient()
+		if hasAgentStream {
 			if err := sm.callAgentctlPrompt(
 				reconnectCtx, execution, prompt, attachments, promptGeneration, steer,
 			); err == nil {

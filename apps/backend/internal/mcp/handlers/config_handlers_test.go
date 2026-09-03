@@ -384,7 +384,11 @@ type recordingMessageQueuer struct {
 	calls []messagequeue.QueuedMessage
 }
 
-func (r *recordingMessageQueuer) QueueMessage(_ context.Context, sessionID, taskID, content, model, userID string, planMode bool, _ []messagequeue.MessageAttachment) (*messagequeue.QueuedMessage, error) {
+func (r *recordingMessageQueuer) QueueMessage(ctx context.Context, sessionID, taskID, content, model, userID string, planMode bool, attachments []messagequeue.MessageAttachment) (*messagequeue.QueuedMessage, error) {
+	return r.QueueMessageWithMetadata(ctx, sessionID, taskID, content, model, userID, planMode, attachments, nil)
+}
+
+func (r *recordingMessageQueuer) QueueMessageWithMetadata(_ context.Context, sessionID, taskID, content, model, userID string, planMode bool, _ []messagequeue.MessageAttachment, metadata map[string]interface{}) (*messagequeue.QueuedMessage, error) {
 	msg := messagequeue.QueuedMessage{
 		SessionID: sessionID,
 		TaskID:    taskID,
@@ -392,6 +396,7 @@ func (r *recordingMessageQueuer) QueueMessage(_ context.Context, sessionID, task
 		Model:     model,
 		PlanMode:  planMode,
 		QueuedBy:  userID,
+		Metadata:  metadata,
 	}
 	r.calls = append(r.calls, msg)
 	return &msg, nil
@@ -465,7 +470,7 @@ func TestQueueMoveTaskPrompt_QueuesWithExpectedFields(t *testing.T) {
 	assert.Equal(t, "session-99", got.SessionID)
 	assert.Equal(t, "task-1", got.TaskID)
 	assert.Equal(t, "Please fix the failing test in foo_test.go", got.Content)
-	assert.Equal(t, "mcp-move-task", got.QueuedBy)
+	assert.Equal(t, messagequeue.QueuedByMoveTask, got.QueuedBy)
 	assert.False(t, got.PlanMode)
 	assert.Equal(t, "", got.Model)
 }
@@ -500,6 +505,32 @@ func TestHandleArchiveTask_MissingTaskID(t *testing.T) {
 	resp, err := h.handleArchiveTask(context.Background(), msg)
 	require.NoError(t, err)
 	assertWSError(t, resp, ws.ErrorCodeValidation)
+}
+
+func TestHandleArchiveTask_UsesHandoffCascadeWhenConfigured(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-handoff", Name: "Handoff"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-handoff", WorkspaceID: "ws-handoff", Name: "Board"}))
+	task := &models.Task{ID: "handoff-archive", WorkspaceID: "ws-handoff", WorkflowID: "wf-handoff", Title: "Archive", State: v1.TaskStateTODO}
+	require.NoError(t, repo.CreateTask(ctx, task))
+
+	h := &Handlers{
+		taskSvc:    svc,
+		handoffSvc: service.NewHandoffService(repo, repo, nil, nil, nil, testLogger(t)),
+		logger:     testLogger(t).WithFields(),
+	}
+	msg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{"task_id": task.ID})
+	resp, err := h.handleArchiveTask(ctx, msg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+
+	var cascadeID string
+	require.NoError(t, repo.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(archived_by_cascade_id, '') FROM tasks WHERE id = ?`, task.ID).Scan(&cascadeID))
+	if cascadeID == "" {
+		t.Fatal("MCP archive did not use HandoffService cascade path")
+	}
 }
 
 func TestHandleArchiveTask_InvalidPayload(t *testing.T) {
@@ -590,6 +621,74 @@ func TestHandleArchiveTask_MergedPRRunAcceptsBoundTarget(t *testing.T) {
 	archived, err := svc.GetTask(ctx, target.ID)
 	require.NoError(t, err)
 	assert.NotNil(t, archived.ArchivedAt)
+}
+
+// TestHandleArchiveTask_MergedPRRunAcceptsRefreshedTargetAfterResume is the
+// regression guard for the reuse_thread + github_pr_merged defect: once a
+// resumed continuation task's metadata is refreshed for a NEW firing (as
+// orchestrator.refreshAutomationContinuationMetadata now does), the guard
+// must bind to the refreshed target, not the stale one from the first
+// firing. It exercises the metadata mutation through repo.SetTaskMetadataKey
+// — the exact concurrent-key-safe primitive, on the exact same *sqliterepo.
+// Repository type, that orchestrator.refreshAutomationContinuationMetadata
+// calls in production (rather than the unrelated Service.UpdateTaskMetadata
+// full-row path) — so this proves the guard accepts a binding written the
+// same way production writes it, not just whatever happens to be in the DB.
+func TestHandleArchiveTask_MergedPRRunAcceptsRefreshedTargetAfterResume(t *testing.T) {
+	svc, repo := newTestTaskService(t)
+	ctx := context.Background()
+	require.NoError(t, repo.CreateWorkspace(ctx, &models.Workspace{ID: "ws-resume", Name: "Resume"}))
+	require.NoError(t, repo.CreateWorkflow(ctx, &models.Workflow{ID: "wf-resume", WorkspaceID: "ws-resume", Name: "Board"}))
+
+	firstTarget := &models.Task{
+		ID: "first-target", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "First merge target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, firstTarget))
+	secondTarget := &models.Task{
+		ID: "second-target", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "Second merge target", State: v1.TaskStateTODO,
+	}
+	require.NoError(t, repo.CreateTask(ctx, secondTarget))
+	caller := &models.Task{
+		ID: "automation-run", WorkspaceID: "ws-resume", WorkflowID: "wf-resume",
+		Title: "Automation run", State: v1.TaskStateTODO,
+		Origin: models.TaskOriginAutomationRun,
+		Metadata: map[string]interface{}{
+			"trigger_type":                       "github_pr_merged",
+			models.MetaKeyAutomationTargetTaskID: firstTarget.ID,
+		},
+	}
+	require.NoError(t, repo.CreateTask(ctx, caller))
+
+	h := &Handlers{taskSvc: svc, logger: testLogger(t).WithFields()}
+
+	// A second firing resumes the same continuation task and refreshes its
+	// binding — this is what orchestrator.refreshAutomationContinuationMetadata
+	// does on the reuse path, one key at a time via the same primitive.
+	require.NoError(t, repo.SetTaskMetadataKey(ctx, caller.ID, "trigger_type", "github_pr_merged"))
+	require.NoError(t, repo.SetTaskMetadataKey(ctx, caller.ID, models.MetaKeyAutomationTargetTaskID, secondTarget.ID))
+
+	// The second merge's target is now accepted...
+	secondMsg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": secondTarget.ID, "caller_task_id": caller.ID,
+	})
+	resp, err := h.handleArchiveTask(ctx, secondMsg)
+	require.NoError(t, err)
+	require.Equal(t, ws.MessageTypeResponse, resp.Type)
+	archived, err := svc.GetTask(ctx, secondTarget.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, archived.ArchivedAt, "the refreshed target must be archivable")
+
+	// ...and the stale first target is correctly refused against the now-current
+	// binding while it is still unarchived, so this assertion specifically tests
+	// the target guard rather than ordinary archive validation.
+	staleMsg := makeWSMessage(t, ws.ActionMCPArchiveTask, map[string]string{
+		"task_id": firstTarget.ID, "caller_task_id": caller.ID,
+	})
+	resp, err = h.handleArchiveTask(ctx, staleMsg)
+	require.NoError(t, err)
+	assertWSError(t, resp, ws.ErrorCodeValidation)
 }
 
 func TestHandleArchiveTask_MergedPRRunRejectsMissingBinding(t *testing.T) {
@@ -998,6 +1097,7 @@ func TestDeferMoveTask_AcceptsValidStep(t *testing.T) {
 		"workflow_id":       "wf-defer3",
 		"workflow_step_id":  "dst-step3",
 		"position":          0,
+		"prompt":            "continue the work",
 		"sender_session_id": "sess-caller3",
 	})
 
@@ -1007,6 +1107,9 @@ func TestDeferMoveTask_AcceptsValidStep(t *testing.T) {
 	require.Len(t, queue.pendingMoves, 1)
 	assert.Equal(t, "dst-step3", queue.pendingMoves[0].WorkflowStepID)
 	assert.Equal(t, "sess-caller3", queue.pendingMoves[0].SenderSessionID)
+	assert.NotEmpty(t, queue.pendingMoves[0].MoveID)
+	require.Len(t, queue.calls, 1)
+	assert.Equal(t, queue.pendingMoves[0].MoveID, queue.calls[0].Metadata[messagequeue.MetadataDeferredMoveID])
 }
 
 func TestMoveTaskErrorMessage_SanitizesClassifiedErrors(t *testing.T) {

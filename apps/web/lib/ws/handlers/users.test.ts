@@ -5,10 +5,12 @@ import { defaultState } from "@/lib/state/default-state";
 import type { AppState } from "@/lib/state/store";
 import type { BackendMessageMap } from "@/lib/types/backend";
 
+/** Creates a vanilla Zustand store seeded with a structured clone of the default app state. */
 function makeStore() {
   return createStore<AppState>(() => structuredClone(defaultState) as AppState);
 }
 
+/** Builds a `user.settings.updated` notification frame merging the given payload over default values. */
 function userSettingsMessage(
   payload: Partial<BackendMessageMap["user.settings.updated"]["payload"]>,
 ): BackendMessageMap["user.settings.updated"] {
@@ -23,6 +25,60 @@ function userSettingsMessage(
     },
   };
 }
+
+function recentUseMessage(
+  payload: Partial<BackendMessageMap["user.agent_profile_recent_use.updated"]["payload"]>,
+): BackendMessageMap["user.agent_profile_recent_use.updated"] {
+  return {
+    type: "notification",
+    action: "user.agent_profile_recent_use.updated",
+    payload: {
+      context: "task_create",
+      profile_ids: [],
+      revision: 1,
+      updated_at: "2026-08-27T12:00:00Z",
+      ...payload,
+    },
+  };
+}
+
+describe("agent profile recent-use websocket sync", () => {
+  it("keeps newer context revisions and accepts independent contexts", () => {
+    const store = makeStore();
+    store.setState((state) => ({
+      ...state,
+      agentProfileRecentUse: {
+        loaded: true,
+        records: {
+          task_create: { profileIds: ["profile-new"], revision: 2, updatedAt: "later" },
+        },
+      },
+    }));
+
+    const handler = registerUsersHandlers(store)["user.agent_profile_recent_use.updated"];
+    handler?.(
+      recentUseMessage({
+        profile_ids: ["profile-old"],
+        revision: 1,
+        updated_at: "older",
+      }),
+    );
+    expect(store.getState().agentProfileRecentUse.records.task_create?.profileIds).toEqual([
+      "profile-new",
+    ]);
+
+    handler?.(
+      recentUseMessage({
+        context: "quick_chat",
+        profile_ids: ["profile-chat"],
+        revision: 1,
+      }),
+    );
+    expect(store.getState().agentProfileRecentUse.records.quick_chat?.profileIds).toEqual([
+      "profile-chat",
+    ]);
+  });
+});
 
 describe("startup page websocket sync", () => {
   it("applies startup page preferences and normalizes unknown values", () => {
@@ -100,6 +156,46 @@ describe("status bar visibility websocket sync", () => {
       appStatusBarEnabled: true,
       revision: 3,
     });
+  });
+});
+
+describe("last seen display websocket sync", () => {
+  it("applies a relative value and normalizes unknown values", () => {
+    const store = makeStore();
+    expect(store.getState().userSettings.lastSeenDisplay).toBe("absolute");
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({ last_seen_display: "relative" }),
+    );
+    expect(store.getState().userSettings.lastSeenDisplay).toBe("relative");
+
+    registerUsersHandlers(store)["user.settings.updated"]?.(
+      userSettingsMessage({
+        last_seen_display: "unexpected",
+      } as unknown as Partial<BackendMessageMap["user.settings.updated"]["payload"]>),
+    );
+    expect(store.getState().userSettings.lastSeenDisplay).toBe("absolute");
+  });
+
+  it("preserves the current value when omitted", () => {
+    const store = makeStore();
+    store.setState((state) => ({
+      ...state,
+      userSettings: { ...state.userSettings, lastSeenDisplay: "relative" },
+    }));
+    registerUsersHandlers(store)["user.settings.updated"]?.(userSettingsMessage({}));
+    expect(store.getState().userSettings.lastSeenDisplay).toBe("relative");
+  });
+
+  it("ignores older settings revisions", () => {
+    const store = makeStore();
+    store.setState((state) => ({
+      ...state,
+      userSettings: { ...state.userSettings, lastSeenDisplay: "absolute", revision: 2 },
+    }));
+    const handler = registerUsersHandlers(store)["user.settings.updated"];
+    handler?.(userSettingsMessage({ last_seen_display: "relative", revision: 1 }));
+    expect(store.getState().userSettings.lastSeenDisplay).toBe("absolute");
   });
 });
 

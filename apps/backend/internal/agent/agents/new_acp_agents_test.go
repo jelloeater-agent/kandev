@@ -2,7 +2,10 @@ package agents
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -21,8 +24,8 @@ type acpAgentSpec struct {
 	// detectBinaries lists every binary name IsInstalled accepts via
 	// WithCommand. Used by TestNewACPAgents_DetectionRequiresGlobalBinary
 	// to skip the test whenever ANY of these is on PATH — otherwise an
-	// agent with multiple WithCommand fallbacks (e.g. Pi accepts both
-	// `pi-acp` and `pi`) flakes when the secondary binary is present.
+	// agent with multiple WithCommand fallbacks flakes when a secondary binary
+	// is present.
 	detectBinaries  []string
 	expectedArgv    []string // BuildCommand and Runtime.Cmd
 	inferenceArgv   []string // InferenceConfig.Command
@@ -76,11 +79,12 @@ var newACPAgentSpecs = []struct {
 		sessionDirTemplate: "{home}/.kilocode",
 	}},
 	{func() Agent { return NewPiACP() }, acpAgentSpec{
-		id: "pi-acp", displayName: "Pi", detectBinaries: []string{"pi-acp", "pi"},
+		id: "pi-acp", displayName: "Pi", detectBinaries: []string{"pi"},
 		expectedArgv:       []string{"npx", "-y", "pi-acp"},
 		inferenceArgv:      []string{"npx", "-y", "pi-acp"},
-		passthroughArgv:    []string{"npx", "-y", "pi-acp"},
+		passthroughArgv:    []string{"pi"},
 		installViaNpm:      true,
+		installScript:      "npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
 		sessionDirTemplate: "{home}/.pi",
 	}},
 	{func() Agent { return NewCursorACP() }, acpAgentSpec{
@@ -231,6 +235,29 @@ func TestNewACPAgents_AllCommandSurfaces(t *testing.T) {
 	}
 }
 
+// TestAuggieRuntime_DeclaresServerNamespacedMCPTools covers
+// AC-TASKS-MCP-TOOL-NAMES-001.1 and .2.
+func TestAuggieRuntime_DeclaresServerNamespacedMCPTools(t *testing.T) {
+	tests := []struct {
+		name string
+		new  func() Agent
+		want bool
+	}{
+		{name: "auggie", new: func() Agent { return NewAuggie() }, want: true},
+		{name: "cursor", new: func() Agent { return NewCursorACP() }, want: false},
+		{name: "codex", new: func() Agent { return NewCodexACP() }, want: false},
+		{name: "claude", new: func() Agent { return NewClaudeACP() }, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.new().Runtime().NamespacesMCPToolsByServer
+			if got != tt.want {
+				t.Errorf("NamespacesMCPToolsByServer = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestNewACPAgents_SessionDirTemplate pins the session root each agent
 // declares. The lifecycle manager turns SessionDirTemplate into the
 // bind-mount source under <kandev-home>/agent-sessions/<instance>/, so an
@@ -295,7 +322,7 @@ func TestNewACPAgents_InstallScript(t *testing.T) {
 // to use. detectBinaries comes from the spec table so npx-launched agents
 // (whose argv[0] is "npx") are still verified against their real detection
 // targets (qwen, iflow, droid, …), and agents with multiple WithCommand
-// fallbacks (e.g. Pi accepts both `pi-acp` and `pi`) skip the test
+// fallbacks skip the test
 // whenever ANY of those is on PATH so the test doesn't flake on CI hosts
 // that happen to have a generic `pi` (Raspberry Pi tooling) installed.
 func TestNewACPAgents_DetectionRequiresGlobalBinary(t *testing.T) {
@@ -315,6 +342,27 @@ func TestNewACPAgents_DetectionRequiresGlobalBinary(t *testing.T) {
 					tc.spec.detectBinaries)
 			}
 		})
+	}
+}
+
+func TestPiACPDetectionRejectsPiBinaryWithoutVersionSupport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell executable fixture is Unix-specific")
+	}
+
+	binDir := t.TempDir()
+	piPath := filepath.Join(binDir, "pi")
+	if err := os.WriteFile(piPath, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write fake pi executable: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	result, err := NewPiACP().IsInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("IsInstalled error: %v", err)
+	}
+	if result.Available {
+		t.Fatalf("Available=true for pi executable that fails --version")
 	}
 }
 

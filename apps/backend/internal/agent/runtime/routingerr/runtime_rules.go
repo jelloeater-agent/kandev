@@ -13,6 +13,21 @@ import "regexp"
 // signal-specific metadata (e.g. RemediationPath) from the raw text.
 var runtimeEnvironmentRules = []runtimeRule{
 	{
+		// npm 9 and npm 10 use different casing for the error prefix. Require
+		// both the ETARGET code and the matching package@version diagnostic in
+		// one bounded sample so generic disconnects and registry errors do not
+		// trigger managed-runtime recovery.
+		id:            "npm.etarget.managed_runtime.v1",
+		pattern:       managedRuntimeNpmResolutionRe,
+		sanitizedOnly: true,
+		build: func(string) *Error {
+			return &Error{
+				Code:       CodeManagedRuntimeNpmResolution,
+				Confidence: ConfHigh,
+			}
+		},
+	},
+	{
 		id:      "npm.enotempty.npx.v1",
 		pattern: regexp.MustCompile(`(?s)npm error code ENOTEMPTY.*?_npx/[0-9a-f]+`),
 		build: func(text string) *Error {
@@ -60,6 +75,23 @@ var runtimeEnvironmentRules = []runtimeRule{
 		},
 	},
 	{
+		// Cursor emits this exact control prefix as an assistant message chunk
+		// when its upstream HTTP/2 stream resets. Keep the fingerprint anchored
+		// to the control frame and bounded so user-authored prose cannot turn
+		// into an automatic retry.
+		id:      cursorRetriableStreamResetRuleID,
+		pattern: cursorRetriableStreamResetRe,
+		build: func(text string) *Error {
+			if cancellationOrDeadlineRe.MatchString(text) {
+				return nil
+			}
+			return &Error{
+				Code:       CodeAgentTransportLost,
+				Confidence: ConfHigh,
+			}
+		},
+	},
+	{
 		// The ACP transport pipe died mid-turn: the upstream provider service
 		// dropped the connection before a response arrived. This is
 		// provider-agnostic wire-level transport death, not a model or
@@ -85,6 +117,10 @@ var runtimeEnvironmentRules = []runtimeRule{
 	},
 }
 
+var managedRuntimeNpmResolutionRe = regexp.MustCompile(
+	`(?ism)^\s*npm\s+(ERR!|error)\s+code\s+ETARGET\b[\s\S]{0,999}^\s*npm\s+(ERR!|error)\s+notarget\s+No matching version found for\s+\S+@\S+`,
+)
+
 // cancellationOrDeadlineRe matches context-cancellation and deadline
 // signatures that can co-occur with the transport-lost wording in the same
 // error string. Kept separate from transportLostRe so the two can be
@@ -96,6 +132,8 @@ const resumeCorruptedRuleID = "anthropic.thinking_blocks.immutable.v1"
 
 const overloadedRuleID = "anthropic.overloaded.529.v1"
 
+const cursorRetriableStreamResetRuleID = "cursor.retriable_stream_reset.v1"
+
 const transportLostRuleID = "acp.transport_lost.v1"
 
 // transportLostRe matches the narrow ACP wire-level transport-death
@@ -104,6 +142,13 @@ const transportLostRuleID = "acp.transport_lost.v1"
 // substrings) so it never matches context-cancellation or shutdown-teardown
 // error strings, which must keep falling through to manual recovery.
 var transportLostRe = regexp.MustCompile(`(?i)peer disconnected|connection closed`)
+
+// cursorRetriableStreamResetRe matches Cursor's complete control diagnostic.
+// Requiring the whole normalized message prevents ordinary provider prose from
+// combining the control prefix with an unrelated transport fragment.
+var cursorRetriableStreamResetRe = regexp.MustCompile(
+	`(?i)^\s*Error:\s*RetriableError:\s*HTTP/2 stream closed with error code CANCEL \(0x8\)(?:\s+\[canceled\])?\s*$`,
+)
 
 // overloadedRe matches the transient 529 Overloaded signature: either the
 // numeric code adjacent to "overloaded" on a single line (in either order), or
@@ -148,9 +193,10 @@ func IsResumeCorrupted(message string) bool {
 }
 
 type runtimeRule struct {
-	id      string
-	pattern *regexp.Regexp
-	build   func(text string) *Error
+	id            string
+	pattern       *regexp.Regexp
+	build         func(text string) *Error
+	sanitizedOnly bool
 }
 
 // npxCachePathRe captures the cache root, e.g.
@@ -171,10 +217,21 @@ func extractNpxCachePath(text string) string {
 }
 
 func matchRuntimeEnvironmentRules(text string) (*Error, bool) {
+	return matchRuntimeRules(text, false)
+}
+
+func matchLegacyRuntimeEnvironmentRules(text string) (*Error, bool) {
+	return matchRuntimeRules(text, true)
+}
+
+func matchRuntimeRules(text string, legacyOnly bool) (*Error, bool) {
 	if text == "" {
 		return nil, false
 	}
 	for _, r := range runtimeEnvironmentRules {
+		if legacyOnly && r.sanitizedOnly {
+			continue
+		}
 		if !r.pattern.MatchString(text) {
 			continue
 		}

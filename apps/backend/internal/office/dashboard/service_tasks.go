@@ -44,8 +44,10 @@ func (s *DashboardService) UpdateTaskPriority(ctx context.Context, taskID, prior
 // project. When non-empty, validates that the project belongs to the same
 // workspace as the task.
 func (s *DashboardService) UpdateTaskProjectID(ctx context.Context, taskID, projectID string) error {
+	var taskWS string
 	if projectID != "" {
-		taskWS, err := s.repo.GetTaskWorkspaceID(ctx, taskID)
+		var err error
+		taskWS, err = s.repo.GetTaskWorkspaceID(ctx, taskID)
 		if err != nil {
 			return fmt.Errorf("resolve task workspace: %w", err)
 		}
@@ -57,8 +59,34 @@ func (s *DashboardService) UpdateTaskProjectID(ctx context.Context, taskID, proj
 			return fmt.Errorf("project %s belongs to a different workspace", projectID)
 		}
 	}
+	// Read the pre-write project so a no-op PATCH (destination == current)
+	// doesn't trigger a budget re-evaluation below: nothing crossed a
+	// threshold, so evaluatePolicy's unconditional alert/exceeded logging
+	// would otherwise write a fresh activity row on every retry. A read
+	// error is treated as "changed" (fail open to evaluating, the prior
+	// behavior) rather than silently skipping. Only read when a
+	// reassignment could actually trigger an evaluation.
+	needsChangeCheck := projectID != "" && s.projectBudget != nil
+	var prevProjectID string
+	var prevErr error
+	if needsChangeCheck {
+		prevProjectID, prevErr = s.repo.GetTaskProjectID(ctx, taskID)
+	}
+
 	if err := s.repo.UpdateTaskProjectID(ctx, taskID, projectID); err != nil {
 		return err
+	}
+	// Best-effort: the write above has already committed, so an evaluation
+	// error here is logged, not returned. Mirrors event_subscribers.go's
+	// post-cost-event budget check. Evaluate before publishing the task event
+	// so a client's refetch can observe any activity row created by the check.
+	if needsChangeCheck && (prevErr != nil || prevProjectID != projectID) {
+		if err := s.projectBudget.EvaluateProjectBudget(ctx, taskWS, projectID); err != nil {
+			s.logger.Warn("project budget evaluation failed on reassignment",
+				zap.String("task_id", taskID),
+				zap.String("project_id", projectID),
+				zap.Error(err))
+		}
 	}
 	s.publishTaskUpdated(ctx, taskID, []string{"project_id"})
 	return nil
@@ -476,6 +504,7 @@ func (s *DashboardService) UpdateTaskStatus(ctx context.Context, req TaskStatusU
 	}
 
 	commentID := s.maybeCreateStatusComment(ctx, req)
+	s.logTaskStatusChangeActivity(ctx, req)
 	s.publishTaskStatusChanged(ctx, req)
 	s.runReactivityForStatus(ctx, req, commentID, preStatus)
 	s.maybeSupersedeOnRework(ctx, req.TaskID, preStatus, dbState)
@@ -495,6 +524,38 @@ func (s *DashboardService) UpdateTaskStatusAsAgent(
 		Comment:      update.Comment,
 		ActorAgentID: update.ActorAgentID,
 	})
+}
+
+// logTaskStatusChangeActivity records the task_status_changed activity row
+// synchronously, in-process, before the OfficeTaskStatusChanged event is
+// published. This used to be an async event-bus subscriber
+// (office/service.Service.handleTaskStatusChanged); under a NATS-backed
+// bus, that subscriber and the WS broadcast subscriber that triggers the
+// frontend's task-detail refetch raced independently, so a browser GET
+// could land before the activity row existed and see stale Started/
+// Completed sidebar values with nothing left to trigger a corrective
+// refetch. Writing the row here, ahead of publishTaskStatusChanged,
+// makes the row durable before the event (and therefore the broadcast)
+// can ever fire, regardless of bus implementation. Best-effort: mirrors
+// logBlockerActivity's activity==nil guard.
+func (s *DashboardService) logTaskStatusChangeActivity(ctx context.Context, req TaskStatusUpdateRequest) {
+	if s.activity == nil {
+		return
+	}
+	wsID, _ := s.repo.GetTaskWorkspaceID(ctx, req.TaskID)
+	actorType := "system"
+	actorID := "office-scheduler"
+	if req.ActorAgentID != "" {
+		actorType = activityActorTypeAgent
+		actorID = req.ActorAgentID
+	}
+	runID := ""
+	if s.runResolver != nil {
+		runID = s.runResolver.ResolveRunForTask(ctx, req.TaskID)
+	}
+	s.activity.LogActivityWithRun(ctx, wsID, actorType, actorID,
+		"task_status_changed", "task", req.TaskID,
+		fmt.Sprintf(`{"new_status":%q}`, req.NewStatus), runID, "")
 }
 
 // applyApprovalGate redirects a "done" transition to in_review when

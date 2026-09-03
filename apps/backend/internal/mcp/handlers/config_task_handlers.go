@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/kandev/kandev/internal/automation"
 	"github.com/kandev/kandev/internal/orchestrator/messagequeue"
 	"github.com/kandev/kandev/internal/steptelemetry"
@@ -154,9 +156,10 @@ func (h *Handlers) deferMoveTask(
 		}
 	}
 
+	moveID := uuid.NewString()
 	if req.Prompt != "" {
 		wrapped := "You were moved to this step with the following message: " + req.Prompt
-		if err := h.queueMoveTaskPrompt(ctx, req.TaskID, session.ID, wrapped); err != nil {
+		if err := h.queueMoveTaskPromptWithMoveID(ctx, req.TaskID, session.ID, wrapped, moveID); err != nil {
 			h.logger.Error("move_task: failed to queue hand-off prompt",
 				zap.String("task_id", req.TaskID), zap.String("session_id", session.ID), zap.Error(err))
 			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError,
@@ -164,6 +167,7 @@ func (h *Handlers) deferMoveTask(
 		}
 	}
 	h.messageQueue.SetPendingMove(ctx, session.ID, &messagequeue.PendingMove{
+		MoveID:          moveID,
 		TaskID:          req.TaskID,
 		WorkflowID:      req.WorkflowID,
 		WorkflowStepID:  req.WorkflowStepID,
@@ -321,13 +325,27 @@ func (h *Handlers) lookupSession(ctx context.Context, taskID string) (*models.Ta
 // or proceed (idle path), since a queue failure makes the deferred contract
 // impossible to honor.
 func (h *Handlers) queueMoveTaskPrompt(ctx context.Context, taskID, sessionID, prompt string) error {
+	return h.queueMoveTaskPromptWithMoveID(ctx, taskID, sessionID, prompt, "")
+}
+
+func (h *Handlers) queueMoveTaskPromptWithMoveID(ctx context.Context, taskID, sessionID, prompt, moveID string) error {
 	if h.messageQueue == nil {
 		return fmt.Errorf("message queue is unavailable")
 	}
 	if sessionID == "" {
 		return fmt.Errorf("task has no primary session")
 	}
-	if _, err := h.messageQueue.QueueMessage(ctx, sessionID, taskID, prompt, "", "mcp-move-task", false, nil); err != nil {
+	metadata := map[string]interface{}(nil)
+	if moveID != "" {
+		metadata = map[string]interface{}{messagequeue.MetadataDeferredMoveID: moveID}
+	}
+	if queueWithMetadata, ok := h.messageQueue.(messageMetadataQueuer); ok {
+		if _, err := queueWithMetadata.QueueMessageWithMetadata(ctx, sessionID, taskID, prompt, "", messagequeue.QueuedByMoveTask, false, nil, metadata); err != nil {
+			return fmt.Errorf("queue message: %w", err)
+		}
+		return nil
+	}
+	if _, err := h.messageQueue.QueueMessage(ctx, sessionID, taskID, prompt, "", messagequeue.QueuedByMoveTask, false, nil); err != nil {
 		return fmt.Errorf("queue message: %w", err)
 	}
 	return nil
@@ -342,6 +360,16 @@ func (h *Handlers) handleDeleteTask(ctx context.Context, msg *ws.Message) (*ws.M
 		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, "task_id is required", nil)
 	}
 
+	// Keep MCP task lifecycle mutations on the same HandoffService path as
+	// HTTP/WS when it is wired. This releases workspace-group membership and
+	// preserves shared-environment ownership before the task row is removed.
+	if h.handoffSvc != nil {
+		if _, err := h.handoffSvc.DeleteTaskTree(ctx, taskID, false); err != nil {
+			h.logger.Error("failed to delete task", zap.Error(err))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete task", nil)
+		}
+		return ws.NewResponse(msg.ID, msg.Action, map[string]interface{}{"success": true})
+	}
 	if err := h.taskSvc.DeleteTask(ctx, taskID); err != nil {
 		h.logger.Error("failed to delete task", zap.Error(err))
 		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to delete task", nil)
@@ -366,6 +394,18 @@ func (h *Handlers) handleArchiveTask(ctx context.Context, msg *ws.Message) (*ws.
 		return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeValidation, err.Error(), nil)
 	}
 
+	if h.handoffSvc != nil {
+		out, err := h.handoffSvc.ArchiveTaskTree(ctx, taskID, false)
+		if err != nil {
+			h.logger.Error("failed to archive task", zap.Error(err))
+			return ws.NewError(msg.ID, msg.Action, ws.ErrorCodeInternalError, "Failed to archive task", nil)
+		}
+		response := map[string]interface{}{"success": true}
+		if out != nil && len(out.ArchivedTaskIDs) == 0 && len(out.SkippedTaskIDs) > 0 {
+			response["already_archived"] = true
+		}
+		return ws.NewResponse(msg.ID, msg.Action, response)
+	}
 	if err := h.taskSvc.ArchiveTask(ctx, taskID); err != nil {
 		// Archiving is a goal-state operation: a task that is already archived
 		// is in the requested state, so report success instead of an opaque

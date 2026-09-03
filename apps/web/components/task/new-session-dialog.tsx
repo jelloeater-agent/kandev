@@ -14,11 +14,9 @@ import type { TaskFormInputsHandle } from "@/components/task-create-dialog-types
 import { useAgentProfileOptions } from "@/components/task-create-dialog-options";
 import { useSummarizeSession } from "@/hooks/use-summarize-session";
 import { useTaskSessions } from "@/hooks/use-task-sessions";
-import { useRemoteAuthSpecs } from "@/hooks/domains/settings/use-remote-auth-specs";
 import { useTaskExecutorProfile } from "@/hooks/domains/session/use-task-executor-profile";
-import { isAgentConfiguredOnExecutor } from "@/lib/agent-executor-compat";
+import { useCompatibleAgentProfiles } from "@/hooks/domains/session/use-compatible-agent-profiles";
 import type { AgentProfileOption } from "@/lib/state/slices";
-import { isSelectableAgentProfile } from "@/lib/state/slices/settings/types";
 import type { ExecutorProfile } from "@/lib/types/http";
 import { usePromptResultDelivery } from "@/hooks/use-prompt-result-delivery";
 import { buildHandoffInitialState, type HandoffPreset } from "./handoff-types";
@@ -27,6 +25,7 @@ import { useUtilityAgentGenerator } from "@/hooks/use-utility-agent-generator";
 import { PromptResultRecovery } from "@/components/prompt-result-recovery";
 import { EnvironmentBadges, ContextSelect } from "./session-dialog-shared";
 import { useSessionContextChange, useSessionLaunchSubmit } from "./new-session-form-actions";
+import { resolveNewSessionProfileSelection } from "./new-session-profile-selection";
 import { resolveComposerWorkspaceId } from "./chat/composer-workspace";
 import { Trans, useTranslation } from "react-i18next";
 
@@ -95,14 +94,6 @@ function useNewSessionDialogState(taskId: string) {
   });
 
   const sessionProfileId = currentSession?.agent_profile_id ?? "";
-  // The default for a NEW session must be selectable: a current session
-  // that uses a now-disabled profile still runs (no effect on existing
-  // sessions), but the dialog falls back to the first enabled profile.
-  const selectableProfiles = agentProfiles.filter(isSelectableAgentProfile);
-  const profileIsValid = selectableProfiles.some((p: { id: string }) => p.id === sessionProfileId);
-  const effectiveDefaultProfileId: string = profileIsValid
-    ? sessionProfileId
-    : (selectableProfiles[0]?.id ?? "");
 
   return {
     resolvedWorkspaceId,
@@ -113,7 +104,6 @@ function useNewSessionDialogState(taskId: string) {
     initialPrompt,
     executorLabel,
     sessionProfileId,
-    effectiveDefaultProfileId,
   };
 }
 
@@ -132,6 +122,7 @@ function activateNewSession(
 }
 
 function useSessionOptions(taskId: string) {
+  const { t } = useTranslation();
   const { sessions, loadSessions } = useTaskSessions(taskId);
   const agentProfiles = useAppStore((s) => s.agentProfiles.items);
   useEffect(() => {
@@ -144,10 +135,10 @@ function useSessionOptions(taskId: string) {
     );
     return sorted.map((s, idx) => {
       const profile = agentProfiles.find((p: { id: string }) => p.id === s.agent_profile_id);
-      const name = profile ? agentProfileDisplayLabel(profile) : "Agent";
+      const name = profile ? agentProfileDisplayLabel(profile) : t("task:panelAgent");
       return { id: s.id, label: name, index: idx + 1, agentName: profile?.agent_name };
     });
-  }, [sessions, agentProfiles]);
+  }, [sessions, agentProfiles, t]);
 }
 
 function isMissingCompatibleProfile(
@@ -158,18 +149,6 @@ function isMissingCompatibleProfile(
   if (!executorProfile) return false;
   if (totalAgentCount === 0) return false;
   return !hasCompatibleProfiles;
-}
-
-function useCompatibleAgentProfiles(
-  agentProfiles: AgentProfileOption[],
-  executorProfile: ExecutorProfile | null,
-): AgentProfileOption[] {
-  const { specs: authSpecs, loaded: authLoaded } = useRemoteAuthSpecs();
-  return useMemo(() => {
-    const selectable = agentProfiles.filter(isSelectableAgentProfile);
-    if (!executorProfile || !authLoaded) return selectable;
-    return selectable.filter((ap) => isAgentConfiguredOnExecutor(ap, executorProfile, authSpecs));
-  }, [agentProfiles, executorProfile, authSpecs, authLoaded]);
 }
 
 function useHandoffAutoSummarize(
@@ -235,37 +214,52 @@ function shouldDisableSubmit(isBusy: boolean, hasPrompt: boolean, hasProfiles: b
   return submitPenalty > 0;
 }
 
-function useEnforceCompatibleProfile(
-  compatible: AgentProfileOption[],
-  selectedId: string,
-  setSelected: (id: string) => void,
-) {
-  useEffect(() => {
-    if (compatible.some((p) => p.id === selectedId)) return;
-    if (compatible.length > 0) {
-      setSelected(compatible[0].id);
-    } else if (selectedId) {
-      setSelected("");
-    }
-  }, [compatible, selectedId, setSelected]);
-}
-
 function useSessionProfileSelection({
   agentProfiles,
   executorProfile,
-  defaultProfileId,
-  selectedProfileId,
-  setSelectedProfileId,
+  currentProfileId,
+  handoff,
 }: {
   agentProfiles: AgentProfileOption[];
   executorProfile: ExecutorProfile | null;
-  defaultProfileId: string;
-  selectedProfileId: string;
-  setSelectedProfileId: (value: string) => void;
+  currentProfileId: string;
+  handoff?: HandoffPreset;
 }) {
-  const compatibleAgentProfiles = useCompatibleAgentProfiles(agentProfiles, executorProfile);
-  useEnforceCompatibleProfile(compatibleAgentProfiles, selectedProfileId, setSelectedProfileId);
-  const profileOptions = useAgentProfileOptions(compatibleAgentProfiles);
+  const compatibleAgentProfiles = useCompatibleAgentProfiles(
+    agentProfiles,
+    executorProfile,
+    handoff,
+  );
+  const recentProfileIds = useAppStore(
+    (state) => state.agentProfileRecentUse?.records.task_session?.profileIds,
+  );
+  const automaticSelection = useMemo(
+    () =>
+      resolveNewSessionProfileSelection({
+        compatibleProfiles: compatibleAgentProfiles,
+        recentProfileIds,
+        currentProfileId,
+        handoffProfileId: handoff?.targetProfileId,
+      }),
+    [compatibleAgentProfiles, currentProfileId, handoff?.targetProfileId, recentProfileIds],
+  );
+  const [selectedProfileId, setSelectedProfileId] = useState(automaticSelection.profileId);
+  const [selectionSource, setSelectionSource] = useState(automaticSelection.source);
+  useEffect(() => {
+    const selectedIsCompatible = compatibleAgentProfiles.some(
+      (profile) => profile.id === selectedProfileId,
+    );
+    if (selectionSource === "manual" && selectedIsCompatible) return;
+    if (
+      selectedProfileId === automaticSelection.profileId &&
+      selectionSource === automaticSelection.source
+    ) {
+      return;
+    }
+    setSelectedProfileId(automaticSelection.profileId);
+    setSelectionSource(automaticSelection.source);
+  }, [automaticSelection, compatibleAgentProfiles, selectedProfileId, selectionSource]);
+  const profileOptions = useAgentProfileOptions(compatibleAgentProfiles, "task_session");
   const hasProfiles = profileOptions.length > 0;
   const noCompatibleProfiles = isMissingCompatibleProfile(
     executorProfile,
@@ -275,13 +269,21 @@ function useSessionProfileSelection({
   const showAgentSelector =
     hasProfiles &&
     (profileOptions.length > 1 ||
-      (!!defaultProfileId && !profileOptions.find((o) => o.value === defaultProfileId)));
+      (!!currentProfileId && !profileOptions.find((o) => o.value === currentProfileId)));
+  const onProfileChange = useCallback((value: string) => {
+    setSelectedProfileId(value);
+    setSelectionSource("manual");
+  }, []);
 
   return {
     profileOptions,
     hasProfiles,
     noCompatibleProfiles,
     showAgentSelector,
+    selectedProfileId,
+    profileExplicit:
+      selectionSource === "handoff" || selectionSource === "recent" || selectionSource === "manual",
+    onProfileChange,
   };
 }
 
@@ -340,8 +342,7 @@ function SessionFormHeader({
 function NewSessionForm({
   taskId,
   workspaceId,
-  defaultProfileId,
-  initialProfileId,
+  currentProfileId,
   executorId,
   executorLabel,
   executorProfile,
@@ -354,8 +355,7 @@ function NewSessionForm({
 }: {
   taskId: string;
   workspaceId?: string | null;
-  defaultProfileId: string;
-  initialProfileId?: string;
+  currentProfileId: string;
   executorId: string;
   executorLabel: string | null;
   executorProfile: ExecutorProfile | null;
@@ -372,9 +372,6 @@ function NewSessionForm({
   const setActiveSession = useAppStore((state) => state.setActiveSession);
   const { summarize, isSummarizing } = useSummarizeSession();
   const [contextValue, setContextValue] = useState(handoffInitial?.contextValue ?? "blank");
-  const [selectedProfileId, setSelectedProfileId] = useState(
-    handoffInitial?.selectedProfileId ?? initialProfileId ?? defaultProfileId,
-  );
   const [hasPrompt, setHasPrompt] = useState(false);
   const [hasPendingAttachmentUploads, setHasPendingAttachmentUploads] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
@@ -386,9 +383,8 @@ function NewSessionForm({
   const profileSelection = useSessionProfileSelection({
     agentProfiles,
     executorProfile,
-    defaultProfileId,
-    selectedProfileId,
-    setSelectedProfileId,
+    currentProfileId,
+    handoff,
   });
   const { handleEnhancePrompt, isEnhancingPrompt, pendingResult, applyPending, copyPending } =
     useSessionPromptController(promptRef, taskId);
@@ -405,7 +401,8 @@ function NewSessionForm({
   const handleSubmit = useSessionLaunchSubmit({
     promptRef,
     taskId,
-    selectedProfileId,
+    selectedProfileId: profileSelection.selectedProfileId,
+    profileExplicit: profileSelection.profileExplicit,
     executorId,
     contextValue,
     initialPrompt,
@@ -431,9 +428,9 @@ function NewSessionForm({
         executorProfileName={executorProfile?.name ?? null}
         showAgentSelector={profileSelection.showAgentSelector}
         profileOptions={profileSelection.profileOptions}
-        selectedProfileId={selectedProfileId}
+        selectedProfileId={profileSelection.selectedProfileId}
         isCreating={isCreating}
-        onProfileChange={setSelectedProfileId}
+        onProfileChange={profileSelection.onProfileChange}
       />
       <ContextSelect
         value={contextValue}
@@ -557,7 +554,6 @@ export function NewSessionDialog({
     initialPrompt,
     executorLabel,
     sessionProfileId,
-    effectiveDefaultProfileId,
   } = useNewSessionDialogState(taskId);
   const executorProfile = useTaskExecutorProfile(taskId, open);
   const handoffLabel = handoffProfileLabel(agentProfiles, handoff);
@@ -589,8 +585,7 @@ export function NewSessionDialog({
           key={formKey}
           taskId={taskId}
           workspaceId={workspaceId ?? resolvedWorkspaceId}
-          defaultProfileId={sessionProfileId}
-          initialProfileId={effectiveDefaultProfileId}
+          currentProfileId={sessionProfileId}
           executorId={currentSession?.executor_id ?? ""}
           executorLabel={executorLabel}
           executorProfile={executorProfile}

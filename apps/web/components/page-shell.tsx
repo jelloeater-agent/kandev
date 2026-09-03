@@ -14,17 +14,18 @@ type PageShellProps = {
   backHref?: string;
   backLabel?: string;
   parents?: ParentCrumb[];
-  variant?: "breadcrumb" | "root";
+  titleSlot?: ReactNode;
   center?: ReactNode;
   leading?: ReactNode;
   leftActions?: ReactNode;
   actions?: ReactNode;
+  overflowActions?: ReactNode;
   className?: string;
   showStatusTrigger?: boolean;
   /** `data-testid` on the topbar header (e2e anchors like `office-topbar`). */
   topbarTestId?: string;
   /** In-section nav for the phone sheet: settings tree, office sections. */
-  pageNav?: ReactNode;
+  pageNav?: ReactNode | ((close: () => void) => ReactNode);
   /** Manifest destination ids `pageNav` already covers. See `AppNavSections`. */
   navOmitDestinations?: string[];
   /**
@@ -51,7 +52,6 @@ type PageShellProps = {
  * nest a second one.
  */
 export function PageShell({
-  variant = "breadcrumb",
   leading,
   pageNav,
   navOmitDestinations,
@@ -62,13 +62,12 @@ export function PageShell({
   children,
   ...topbarProps
 }: PageShellProps) {
-  const home = useHomeAffordance(variant);
+  const home = useHomeAffordance();
   const { topbarTestId, ...forwarded } = topbarProps;
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <PageTopbar
         {...forwarded}
-        variant={variant}
         testId={topbarTestId}
         homeAffordance={home.mode}
         homeHref={home.href}

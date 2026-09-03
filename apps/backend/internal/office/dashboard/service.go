@@ -14,6 +14,7 @@ import (
 	"github.com/kandev/kandev/internal/office/shared"
 	taskmodels "github.com/kandev/kandev/internal/task/models"
 	workflowmodels "github.com/kandev/kandev/internal/workflow/models"
+	v1 "github.com/kandev/kandev/pkg/api/v1"
 
 	"go.uber.org/zap"
 )
@@ -75,6 +76,7 @@ type Repository interface {
 	UpdateTaskAssignee(ctx context.Context, taskID, assigneeID string) error
 	UpdateTaskPriority(ctx context.Context, taskID, priority string) error
 	UpdateTaskProjectID(ctx context.Context, taskID, projectID string) error
+	GetTaskProjectID(ctx context.Context, taskID string) (string, error)
 	UpdateTaskParentID(ctx context.Context, taskID, parentID string) error
 	GetProjectWorkspaceID(ctx context.Context, projectID string) (string, error)
 	GetTaskWorkspaceID(ctx context.Context, taskID string) (string, error)
@@ -142,6 +144,23 @@ type GovernanceSettingsStore interface {
 // RetryCanceller is the interface used to cancel pending retries when a task is reassigned.
 type RetryCanceller interface {
 	CancelPendingRetriesForTask(ctx context.Context, taskID string) error
+}
+
+// ProjectBudgetEvaluator evaluates project-scoped budget policies for a
+// destination project. Wired to costs.CostService.EvaluateProjectBudget so
+// reassigning a task into a project re-checks that project's policies —
+// otherwise a notify_only threshold crossed purely by moving historical
+// spend (not a new cost event or agent launch) would never fire an alert.
+type ProjectBudgetEvaluator interface {
+	EvaluateProjectBudget(ctx context.Context, workspaceID, projectID string) error
+}
+
+// RunResolver resolves the originating office run id for a task, used
+// to attribute the task_status_changed activity row back to the run
+// that produced the transition. Optional dependency — when nil, the
+// activity row is logged with an empty run_id. Mirrors channels.RunResolver.
+type RunResolver interface {
+	ResolveRunForTask(ctx context.Context, taskID string) string
 }
 
 // TaskCanceller hard-cancels a task's active execution. Used by the
@@ -351,6 +370,20 @@ type DashboardService struct {
 	decisions        DecisionStore                   // workflow-domain decisions store (ADR 0005 Wave E); nil disables decision endpoints
 	routingProvider  RoutingProvider                 // optional; nil disables /routing endpoints (503)
 	attemptLister    RouteAttemptLister              // optional; nil disables attempt embedding on run-detail responses
+	runResolver      RunResolver                     // optional; nil means status-change activity rows have no run_id
+	projectBudget    ProjectBudgetEvaluator          // optional; nil means reassignment doesn't re-evaluate the destination project's budget policies
+	// officeSessionIdentity gates RecordAgentDecision's use of the caller's
+	// own session id. Defaults false (zero value); set via
+	// SetOfficeSessionIdentity, wired from features.officeSessionIdentity.
+	officeSessionIdentity bool
+}
+
+// SetOfficeSessionIdentity wires the features.officeSessionIdentity flag.
+// When true, RecordAgentDecision forwards the decider's own calling session
+// id so RecordDecision re-evaluates against it instead of the task's
+// most-recently-started ("active") session. Defaults false.
+func (s *DashboardService) SetOfficeSessionIdentity(enabled bool) {
+	s.officeSessionIdentity = enabled
 }
 
 // SetRoutingProvider wires the provider-routing seam used by the
@@ -449,6 +482,50 @@ func (s *DashboardService) SetSettingsProvider(p SettingsProvider) {
 // SetRetryCanceller sets the service used to cancel pending retries when a task is reassigned.
 func (s *DashboardService) SetRetryCanceller(c RetryCanceller) {
 	s.retryCanceller = c
+}
+
+// SetRunResolver wires the seam used to attribute status-change activity
+// rows back to the office run that produced them. Optional; when unset,
+// rows are logged with an empty run_id.
+func (s *DashboardService) SetRunResolver(r RunResolver) {
+	s.runResolver = r
+}
+
+// SetProjectBudgetEvaluator wires the seam used to re-evaluate a
+// destination project's budget policies on task reassignment. Optional;
+// when unset, UpdateTaskProjectID does not check budgets.
+func (s *DashboardService) SetProjectBudgetEvaluator(e ProjectBudgetEvaluator) {
+	s.projectBudget = e
+}
+
+// LogTaskStateChange records a task state transition for Office tasks before
+// the task service publishes its state-change notification. This keeps the
+// activity-backed timeline durable before clients refetch the task detail.
+// Non-Office tasks use the shared task service and are ignored here.
+func (s *DashboardService) LogTaskStateChange(
+	ctx context.Context, task *taskmodels.Task, oldState v1.TaskState,
+) {
+	if task == nil || oldState == task.State || s.activity == nil {
+		return
+	}
+	fields, err := s.repo.GetTaskExecutionFields(ctx, task.ID)
+	if err != nil || fields == nil || !fields.IsFromOffice {
+		return
+	}
+	wsID := fields.WorkspaceID
+	if wsID == "" {
+		wsID = task.WorkspaceID
+	}
+	runID := ""
+	if s.runResolver != nil {
+		runID = s.runResolver.ResolveRunForTask(ctx, task.ID)
+	}
+	details, _ := json.Marshal(map[string]string{
+		"new_status": string(task.State),
+		"old_status": string(oldState),
+	})
+	s.activity.LogActivityWithRun(ctx, wsID, "system", "orchestrator",
+		"task_status_changed", "task", task.ID, string(details), runID, "")
 }
 
 // SetTaskCanceller sets the canceller used to hard-cancel sessions when

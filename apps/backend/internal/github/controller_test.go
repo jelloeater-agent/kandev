@@ -52,7 +52,7 @@ func TestValidGitHubCallbackState(t *testing.T) {
 type stubClient struct {
 	getPRFunc             func(ctx context.Context, owner, repo string, number int) (*PR, error)
 	getIssueFunc          func(ctx context.Context, owner, repo string, number int) (*Issue, error)
-	mergePRFn             func(ctx context.Context, owner, repo string, number int, mergeMethod string) error
+	mergePRFn             func(ctx context.Context, owner, repo string, number int, mergeMethod string) (MergeOutcome, error)
 	getRepoMergeMethodsFn func() (RepoMergeMethods, error)
 	requestReviewersFn    func(ctx context.Context, owner, repo string, number int, reviewers []string) error
 }
@@ -132,11 +132,11 @@ func (s *stubClient) RequestReviewers(ctx context.Context, owner, repo string, n
 	}
 	return nil
 }
-func (s *stubClient) MergePR(ctx context.Context, owner, repo string, number int, mergeMethod string) error {
+func (s *stubClient) MergePR(ctx context.Context, owner, repo string, number int, request MergePRRequest) (MergeOutcome, error) {
 	if s.mergePRFn != nil {
-		return s.mergePRFn(ctx, owner, repo, number, mergeMethod)
+		return s.mergePRFn(ctx, owner, repo, number, request.MergeMethod)
 	}
-	return nil
+	return MergeOutcomeMerged, nil
 }
 func (s *stubClient) ListRepoBranches(context.Context, string, string) ([]RepoBranch, error) {
 	return nil, nil
@@ -1250,6 +1250,161 @@ func TestHttpTaskCIOptions_DefaultAndPatch(t *testing.T) {
 	}
 }
 
+func TestHttpRetryMergeAcceptsLinkedFailedAttemptAndPublishesEvaluation(t *testing.T) {
+	svc, store := setupWatchServiceTest(t)
+	eventBus := &mockEventBus{}
+	svc.eventBus = eventBus
+	router := gin.New()
+	useControllerTestWorkspace(router)
+	NewController(svc, newControllerTestLogger()).RegisterHTTPRoutes(router)
+	ctx := context.Background()
+	pr := &TaskPR{
+		TaskID: "task-1", RepositoryID: "repo-1", Owner: "acme", Repo: "widget", PRNumber: 42,
+		State: "open", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.CreateTaskPR(ctx, pr); err != nil {
+		t.Fatalf("seed task PR: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttempt(ctx, TaskCIMergeAttempt{
+		TaskID: pr.TaskID, RepositoryID: pr.RepositoryID, PRNumber: pr.PRNumber,
+		Signature: "ready-v1", AttemptedHeadSHA: "head-v1",
+	}); err != nil {
+		t.Fatalf("reserve attempt: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttemptResult(
+		ctx, pr.TaskID, pr.RepositoryID, pr.PRNumber,
+		"ready-v1", TaskCIMergeResultFailed, "merge PR: provider unavailable",
+	); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"repository_id":"repo-1","pr_number":42}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/github/tasks/task-1/ci-automation/retry-merge", body)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", response.Code, response.Body.String())
+	}
+	state, err := store.GetTaskCIPRState(ctx, pr.TaskID, pr.RepositoryID, pr.PRNumber)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if state == nil || !state.MergeRetryPending {
+		t.Fatalf("retry authorization not persisted: %+v", state)
+	}
+	if eventBus.publishedCount() != 1 {
+		t.Fatalf("published events = %d, want 1", eventBus.publishedCount())
+	}
+	event := eventBus.events[0]
+	if event.Type != "github.task_pr.updated" {
+		t.Fatalf("event type = %q, want github.task_pr.updated", event.Type)
+	}
+	published, ok := event.Data.(*TaskPR)
+	if !ok || published.RepositoryID != pr.RepositoryID || published.PRNumber != pr.PRNumber {
+		t.Fatalf("published PR = %#v, want exact linked PR", event.Data)
+	}
+}
+
+func TestHttpRetryMergeClearsAuthorizationWhenPublishFails(t *testing.T) {
+	svc, store := setupWatchServiceTest(t)
+	svc.eventBus = &mockEventBus{err: errors.New("publish unavailable")}
+	router := gin.New()
+	useControllerTestWorkspace(router)
+	NewController(svc, newControllerTestLogger()).RegisterHTTPRoutes(router)
+	ctx := context.Background()
+	pr := &TaskPR{
+		TaskID: "task-1", RepositoryID: "repo-1", Owner: "acme", Repo: "widget", PRNumber: 42,
+		State: "open", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.CreateTaskPR(ctx, pr); err != nil {
+		t.Fatalf("seed task PR: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttempt(ctx, TaskCIMergeAttempt{
+		TaskID: pr.TaskID, RepositoryID: pr.RepositoryID, PRNumber: pr.PRNumber,
+		Signature: "ready-v1", AttemptedHeadSHA: "head-v1",
+	}); err != nil {
+		t.Fatalf("reserve attempt: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttemptResult(
+		ctx, pr.TaskID, pr.RepositoryID, pr.PRNumber,
+		"ready-v1", TaskCIMergeResultFailed, "merge PR: provider unavailable",
+	); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/github/tasks/task-1/ci-automation/retry-merge",
+		bytes.NewBufferString(`{"repository_id":"repo-1","pr_number":42}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", response.Code, response.Body.String())
+	}
+	state, err := store.GetTaskCIPRState(ctx, pr.TaskID, pr.RepositoryID, pr.PRNumber)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if state == nil || state.MergeRetryPending {
+		t.Fatalf("retry authorization remained pending after publish failure: %+v", state)
+	}
+}
+
+func TestHttpRetryMergeRejectsUnlinkedAndDuplicateRequests(t *testing.T) {
+	svc, store := setupWatchServiceTest(t)
+	svc.eventBus = &mockEventBus{}
+	router := gin.New()
+	useControllerTestWorkspace(router)
+	NewController(svc, newControllerTestLogger()).RegisterHTTPRoutes(router)
+	ctx := context.Background()
+	pr := &TaskPR{
+		TaskID: "task-1", RepositoryID: "repo-1", Owner: "acme", Repo: "widget", PRNumber: 42,
+		State: "open", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.CreateTaskPR(ctx, pr); err != nil {
+		t.Fatalf("seed task PR: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttempt(ctx, TaskCIMergeAttempt{
+		TaskID: pr.TaskID, RepositoryID: pr.RepositoryID, PRNumber: pr.PRNumber,
+		Signature: "ready-v1", AttemptedHeadSHA: "head-v1",
+	}); err != nil {
+		t.Fatalf("reserve attempt: %v", err)
+	}
+	if err := store.RecordTaskCIMergeAttemptResult(
+		ctx, pr.TaskID, pr.RepositoryID, pr.PRNumber,
+		"ready-v1", TaskCIMergeResultFailed, "merge PR: provider unavailable",
+	); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/github/tasks/task-1/ci-automation/retry-merge", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	unlinked := request(`{"repository_id":"repo-1","pr_number":99}`)
+	if unlinked.Code != http.StatusBadRequest {
+		t.Fatalf("unlinked status = %d, want 400: %s", unlinked.Code, unlinked.Body.String())
+	}
+	first := request(`{"repository_id":"repo-1","pr_number":42}`)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202: %s", first.Code, first.Body.String())
+	}
+	duplicate := request(`{"repository_id":"repo-1","pr_number":42}`)
+	if duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, want 409: %s", duplicate.Code, duplicate.Body.String())
+	}
+}
+
 // TestHttpPatchTaskCIOptions_TargetsOnePRWithoutAffectingSibling covers AC6:
 // a PATCH naming one linked PR's repository_id/pr_number sets the switch for
 // that PR only; a second linked PR's row is unchanged.
@@ -1780,12 +1935,12 @@ func TestHttpMergePR_Success(t *testing.T) {
 		mergeMethod string
 	}
 	sc := &stubClient{
-		mergePRFn: func(_ context.Context, owner, repo string, number int, mergeMethod string) error {
+		mergePRFn: func(_ context.Context, owner, repo string, number int, mergeMethod string) (MergeOutcome, error) {
 			called.owner = owner
 			called.repo = repo
 			called.number = number
 			called.mergeMethod = mergeMethod
-			return nil
+			return MergeOutcomeMerged, nil
 		},
 	}
 	router, _ := setupControllerTest(sc)
@@ -1799,8 +1954,36 @@ func TestHttpMergePR_Success(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	var response struct {
+		Status MergeOutcome `json:"status"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Status != MergeOutcomeMerged {
+		t.Errorf("status = %q, want merged", response.Status)
+	}
 	if called.owner != "acme" || called.repo != "widget" || called.number != 42 || called.mergeMethod != "squash" {
 		t.Errorf("unexpected MergePR args: %+v", called)
+	}
+}
+
+func TestHttpMergePR_Queued(t *testing.T) {
+	router, _ := setupControllerTest(&stubClient{
+		mergePRFn: func(context.Context, string, string, int, string) (MergeOutcome, error) {
+			return MergeOutcomeQueued, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/github/prs/acme/widget/42/merge", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"status":"queued"`) {
+		t.Errorf("body = %s, want queued outcome", w.Body.String())
 	}
 }
 
@@ -1824,9 +2007,9 @@ func TestHttpMergePR_EmptyBody_ResolvesToAllowedMethod(t *testing.T) {
 	// should resolve to the first allowed method instead.
 	var gotMethod string
 	sc := &stubClient{
-		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) error {
+		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) (MergeOutcome, error) {
 			gotMethod = mergeMethod
-			return nil
+			return MergeOutcomeMerged, nil
 		},
 		getRepoMergeMethodsFn: func() (RepoMergeMethods, error) {
 			// Squash-only repo (the case that surfaced this bug).
@@ -1853,9 +2036,9 @@ func TestHttpMergePR_ExplicitMethod_Passthrough(t *testing.T) {
 	var gotMethod string
 	var lookupCalls int
 	sc := &stubClient{
-		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) error {
+		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) (MergeOutcome, error) {
 			gotMethod = mergeMethod
-			return nil
+			return MergeOutcomeMerged, nil
 		},
 		getRepoMergeMethodsFn: func() (RepoMergeMethods, error) {
 			lookupCalls++
@@ -1887,9 +2070,9 @@ func TestHttpMergePR_EmptyBody_LookupFails_FallsBackToGitHubDefault(t *testing.T
 	// than refusing to merge because of an unrelated lookup failure.
 	var gotMethod string
 	sc := &stubClient{
-		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) error {
+		mergePRFn: func(_ context.Context, _, _ string, _ int, mergeMethod string) (MergeOutcome, error) {
 			gotMethod = mergeMethod
-			return nil
+			return MergeOutcomeMerged, nil
 		},
 		getRepoMergeMethodsFn: func() (RepoMergeMethods, error) {
 			return RepoMergeMethods{}, fmt.Errorf("rate limited")
@@ -2402,8 +2585,8 @@ func TestHandleListAccessibleRepos_PreservesAPIErrorStatus(t *testing.T) {
 
 func TestHttpMergePR_Conflict(t *testing.T) {
 	sc := &stubClient{
-		mergePRFn: func(context.Context, string, string, int, string) error {
-			return &GitHubAPIError{StatusCode: http.StatusMethodNotAllowed, Endpoint: "/merge", Body: "not mergeable"}
+		mergePRFn: func(context.Context, string, string, int, string) (MergeOutcome, error) {
+			return "", &GitHubAPIError{StatusCode: http.StatusMethodNotAllowed, Endpoint: "/merge", Body: "not mergeable"}
 		},
 	}
 	router, _ := setupControllerTest(sc)

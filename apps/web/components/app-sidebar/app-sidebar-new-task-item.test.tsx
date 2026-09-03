@@ -35,6 +35,18 @@ const state = {
     workflowId: "wf-1" as string | null,
     steps: [{ id: "s1", title: "Todo" }],
   },
+  quickChat: {
+    isOpen: false,
+    sessions: [] as Array<{
+      sessionId: string;
+      workspaceId: string;
+      kind: "chat";
+      taskId?: string;
+    }>,
+    unseenIdleByWorkspace: {} as Record<string, Record<string, true>>,
+  },
+  taskSessions: { items: {} as Record<string, { state: string; task_id: string }> },
+  prepareProgress: { bySessionId: {} as Record<string, { status: string }> },
   setActiveTask: mocks.setActiveTask,
   setActiveSession: mocks.setActiveSession,
   setImproveDialogOpen: mocks.setImproveDialogOpen,
@@ -43,6 +55,7 @@ const QUICK_TERMINAL_TEST_ID = "sidebar-quick-terminal-shortcut";
 const QUICK_CHAT_TEST_ID = "sidebar-quick-chat-shortcut";
 let officeEnabled = false;
 let pathname = "/";
+let workspaceMode: "office" | "kanban" | "unknown" = "kanban";
 
 // sidebar-workspace-actions plugin slot registrations (A1-A5). Empty by
 // default so the existing dialog-routing/row-action tests above are
@@ -71,6 +84,11 @@ vi.mock("@/hooks/use-quick-terminal-launcher", () => ({
 }));
 vi.mock("@/hooks/domains/features/use-feature", () => ({
   useFeature: () => officeEnabled,
+}));
+// Mode follows the active workspace, not the route: the dialog choice is
+// about which workspace the task will land in.
+vi.mock("@/components/workspace-scope-provider", () => ({
+  useWorkspaceScope: () => ({ mode: workspaceMode, workspaceId: state.workspaces.activeId }),
 }));
 vi.mock("@/lib/routing/client-router", () => ({
   useRouter: () => ({ push: mocks.routerPush }),
@@ -121,11 +139,17 @@ function setImproveWorkspaceActive() {
 }
 
 function resetTestState() {
+  workspaceMode = "kanban";
   state.workspaces.activeId = WORKSPACE_ID;
   state.workspaces.items = [{ id: WORKSPACE_ID, name: WORKSPACE_NAME }];
   state.appSidebar.improveDialogOpen = false;
   state.kanban.workflowId = "wf-1";
   state.kanban.steps = [{ id: "s1", title: "Todo" }];
+  state.quickChat.isOpen = false;
+  state.quickChat.sessions = [];
+  state.quickChat.unseenIdleByWorkspace = {};
+  state.taskSessions.items = {};
+  state.prepareProgress.bySessionId = {};
   mocks.routerPush.mockClear();
   mocks.setActiveTask.mockClear();
   mocks.setActiveSession.mockClear();
@@ -166,19 +190,22 @@ describe("AppSidebarNewTaskItem dialog routing", () => {
     expect(screen.queryByTestId(OFFICE_DIALOG_TESTID)).toBeNull();
   });
 
-  it("uses the regular dialog when office is enabled but NOT on an office route", () => {
-    // The bug: office-on alone routed to the Office dialog even in Kanban mode.
-    // Gating is now on the actual /office route, so home stays on the Kanban dialog.
+  it("uses the regular dialog on a kanban workspace even with office enabled", () => {
+    // The bug: office-on alone routed to the Office dialog in Kanban mode.
+    // Gating is on the active workspace, so a kanban workspace keeps the
+    // Kanban dialog no matter which route it is reached from.
     officeEnabled = true;
-    pathname = "/";
+    workspaceMode = "kanban";
+    pathname = "/office";
     renderItem(false);
     expect(screen.getByTestId(REGULAR_DIALOG_TESTID)).toBeTruthy();
     expect(screen.queryByTestId(OFFICE_DIALOG_TESTID)).toBeNull();
   });
 
-  it("uses the office new-issue dialog when inside an office route", async () => {
+  it("uses the office new-issue dialog on an office workspace, whatever the route", async () => {
     officeEnabled = true;
-    pathname = "/office";
+    workspaceMode = "office";
+    pathname = "/settings";
     renderItem(false);
     // NewTaskDialog is lazy-loaded by the SPA dynamic adapter, so it resolves asynchronously.
     expect(await screen.findByTestId(OFFICE_DIALOG_TESTID)).toBeTruthy();
@@ -260,6 +287,43 @@ describe("AppSidebarNewTaskItem row actions", () => {
     renderItem(false);
     screen.getByTestId(QUICK_CHAT_TEST_ID).click();
     expect(mocks.openQuickChat).toHaveBeenCalledOnce();
+  });
+
+  it("shows a running activity bubble on the Quick Chat shortcut", () => {
+    state.quickChat.sessions = [
+      { sessionId: "session-1", workspaceId: WORKSPACE_ID, kind: "chat", taskId: "task-1" },
+    ];
+    state.taskSessions.items = {
+      "session-1": { state: "RUNNING", task_id: "task-1" },
+    };
+
+    renderItem(false);
+
+    const quickChat = screen.getByRole("button", { name: "Quick Chat, agent working" });
+    expect(
+      quickChat
+        .querySelector('[data-testid="quick-chat-activity-indicator"]')
+        ?.getAttribute("data-state"),
+    ).toBe("running");
+  });
+
+  it("shows a finished activity bubble for an unseen response", () => {
+    state.quickChat.sessions = [
+      { sessionId: "session-1", workspaceId: WORKSPACE_ID, kind: "chat", taskId: "task-1" },
+    ];
+    state.taskSessions.items = {
+      "session-1": { state: "COMPLETED", task_id: "task-1" },
+    };
+    state.quickChat.unseenIdleByWorkspace = { [WORKSPACE_ID]: { "session-1": true } };
+
+    renderItem(false);
+
+    const quickChat = screen.getByRole("button", { name: "Quick Chat, new response" });
+    expect(
+      quickChat
+        .querySelector('[data-testid="quick-chat-activity-indicator"]')
+        ?.getAttribute("data-state"),
+    ).toBe("finished");
   });
 
   it("hides the quick chat shortcut when the rail is collapsed", () => {

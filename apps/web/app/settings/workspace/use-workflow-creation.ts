@@ -10,6 +10,8 @@ import {
   type WorkflowStep,
   type WorkflowTemplate,
   type Workspace,
+  normalizeWorkflowProfileSessionStartPolicy,
+  normalizeWorkflowProfileSessionEndPolicy,
 } from "@/lib/types/http";
 import { createWorkflowDuplication } from "./workflow-duplication";
 
@@ -18,6 +20,7 @@ import { createWorkflowDuplication } from "./workflow-duplication";
 // These names are PERSISTED as the workflow's step names, so they deliberately
 // stay English — translating them would write localized values into the
 // database.
+// i18n-exempt: persisted workflow step names. See the comment above.
 export const DEFAULT_CUSTOM_STEPS: StepDefinition[] = [
   { name: "Todo", position: 0, color: "bg-slate-500" },
   { name: "In Progress", position: 1, color: "bg-blue-500" },
@@ -67,6 +70,12 @@ function toDraftStep(
     is_start_step: definition.is_start_step,
     show_in_command_panel: definition.show_in_command_panel,
     agent_profile_id: definition.agent_profile_id,
+    profile_session_start_policy: normalizeWorkflowProfileSessionStartPolicy(
+      definition.profile_session_start_policy,
+    ),
+    profile_session_end_policy: normalizeWorkflowProfileSessionEndPolicy(
+      definition.profile_session_end_policy,
+    ),
     auto_advance_requires_signal: definition.auto_advance_requires_signal,
     cancel_triggers_turn_complete: definition.cancel_triggers_turn_complete,
     wip_limit: definition.wip_limit,
@@ -118,6 +127,7 @@ export function useWorkflowCreation({
       ? workflowTemplates.find((item) => item.id === selectedTemplateId)
       : undefined;
     const tempId = newClientId("temp-workflow");
+    // i18n-exempt: persisted workflow name. See the comment below.
     const workflow: Workflow = {
       id: toWorkflowId(tempId),
       workspace_id: toWorkspaceId(workspace.id),

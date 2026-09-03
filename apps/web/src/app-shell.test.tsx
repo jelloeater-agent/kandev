@@ -35,6 +35,11 @@ vi.mock("@/components/update-available-toast-bridge", () => ({
 }));
 vi.mock("@/components/sidebar-views-sync-bridge", () => ({ SidebarViewsSyncBridge: () => null }));
 vi.mock("@/components/theme-provider", () => ({ ThemeProvider: mocks.passthrough }));
+// Reads the store to derive the workspace's mode; this suite mounts the shell
+// without a StateProvider, and only cares about provider nesting order.
+vi.mock("@/components/workspace-scope-provider", () => ({
+  WorkspaceScopeProvider: mocks.passthrough,
+}));
 vi.mock("@/components/ws-connector", () => ({ WebSocketConnector: () => null }));
 vi.mock("@/lib/commands/command-registry", () => ({
   CommandRegistryProvider: mocks.passthrough,
@@ -46,6 +51,7 @@ describe("AppShell plugin modal topology", () => {
   afterEach(() => {
     cleanup();
     pluginModalManager.closeAllForPlugin("bitbucket");
+    Reflect.deleteProperty(navigator, "windowControlsOverlay");
   });
 
   it("renders host task-link forms inside the shared toast provider", () => {
@@ -68,5 +74,25 @@ describe("AppShell plugin modal topology", () => {
 
     expect(screen.getByLabelText("Pull request")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Save" })).not.toBeNull();
+  });
+
+  it("publishes visible window-controls-overlay geometry on the root shell", () => {
+    Object.defineProperty(navigator, "windowControlsOverlay", {
+      configurable: true,
+      value: {
+        visible: true,
+        getTitlebarAreaRect: () => ({ x: 72, y: 0, width: 1448, height: 40 }),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
+    });
+
+    render(<AppShell>App content</AppShell>);
+
+    const shell = screen.getByTestId("app-shell");
+    expect(shell.getAttribute("data-window-controls-overlay")).toBe("visible");
+    expect(shell.style.getPropertyValue("--titlebar-area-x")).toBe("72px");
+    expect(shell.style.getPropertyValue("--titlebar-area-width")).toBe("1448px");
+    expect(shell.style.getPropertyValue("--titlebar-area-height")).toBe("40px");
   });
 });

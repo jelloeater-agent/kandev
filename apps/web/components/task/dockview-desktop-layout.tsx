@@ -9,7 +9,11 @@ import {
   type DockviewReadyEvent,
 } from "dockview-react";
 import { themeKandev } from "@/lib/layout/dockview-theme";
-import { useDockviewStore, performLayoutSwitch } from "@/lib/state/dockview-store";
+import {
+  resolveRestoredLayoutProfile,
+  useDockviewStore,
+  performLayoutSwitch,
+} from "@/lib/state/dockview-store";
 import { restoreEnvLayout } from "./dockview-layout-restore";
 import {
   setupContainerResizeSync,
@@ -56,7 +60,11 @@ import type { Terminal } from "@/hooks/domains/session/use-terminals";
 // Portal system
 import { PanelPortalHost, usePortalSlot } from "@/lib/layout/panel-portal-host";
 import { ENV_SCOPED_DOCKVIEW_COMPONENTS } from "@/lib/state/dockview-env-scoped-components";
-import { resolveEffectiveDefaultLayout } from "@/lib/layout/layout-profiles";
+import {
+  getLayoutProfileIdentity,
+  resolveEffectiveDefaultLayout,
+  type LayoutProfileIdentity,
+} from "@/lib/layout/layout-profiles";
 import type { LayoutState } from "@/lib/state/layout-manager";
 import { registerDockviewRoot, unregisterDockviewRoot } from "@/lib/state/dockview-measure";
 
@@ -132,6 +140,7 @@ const components: Record<string, React.FunctionComponent<IDockviewPanelProps>> =
   vscode: PortalSlot,
   plan: PortalSlot,
   todos: PortalSlot,
+  "prompt-history": PortalSlot,
   "pr-detail": PortalSlot,
   "mr-detail": PortalSlot,
   "review-detail": PortalSlot,
@@ -142,6 +151,8 @@ const components: Record<string, React.FunctionComponent<IDockviewPanelProps>> =
 };
 
 // --- TAB COMPONENTS ---
+/** Tab header for permanent panels: renders the default dockview tab without
+ * a close button and maximizes the panel on double-click. */
 function PermanentTab(props: IDockviewPanelHeaderProps) {
   const onDoubleClick = useTabMaximizeOnDoubleClick(props.api);
   return (
@@ -155,15 +166,26 @@ function PermanentTab(props: IDockviewPanelHeaderProps) {
 }
 
 /** Sync the user's default saved layout from settings into the dockview store. */
-function useSyncUserDefaultLayout(): LayoutState | null {
+type SyncedUserDefaultLayout = {
+  layout: LayoutState | null;
+  profile: LayoutProfileIdentity;
+};
+
+function useSyncUserDefaultLayout(): SyncedUserDefaultLayout {
   const savedLayouts = useAppStore((s) => s.userSettings.savedLayouts);
   const setUserDefaultLayout = useDockviewStore((s) => s.setUserDefaultLayout);
-  const userDefaultLayout = useMemo(() => {
+  const userDefaultLayout = useMemo<SyncedUserDefaultLayout>(() => {
     const effectiveDefault = resolveEffectiveDefaultLayout(savedLayouts);
-    return effectiveDefault.source === "custom" ? effectiveDefault.layout : null;
+    return {
+      layout: effectiveDefault.source === "custom" ? effectiveDefault.layout : null,
+      profile:
+        effectiveDefault.source === "custom"
+          ? getLayoutProfileIdentity(effectiveDefault.profile)
+          : { kind: "built-in", id: effectiveDefault.profile.id },
+    };
   }, [savedLayouts]);
   useEffect(() => {
-    setUserDefaultLayout(userDefaultLayout);
+    setUserDefaultLayout(userDefaultLayout.layout, userDefaultLayout.profile);
   }, [setUserDefaultLayout, userDefaultLayout]);
   return userDefaultLayout;
 }
@@ -185,12 +207,21 @@ const tabComponents: Record<string, React.FunctionComponent<IDockviewPanelHeader
 // LAYOUT RESTORATION HELPERS
 // ---------------------------------------------------------------------------
 
-const VALID_COMPONENTS = new Set(Object.keys(components));
+/** Exported seam for registry-membership tests (Office exports the same
+ *  set from `dockview-shared.tsx`). */
+export const DESKTOP_VALID_COMPONENTS = new Set(Object.keys(components));
 
 // ---------------------------------------------------------------------------
 // useEnvSwitchCleanup — backup layout switch for external session changes
 // ---------------------------------------------------------------------------
 
+/**
+ * Backup layout-switch hook for external session changes (e.g. WS-driven)
+ * that don't go through the sidebar/dropdown switch helpers. When the
+ * effective task env actually changes (ignoring the same-task env-id bounce
+ * that launch races can produce), performs a layout switch to the new env;
+ * same-env session switches are a no-op.
+ */
 function useEnvSwitchCleanup(
   effectiveSessionId: string | null,
   effectiveEnvId: string | null,
@@ -273,6 +304,7 @@ type ReadyDockviewLayoutSetup = {
   compact: boolean;
   initialLayout?: string | null;
   userDefaultLayout: LayoutState | null;
+  userDefaultLayoutProfile: LayoutProfileIdentity;
 };
 
 type ReadyDockviewRefs = {
@@ -290,10 +322,20 @@ type ReadyDockviewSetup = {
   refs: ReadyDockviewRefs;
 };
 
+/**
+ * One-time dockview-ready setup: seeds the store's user default layout,
+ * registers the layout root for size measurement, restores the env's saved
+ * layout (or builds the default one), and installs the group-tracking,
+ * session-tab sync, chat-panel safety net, layout persistence, portal
+ * cleanup, container resize, and sash-drag-cap disposers — all recorded on
+ * `refs.readyDisposersRef`.
+ */
 function setupReadyDockview({ api, appStore, layout, refs }: ReadyDockviewSetup): void {
   // Dockview can become ready before the parent passive effect synchronizes
   // settings. Seed the store before exposing the API or building a cold layout.
-  useDockviewStore.getState().setUserDefaultLayout(layout.userDefaultLayout);
+  useDockviewStore
+    .getState()
+    .setUserDefaultLayout(layout.userDefaultLayout, layout.userDefaultLayoutProfile);
   refs.setApi(api);
   const layoutRoot = refs.layoutRootRef.current;
   if (layoutRoot) {
@@ -303,12 +345,17 @@ function setupReadyDockview({ api, appStore, layout, refs }: ReadyDockviewSetup)
 
   const currentEnvId = refs.envIdRef.current;
   const restored =
-    !layout.initialLayout && restoreEnvLayout(api, currentEnvId, appStore, VALID_COMPONENTS);
+    !layout.initialLayout &&
+    restoreEnvLayout(api, currentEnvId, appStore, DESKTOP_VALID_COMPONENTS);
   if (!restored) {
     layout.buildDefaultLayout(
       api,
       layout.initialLayout ?? (layout.compact ? "compact" : undefined),
     );
+  } else {
+    useDockviewStore.setState({
+      activeLayoutProfile: resolveRestoredLayoutProfile(api, currentEnvId),
+    });
   }
 
   useDockviewStore.setState({ currentLayoutEnvId: currentEnvId });
@@ -332,6 +379,9 @@ type DockviewMainAreaProps = {
   onReady: (event: DockviewReadyEvent) => void;
 };
 
+/** Renders the dockview surface itself: the preview controller above the
+ * `DockviewReact` grid wired with the desktop component/tab maps, header
+ * actions, watermark, and default tab; forwards the ready event via `onReady`. */
 function DockviewMainArea({ effectiveSessionId, hasDevScript, onReady }: DockviewMainAreaProps) {
   return (
     <div className="min-h-0 min-w-0 overflow-hidden flex flex-col">
@@ -378,7 +428,8 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
   const envIdRef = useRef<string | null>(effectiveEnvId);
   const hasDevScript = Boolean(repository?.dev_script?.trim());
 
-  const userDefaultLayout = useSyncUserDefaultLayout();
+  const { layout: userDefaultLayout, profile: userDefaultLayoutProfile } =
+    useSyncUserDefaultLayout();
   useLspFileOpener();
   useEditorKeybinds();
   usePlanPanelAutoOpen();
@@ -401,11 +452,25 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
       setupReadyDockview({
         api: event.api,
         appStore,
-        layout: { buildDefaultLayout, compact, initialLayout, userDefaultLayout },
+        layout: {
+          buildDefaultLayout,
+          compact,
+          initialLayout,
+          userDefaultLayout,
+          userDefaultLayoutProfile,
+        },
         refs: { envIdRef, readyDisposersRef, saveTimerRef, setApi, layoutRootRef },
       });
     },
-    [setApi, buildDefaultLayout, initialLayout, compact, userDefaultLayout, appStore],
+    [
+      setApi,
+      buildDefaultLayout,
+      initialLayout,
+      compact,
+      userDefaultLayout,
+      userDefaultLayoutProfile,
+      appStore,
+    ],
   );
 
   // Release session-scoped portals + trigger layout switch on session change.

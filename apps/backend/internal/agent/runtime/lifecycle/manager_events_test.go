@@ -1532,6 +1532,26 @@ func TestHandleAgentEvent_UpdatesLastActivityAt(t *testing.T) {
 	}
 }
 
+func TestRecordActivity_MetadataDoesNotMarkPromptStarted(t *testing.T) {
+	mgr, _ := createTestManagerWithTracking()
+	execution := createTestExecution("exec-metadata", "task-1", "session-1")
+	execution.agentEventSincePrompt = false
+	execution.lastActivityAt = time.Now().Add(-time.Minute)
+
+	mgr.recordActivity(execution, agentctl.AgentEvent{Type: "session_models"})
+
+	lastActivity, agentEventSeen, epoch := execution.promptActivitySnapshot()
+	if time.Since(lastActivity) > time.Second {
+		t.Fatalf("metadata event did not refresh last activity: %v ago", time.Since(lastActivity))
+	}
+	if agentEventSeen {
+		t.Fatal("metadata event marked the prompt as started")
+	}
+	if epoch != 0 {
+		t.Fatalf("metadata event advanced activity epoch to %d, want 0", epoch)
+	}
+}
+
 func TestHandleAgentEvent_TracksActiveTopLevelTool(t *testing.T) {
 	mgr, _ := createTestManagerWithTracking()
 	execution := createTestExecution("exec-1", "task-1", "session-1")
@@ -1643,6 +1663,58 @@ func TestHandleAgentEvent_DelayedCompleteCannotFinishReplacementPrompt(t *testin
 		if published.Subject == events.AgentReady {
 			t.Fatal("delayed completion published AgentReady for replacement prompt")
 		}
+	}
+}
+
+func TestHandleAgentEvent_UnnumberedCompleteCannotReleasePendingPrompt(t *testing.T) {
+	mgr, eventBus := createTestManagerWithTracking()
+	execution := createTestExecution("exec-1", "task-1", "session-1")
+	if err := mgr.executionStore.Add(execution); err != nil {
+		t.Fatalf("add execution: %v", err)
+	}
+	generation, err := mgr.executionStore.BeginPrompt(execution.ID)
+	if err != nil {
+		t.Fatalf("begin prompt: %v", err)
+	}
+	mgr.executionStore.MarkPromptDispatched(execution.ID, generation)
+	execution.dispatchedPromptPending.Store(true)
+
+	if mgr.handleCompleteEvent(execution, &agentctl.AgentEvent{
+		Type:      streams.EventTypeComplete,
+		SessionID: execution.SessionID,
+		Data:      map[string]any{"stop_reason": "end_turn"},
+	}) {
+		t.Fatal("unnumbered completion was accepted while a numbered prompt was pending")
+	}
+	select {
+	case signal := <-execution.promptDoneCh:
+		t.Fatalf("unnumbered completion released pending prompt: %+v", signal)
+	default:
+	}
+	if !execution.dispatchedPromptPending.Load() {
+		t.Fatal("unnumbered completion cleared the pending prompt gate")
+	}
+	for _, published := range eventBus.PublishedEvents {
+		if published.Subject == events.AgentReady {
+			t.Fatal("unnumbered completion published AgentReady for pending prompt")
+		}
+	}
+
+	if !mgr.handleCompleteEvent(execution, &agentctl.AgentEvent{
+		Type:             streams.EventTypeComplete,
+		SessionID:        execution.SessionID,
+		PromptGeneration: generation,
+		Data:             map[string]any{"stop_reason": "end_turn"},
+	}) {
+		t.Fatal("numbered completion was rejected after unnumbered completion")
+	}
+	select {
+	case signal := <-execution.promptDoneCh:
+		if signal.PromptGeneration != generation {
+			t.Fatalf("completion generation = %d, want %d", signal.PromptGeneration, generation)
+		}
+	default:
+		t.Fatal("numbered completion did not signal the pending prompt")
 	}
 }
 
@@ -2045,7 +2117,7 @@ func TestHandleCompleteEventMarkState_ErrorDoesNotRemoveExecution(t *testing.T) 
 		Data:  map[string]interface{}{"is_error": true},
 	}
 
-	mgr.handleCompleteEventMarkState(execution, errorEvent, true)
+	mgr.handleCompleteEventMarkState(execution, errorEvent, true, nil)
 
 	// Execution must still be in the store so the orchestrator can clean it up
 	if _, found := mgr.executionStore.Get("exec-1"); !found {
@@ -2065,7 +2137,7 @@ func TestHandleCompleteEventMarkState_SuccessKeepsExecution(t *testing.T) {
 		Type: "complete",
 	}
 
-	mgr.handleCompleteEventMarkState(execution, successEvent, false)
+	mgr.handleCompleteEventMarkState(execution, successEvent, false, nil)
 
 	got, found := mgr.executionStore.Get("exec-1")
 	if !found {

@@ -2,7 +2,10 @@ package agents
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -85,7 +88,14 @@ func TestGooseACP_EnvAndStripEnv(t *testing.T) {
 func TestGooseACP_InstallScript(t *testing.T) {
 	got := NewGooseACP().InstallScript()
 	for _, needle := range []string{
+		"set -eu",
+		`tmp="$(mktemp)"`,
+		`trap 'rm -f "$tmp"' EXIT`,
 		"curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh",
+		`-o "$tmp"`,
+		"install_dir=",
+		`GOOSE_BIN_DIR="$install_dir" CONFIGURE=false bash "$tmp"`,
+		`command -v goose`,
 		"goose",
 	} {
 		if !strings.Contains(got, needle) {
@@ -97,6 +107,76 @@ func TestGooseACP_InstallScript(t *testing.T) {
 	}
 	if !strings.Contains(got, "CONFIGURE=false") {
 		t.Errorf("InstallScript should set CONFIGURE=false for deterministic non-interactive install, got %q", got)
+	}
+}
+
+func TestGooseACPInstallScriptUsesFirstWritablePathDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("install script is POSIX shell")
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir fake bin: %v", err)
+	}
+
+	fakeCurl := `#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+cat > "$out" <<'INSTALL'
+#!/bin/sh
+set -eu
+mkdir -p "$GOOSE_BIN_DIR"
+cat > "$GOOSE_BIN_DIR/goose" <<'GOOSE'
+#!/bin/sh
+echo "Run goose as an ACP agent server on stdio"
+GOOSE
+chmod +x "$GOOSE_BIN_DIR/goose"
+INSTALL
+`
+	if err := os.WriteFile(filepath.Join(binDir, "curl"), []byte(fakeCurl), 0o755); err != nil {
+		t.Fatalf("write fake curl: %v", err)
+	}
+
+	cmd := exec.Command("sh", "-c", NewGooseACP().InstallScript())
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + binDir + ":/usr/bin:/bin",
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("InstallScript failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(binDir, "goose")); err != nil {
+		t.Fatalf("expected goose binary in first writable PATH directory: %v", err)
+	}
+}
+
+func TestGooseACPInstallScriptPropagatesDownloadFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("install script is POSIX shell")
+	}
+
+	binDir := t.TempDir()
+	fakeCurl := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "curl"), []byte(fakeCurl), 0o755); err != nil {
+		t.Fatalf("write fake curl: %v", err)
+	}
+
+	cmd := exec.Command("sh", "-c", NewGooseACP().InstallScript())
+	cmd.Env = []string{
+		"HOME=" + t.TempDir(),
+		"PATH=" + binDir + ":/usr/bin:/bin",
+	}
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("InstallScript succeeded after curl failure; output: %s", out)
 	}
 }
 
@@ -113,6 +193,56 @@ func TestGooseACP_DetectionRequiresGlobalBinary(t *testing.T) {
 	}
 }
 
+func TestGooseACP_DetectionRejectsUnrelatedGooseBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell executable fixture is Unix-specific")
+	}
+
+	binDir := t.TempDir()
+	goosePath := filepath.Join(binDir, gooseBin)
+	// Pressly's database-migration CLI also installs a `goose` binary. It may
+	// answer generic version requests successfully, but it has no Goose ACP
+	// help surface.
+	script := "#!/bin/sh\necho 'goose version v3.24.3'\n"
+	if err := os.WriteFile(goosePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write unrelated goose executable: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	result, err := NewGooseACP().IsInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("IsInstalled error: %v", err)
+	}
+	if result.Available {
+		t.Fatal("Available=true for unrelated goose binary without ACP help")
+	}
+}
+
+func TestGooseACP_DetectionAcceptsACPHelp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell executable fixture is Unix-specific")
+	}
+
+	binDir := t.TempDir()
+	goosePath := filepath.Join(binDir, gooseBin)
+	script := "#!/bin/sh\necho 'Run goose as an ACP agent server on stdio'\n"
+	if err := os.WriteFile(goosePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write Goose executable: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	result, err := NewGooseACP().IsInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("IsInstalled error: %v", err)
+	}
+	if !result.Available {
+		t.Fatal("Available=false for Goose binary with ACP help")
+	}
+	if result.MatchedPath != goosePath {
+		t.Errorf("MatchedPath = %q, want %q", result.MatchedPath, goosePath)
+	}
+}
+
 func TestGooseACP_SupportsMCPAndResume(t *testing.T) {
 	if _, err := exec.LookPath("goose"); err != nil {
 		t.Skip("goose not on PATH; MCP/resume capabilities surface only when detected")
@@ -125,7 +255,7 @@ func TestGooseACP_SupportsMCPAndResume(t *testing.T) {
 		t.Error("SupportsMCP = false, want true (session/new mcpServers)")
 	}
 	if !result.Capabilities.SupportsSessionResume {
-		t.Error("SupportsSessionResume = false, want true (session/resume)")
+		t.Error("SupportsSessionResume = false, want true (session/load)")
 	}
 }
 
@@ -160,7 +290,7 @@ func TestGooseACP_RemoteAuth(t *testing.T) {
 	}
 	for _, osName := range []string{"darwin", "linux"} {
 		paths := files.SourceFiles[osName]
-		want := []string{".config/goose/config.yaml", ".config/goose/extensions.yaml"}
+		want := []string{".config/goose/config.yaml", ".config/goose/extensions.yaml", ".config/goose/secrets.yaml"}
 		if !slices.Equal(paths, want) {
 			t.Errorf("SourceFiles[%s] = %#v, want %#v", osName, paths, want)
 		}

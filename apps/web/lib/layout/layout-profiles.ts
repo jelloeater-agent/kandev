@@ -14,6 +14,11 @@ import { generateUUID } from "@/lib/utils";
 
 export type BuiltInLayoutProfileId = Exclude<BuiltInPreset, "compact">;
 
+/** Identity of the profile that produced the currently rendered layout. */
+export type LayoutProfileIdentity =
+  | { kind: "built-in"; id: BuiltInPreset }
+  | { kind: "custom"; id: string };
+
 export type BuiltInLayoutProfileDescriptor = {
   id: BuiltInLayoutProfileId;
   /** Canonical English; persisted into a saved override. Not for display. */
@@ -52,6 +57,7 @@ export type BuiltInLayoutProfile = BuiltInLayoutProfileDescriptor & {
  *
  * "VS Code" is a product name and so has no `nameKey`.
  */
+// i18n-exempt: canonical English persisted in saved layouts; `descriptionKey` beside it is what renders.
 export const BUILT_IN_LAYOUT_PROFILES: readonly BuiltInLayoutProfileDescriptor[] = [
   {
     id: "default",
@@ -152,6 +158,14 @@ export function getBuiltInLayoutOverrideSourceId(
     BUILT_IN_LAYOUT_PROFILES.find(({ id }) => profile.id === getBuiltInLayoutOverrideId(id))?.id ??
     null
   );
+}
+
+/** Resolve the identity represented by a saved layout profile ID. */
+export function getLayoutProfileIdentity(profile: Pick<SavedLayout, "id">): LayoutProfileIdentity {
+  const builtInSource = getBuiltInLayoutOverrideSourceId(profile);
+  return builtInSource
+    ? { kind: "built-in", id: builtInSource }
+    : { kind: "custom", id: profile.id };
 }
 
 export function isBuiltInLayoutOverride(profile: Pick<SavedLayout, "id">): boolean {

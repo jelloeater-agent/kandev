@@ -39,6 +39,7 @@ import { TaskMRLinkDialog } from "./task-mr-link-dialog";
 import { MRAutomationControls } from "./mr-automation-controls";
 import { MRCIPopover } from "./mr-ci-popover";
 import { useDockviewStore } from "@/lib/state/dockview-store";
+import type { ReviewPanelOptions } from "@/lib/state/dockview-panel-actions";
 import { reviewItemId } from "@/components/task/review-selection";
 import { mrTaskKey } from "./mr-detail-panel";
 import { useTranslation } from "react-i18next";
@@ -86,7 +87,7 @@ export function openMobileMRReview(
 }
 
 export function openDesktopMRReview(
-  addMRPanel: (mrKey: string) => void,
+  addMRPanel: (mrKey: string, opts?: ReviewPanelOptions) => void,
   mr: TaskMR,
   schedule: (callback: FrameRequestCallback) => number = requestAnimationFrame,
 ) {
@@ -191,7 +192,6 @@ function MRMenuTriggerButton({
 function MRDropdownList({
   taskId,
   mrs,
-  single,
   canLink,
   onOpenReview,
   onUnlink,
@@ -199,7 +199,6 @@ function MRDropdownList({
 }: {
   taskId: string;
   mrs: TaskMR[];
-  single: TaskMR | null;
   canLink: boolean;
   onOpenReview: (mr: TaskMR) => void;
   onUnlink: (associationId: string) => void;
@@ -229,10 +228,12 @@ function MRDropdownList({
             {t("gitlab:unlink")}
             {mr.mr_iid}
           </DropdownMenuItem>
+          {/* The automation switches are per-MR, so each linked MR gets its
+              own group here rather than one shared group for the task. */}
+          <DropdownMenuSeparator />
+          <MRAutomationControls taskId={taskId} mr={mr} />
         </div>
       ))}
-      <DropdownMenuSeparator />
-      <MRAutomationControls taskId={taskId} mr={single ?? undefined} />
       {canLink ? (
         <>
           <DropdownMenuSeparator />
@@ -380,7 +381,6 @@ function MRMenuButton({
       <MRDropdownList
         taskId={taskId}
         mrs={mrs}
-        single={single}
         canLink={canLink}
         onOpenReview={openReview}
         onUnlink={onUnlink}

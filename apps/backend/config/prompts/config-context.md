@@ -11,6 +11,7 @@ WORKFLOW TOOLS:
 - update_workflow_kandev: Update a workflow. Required: workflow_id. Optional: name, description.
 - delete_workflow_kandev: Delete a workflow and all its steps (destructive). Required: workflow_id.
 - import_workflow_kandev: Import one or more workflows into a workspace from a portable document (the kandev_workflow YAML/JSON export envelope). Workflows whose name already exists are skipped. Required: workspace_id, document. Returns the created and skipped workflow names.
+- export_workflow_kandev: Export one workflow as a portable version 1 kandev_workflow JSON document. Required: workflow_id. Pass the returned JSON unchanged as document to import_workflow_kandev.
 - list_workflow_steps_kandev: List workflow steps (columns) in a workflow. Required: workflow_id.
 - create_workflow_step_kandev: Create a new workflow step. Required: workflow_id, name. Optional: position, color, prompt, is_start_step, allow_manual_move, show_in_command_panel, auto_advance_requires_signal, cancel_triggers_turn_complete, events.
 - update_workflow_step_kandev: Update a workflow step. Required: step_id. Optional: name, color, prompt, is_start_step, allow_manual_move, show_in_command_panel, auto_archive_after_hours, auto_advance_requires_signal, cancel_triggers_turn_complete, events.
@@ -37,6 +38,13 @@ MCP CONFIG TOOLS:
 - update_agent_profile_kandev: Update a profile. Required: profile_id. Optional: name, model, auto_approve.
 - get_mcp_config_kandev: Get MCP server config for a profile. Required: profile_id.
 - update_mcp_config_kandev: Update MCP config for a profile. Required: profile_id. Optional: enabled, servers.
+
+SAVED PROMPT TOOLS:
+- list_shared_prompts_kandev: List saved prompt summaries without content.
+- get_shared_prompt_kandev: Read one saved prompt by exact name. Required: name.
+Saved prompt names are case-sensitive. Surrounding whitespace is ignored. Use
+the list result to discover names before reading a prompt. These tools are
+read-only and do not create, update, delete, or expand saved prompts.
 
 TASK TOOLS:
 - list_tasks_kandev: List all tasks in a workflow. Required: workflow_id.

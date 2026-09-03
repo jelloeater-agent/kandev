@@ -42,16 +42,18 @@ Evidence is drawn from the Goose source, an ACP client reference
 - **Global extensions:** Goose loads globally-enabled extensions even when
   `session/new` MCP servers are passed; there is no skip knob on `goose acp`.
   Accepted behavior; a slow unrelated global extension may delay `initialize`.
-- **Session resume:** ACP `session/resume`; native resume enabled with session
+- **Session resume:** ACP `session/load`; native resume enabled with session
   root `{home}/.local/share/goose`.
 - **Auth:** declarative config (`~/.config/goose`); primary remote path is a
   `files` `RemoteAuth` copy of the config dir; optional `goose configure` PTY
   login.
 - **Permissions:** Goose presents real interactive approval prompts; map
   `PermissionKeyAutoApprove` via `PermissionApplyMethodAgentctlAutoApprove`.
-- **Environment:** strip host provider-secret vars so they never reach the
-  goose child (`StripEnv`); no required env for base launch.
-- **Install script:** `curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash`.
+- **Environment:** no required environment variables; Goose reads provider
+  credentials from its config files.
+- **Install script:** Kandev downloads the official script to a temporary file,
+  runs it with `CONFIGURE=false` in the first writable absolute directory on
+  the current `PATH`, and verifies the installed `goose acp --help` command.
 
 > **Deviation from earlier plan draft:** `NativeBinaryAgent` is **not**
 > implemented. The interface (`agent.go`) is specifically for npm-distributed
@@ -91,13 +93,14 @@ Evidence is drawn from the Goose source, an ACP client reference
    `["goose","acp"]` across BuildCommand/Runtime.Cmd/InferenceConfig.Command;
    passthrough `["goose"]`; `Runtime().Protocol == agent.ProtocolACP`;
    `SessionDirTemplate == "{home}/.local/share/goose"`; InstallScript; RemoteAuth
-   files for darwin/linux; `StripEnv`; logos non-empty; presence-based detection.
+   files for darwin/linux; no provider environment requirements; logos non-empty;
+   bounded ACP-help detection.
 2. **Implement `goose_acp.go`** — `type GooseACP struct { StandardPassthrough }`;
    marker interfaces `Agent`, `PassthroughAgent`, `InferenceAgent`,
    `LoginAgent`; `goose` binary via `Cmd`/`Command` builders (no shell strings);
-   `IsInstalled` via `Detect(ctx, WithCommand(gooseBin))`; `Runtime()` with
+   `IsInstalled` via a bounded `goose acp --help` identity check; `Runtime()` with
    Protocol ACP, native resume, pinned session dir, `AssumeMcpSse=false`,
-   `StripEnv`; `RemoteAuth` file copy; `InstallScript`; `PermissionSettings`;
+   no `StripEnv`; `RemoteAuth` file copy; `InstallScript`; `PermissionSettings`;
    `InferenceConfig`.
 3. **Register** in `registry.go` `LoadDefaults()`.
 4. **Test wiring** — add Goose to `new_acp_agents_test.go` matrix; add SVGs.
@@ -123,6 +126,6 @@ Evidence is drawn from the Goose source, an ACP client reference
   handles or normalizes these, else add a small parser.
 - **Global extensions auto-load:** accepted; may delay `initialize` if a slow
   unrelated extension is configured.
-- **Detection:** `goose acp` is a blocking server; use presence-based
-  detection, not a probe that could hang or open providers.
+- **Detection:** `goose acp` is a blocking server; use its bounded `--help`
+  command, not the server itself or a provider-opening probe.
 - **Windows support** is unverified upstream; treated as a caveat.

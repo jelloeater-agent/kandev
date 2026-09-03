@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -70,8 +71,8 @@ func (m *Manager) Start(ctx context.Context) error {
 				context.Background(), execution.TaskID, execution.SessionID, execution.ID,
 			)
 			execution.SetSessionSpan(recoverySpan)
-			if execution.agentctl != nil {
-				execution.agentctl.SetTraceContext(execution.SessionTraceContext())
+			if ri.Client != nil {
+				ri.Client.SetTraceContext(execution.SessionTraceContext())
 			}
 
 			// Create short-lived init span so recovery-phase operations are visible
@@ -87,8 +88,8 @@ func (m *Manager) Start(ctx context.Context) error {
 					zap.String("execution_id", execution.ID),
 					zap.String("session_id", execution.SessionID),
 					zap.Error(err))
-				if execution.agentctl != nil {
-					execution.agentctl.Close()
+				if ri.Client != nil {
+					ri.Client.Close()
 				}
 				execution.EndSessionSpan()
 				initSpan.End()
@@ -107,8 +108,10 @@ func (m *Manager) Start(ctx context.Context) error {
 			// without this its trackers keep whatever map they had — or none,
 			// if it was created by a path that could not supply one — and
 			// their diff stats stay pinned to an integration-branch fallback.
-			if client := execution.GetAgentCtlClient(); client != nil {
+			if client, releaseClient := execution.AcquireAgentCtlClient(); client != nil {
 				m.pushTaskBaseBranches(ctx, execution.TaskID, execution.ID, client)
+				m.pushTaskComparisonTargets(ctx, execution.TaskID, execution.ID, client)
+				releaseClient()
 			}
 
 			// Reconnect to workspace streams (shell, git, file changes) in background
@@ -269,23 +272,68 @@ func (m *Manager) CleanupStaleExecutionBySessionID(ctx context.Context, sessionI
 	if !exists {
 		return nil // No execution to clean up
 	}
+	return m.cleanupStaleExecution(ctx, execution)
+}
+
+// CleanupStaleExecutionBySessionIDIfCurrent cleans up only the execution that
+// the caller observed. The operation shares the session-keyed singleflight
+// used by launch paths, so a successor launch either wins before cleanup or
+// runs after the stale execution has been removed. The persisted timestamp
+// check closes the remaining same-ID workspace-promotion window.
+func (m *Manager) CleanupStaleExecutionBySessionIDIfCurrent(
+	ctx context.Context,
+	sessionID, expectedExecutionID string,
+	expectedUpdatedAt time.Time,
+) error {
+	if sessionID == "" || expectedExecutionID == "" {
+		return nil
+	}
+	_, err := m.doCoalescedExecution(ctx, sessionID, func(sharedCtx context.Context) (interface{}, error) {
+		execution, exists := m.executionStore.GetBySessionID(sessionID)
+		if !exists || execution == nil || execution.ID != expectedExecutionID {
+			return nil, nil
+		}
+		if reader, ok := m.runningWriter.(executorRunningReader); ok && !expectedUpdatedAt.IsZero() {
+			current, readErr := reader.GetExecutorRunningBySessionID(sharedCtx, sessionID)
+			if readErr != nil || current == nil || current.AgentExecutionID != expectedExecutionID ||
+				!current.UpdatedAt.Equal(expectedUpdatedAt) {
+				return nil, nil
+			}
+		}
+		return nil, m.cleanupStaleExecution(sharedCtx, execution)
+	})
+	return err
+}
+
+func (m *Manager) cleanupStaleExecution(ctx context.Context, execution *AgentExecution) error {
+	if execution == nil {
+		return nil
+	}
+	execution.remoteInstanceLifecycleMu.Lock()
+	defer execution.remoteInstanceLifecycleMu.Unlock()
+	execution.agentctlLifecycleMu.Lock()
+	defer execution.agentctlLifecycleMu.Unlock()
+	sessionID := execution.SessionID
 
 	m.logger.Info("cleaning up stale agent execution",
 		zap.String("session_id", sessionID),
 		zap.String("execution_id", execution.ID))
 
-	// End session trace span
-	execution.EndSessionSpan()
-
 	// Stop the runtime instance (workspace tracker, shell, etc.) to prevent leaked
 	// goroutines. Without this, the old agentctl instance keeps running when a new
 	// execution is created for the same session, causing git polling on deleted worktrees.
 	// This is idempotent — returns success if the instance is already gone.
-	m.stopAgentViaBackend(ctx, execution.ID, execution, stopReasonStaleExecutionCleanup, false, false)
+	if err := m.stopAgentViaBackend(ctx, execution.ID, execution, stopReasonStaleExecutionCleanup, false, false); err != nil {
+		return fmt.Errorf("stop stale runtime %s: %w", execution.ID, err)
+	}
+
+	// End session trace span only after the runtime has stopped. A failed stop
+	// remains retryable and should keep the execution's lifecycle intact.
+	execution.EndSessionSpan()
 
 	// Close agentctl connection if it exists
-	if execution.agentctl != nil {
-		execution.agentctl.Close()
+	if client := execution.currentAgentCtlClient(); client != nil { // protected by agentctlLifecycleMu
+		client.Close()
 	}
 
 	// Remove from execution store
@@ -294,7 +342,7 @@ func (m *Manager) CleanupStaleExecutionBySessionID(ctx context.Context, sessionI
 	// Delete the persistence row in lockstep with store removal so we never
 	// leave a phantom executors_running row pointing at a non-existent
 	// execution. Best-effort; "not found" is expected and silently swallowed.
-	m.deleteExecutorRunning(ctx, sessionID)
+	m.deleteExecutorRunning(ctx, sessionID, execution.ID)
 
 	return nil
 }
@@ -310,7 +358,7 @@ func (m *Manager) CleanupStaleExecutionBySessionID(ctx context.Context, sessionI
 //   - Removes the execution from the in-memory store
 //   - Makes the sessionID available for new executions
 //   - Does NOT stop the agent process (call StopAgent first)
-//   - Does NOT close the agentctl client (call execution.agentctl.Close() first)
+//   - Does NOT close the agentctl client (use the execution lifecycle lock first)
 //   - Does NOT clean up resources (worktrees, containers, etc.)
 //
 // After calling this, the executionID and sessionID can no longer be used to query

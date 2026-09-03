@@ -34,13 +34,37 @@ func (p *EventPublisher) PublishAgentEvent(ctx context.Context, eventType string
 	p.publishAgentEventPayload(ctx, eventType, newAgentEventPayload(execution))
 }
 
-// PublishAgentStalled publishes one advisory inactivity signal for a prompt.
+// publishAgentEventWithTurnID publishes a lifecycle event with a turn captured
+// by the completion handler. It avoids reading prompt state while that handler
+// still holds the prompt lifecycle lock.
+func (p *EventPublisher) publishAgentEventWithTurnID(
+	ctx context.Context, eventType string, execution *AgentExecution, turnID string,
+) {
+	p.publishAgentEventWithTurnIDAndEvidence(ctx, eventType, execution, turnID, nil)
+}
+
+func (p *EventPublisher) publishAgentEventWithTurnIDAndEvidence(
+	ctx context.Context,
+	eventType string,
+	execution *AgentExecution,
+	turnID string,
+	evidence *PromptAttemptEvidence,
+) {
+	p.publishAgentEventPayload(ctx, eventType, newAgentEventPayloadWithTurnIDAndEvidence(execution, turnID, evidence))
+}
+
+// PublishAgentStalled publishes one inactivity signal for a prompt.
+// neverStarted reports whether the agent has emitted zero events since this
+// prompt was dispatched, and activityEpoch lets the consumer revalidate that
+// classification before applying a terminal transition.
 func (p *EventPublisher) PublishAgentStalled(
 	ctx context.Context,
 	execution *AgentExecution,
 	promptGeneration uint64,
 	lastActivityAt time.Time,
 	stalledFor time.Duration,
+	activityEpoch uint64,
+	neverStarted bool,
 ) {
 	if p.eventBus == nil {
 		return
@@ -50,8 +74,10 @@ func (p *EventPublisher) PublishAgentStalled(
 		TaskID:           execution.TaskID,
 		SessionID:        execution.SessionID,
 		PromptGeneration: promptGeneration,
+		ActivityEpoch:    activityEpoch,
 		LastActivityAt:   lastActivityAt,
 		StalledFor:       stalledFor,
+		NeverStarted:     neverStarted,
 	}
 	if tool := execution.activeToolSnapshot(); tool != nil {
 		payload.ToolCallID = tool.ToolCallID
@@ -88,10 +114,25 @@ func (p *EventPublisher) publishAgentEventPayload(ctx context.Context, eventType
 }
 
 func newAgentEventPayload(execution *AgentExecution) AgentEventPayload {
-	return AgentEventPayload{
+	return newAgentEventPayloadWithTurnID(execution, execution.promptTurnIDSnapshot())
+}
+
+func newAgentEventPayloadWithTurnID(execution *AgentExecution, turnID string) AgentEventPayload {
+	return newAgentEventPayloadWithTurnIDAndEvidence(execution, turnID, nil)
+}
+
+func newAgentEventPayloadWithTurnIDAndEvidence(
+	execution *AgentExecution,
+	turnID string,
+	evidence *PromptAttemptEvidence,
+) AgentEventPayload {
+	payload := AgentEventPayload{
 		AgentExecutionID:   execution.ID,
+		RunID:              execution.RunID,
 		TaskID:             execution.TaskID,
 		SessionID:          execution.SessionID,
+		TaskEnvironmentID:  execution.TaskEnvironmentID,
+		TurnID:             turnID,
 		AgentID:            execution.AgentID,
 		AgentProfileID:     execution.officeProfileID(),
 		ExecutionProfileID: execution.AgentProfileID,
@@ -100,10 +141,18 @@ func newAgentEventPayload(execution *AgentExecution) AgentEventPayload {
 		StartedAt:          execution.StartedAt,
 		FinishedAt:         execution.FinishedAt,
 		ErrorMessage:       execution.ErrorMessage,
+		FailureCode:        execution.FailureCode,
+		FailureDetails:     execution.FailureDetails,
 		ProviderError:      execution.ProviderError,
 		ExitCode:           execution.ExitCode,
 		PromptGeneration:   execution.promptGeneration,
 	}
+	if evidence != nil {
+		payload.EvidenceKnown = evidence.EvidenceKnown
+		payload.OutputObserved = evidence.OutputObserved
+		payload.EffectObserved = evidence.EffectObserved
+	}
+	return payload
 }
 
 // PublishAgentctlEvent publishes an agentctl lifecycle event (starting, ready, error).
@@ -127,6 +176,8 @@ func (p *EventPublisher) PublishAgentctlEvent(ctx context.Context, eventType str
 		TaskEnvironmentID: execution.TaskEnvironmentID,
 		AgentExecutionID:  execution.ID,
 		ErrorMessage:      errMsg,
+		FailureCode:       execution.FailureCode,
+		FailureDetails:    execution.FailureDetails,
 		WorktreeID:        worktreeID,
 		WorktreePath:      execution.WorkspacePath,
 		WorktreeBranch:    worktreeBranch,
@@ -180,6 +231,7 @@ func (p *EventPublisher) PublishAgentStreamEvent(execution *AgentExecution, even
 		ToolCallID:              event.ToolCallID,
 		ParentToolCallID:        event.ParentToolCallID,
 		PendingID:               event.PendingID,
+		RequestID:               event.RequestID,
 		ToolName:                event.ToolName,
 		ToolTitle:               event.ToolTitle,
 		ToolStatus:              event.ToolStatus,
@@ -203,6 +255,7 @@ func (p *EventPublisher) PublishAgentStreamEvent(execution *AgentExecution, even
 		AuthMethods:             event.AuthMethods,
 		CurrentModelID:          event.CurrentModelID,
 		FallbackModel:           event.FallbackModel,
+		ModelSelectionWarning:   event.ModelSelectionWarning,
 		SessionModels:           event.SessionModels,
 		ConfigOptions:           event.ConfigOptions,
 		ConfigBaselineCandidate: event.ConfigBaselineCandidate,
@@ -284,31 +337,35 @@ func (p *EventPublisher) PublishGitEvent(payload *GitEventPayload) {
 // PublishGitStatus publishes a git status update event.
 func (p *EventPublisher) PublishGitStatus(execution *AgentExecution, update *agentctl.GitStatusUpdate) {
 	p.PublishGitEvent(&GitEventPayload{
-		Type:      GitEventTypeStatusUpdate,
-		TaskID:    execution.TaskID,
-		SessionID: execution.SessionID,
-		AgentID:   execution.ID,
-		Timestamp: update.Timestamp.Format(time.RFC3339Nano),
+		Type:              GitEventTypeStatusUpdate,
+		TaskID:            execution.TaskID,
+		SessionID:         execution.SessionID,
+		TaskEnvironmentID: execution.TaskEnvironmentID,
+		AgentID:           execution.ID,
+		Timestamp:         update.Timestamp.Format(time.RFC3339Nano),
 		Status: &GitStatusData{
-			Branch:           update.Branch,
-			RemoteBranch:     update.RemoteBranch,
-			HeadCommit:       update.HeadCommit,
-			BaseCommit:       update.BaseCommit,
-			Modified:         update.Modified,
-			Added:            update.Added,
-			Deleted:          update.Deleted,
-			Untracked:        update.Untracked,
-			Renamed:          update.Renamed,
-			Ahead:            update.Ahead,
-			Behind:           update.Behind,
-			RemoteAhead:      update.RemoteAhead,
-			RemoteBehind:     update.RemoteBehind,
-			RemoteHeadCommit: update.RemoteHeadCommit,
-			Files:            update.Files,
-			BranchAdditions:  update.BranchAdditions,
-			BranchDeletions:  update.BranchDeletions,
-			RepositoryName:   update.RepositoryName,
-			IsSubmodule:      update.IsSubmodule,
+			Branch:              update.Branch,
+			RemoteBranch:        update.RemoteBranch,
+			HeadCommit:          update.HeadCommit,
+			BaseCommit:          update.BaseCommit,
+			ComparisonTarget:    update.ComparisonTarget,
+			ComparisonStatus:    update.ComparisonStatus,
+			ComparisonErrorCode: update.ComparisonErrorCode,
+			Modified:            update.Modified,
+			Added:               update.Added,
+			Deleted:             update.Deleted,
+			Untracked:           update.Untracked,
+			Renamed:             update.Renamed,
+			Ahead:               update.Ahead,
+			Behind:              update.Behind,
+			RemoteAhead:         update.RemoteAhead,
+			RemoteBehind:        update.RemoteBehind,
+			RemoteHeadCommit:    update.RemoteHeadCommit,
+			Files:               update.Files,
+			BranchAdditions:     update.BranchAdditions,
+			BranchDeletions:     update.BranchDeletions,
+			RepositoryName:      update.RepositoryName,
+			IsSubmodule:         update.IsSubmodule,
 		},
 	})
 }
@@ -422,6 +479,7 @@ func (p *EventPublisher) PublishPermissionRequest(execution *AgentExecution, eve
 		AgentID:       execution.ID,
 		TaskID:        execution.TaskID,
 		SessionID:     execution.SessionID,
+		RequestID:     event.RequestID,
 		PendingID:     event.PendingID,
 		ToolCallID:    event.ToolCallID,
 		Title:         event.PermissionTitle,

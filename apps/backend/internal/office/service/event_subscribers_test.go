@@ -520,9 +520,9 @@ func TestPromptUsage_RecordsCostEvent(t *testing.T) {
 	// With no pricing lookup wired and no provider-reported cost, the row
 	// records 0 (Layer A miss + no Layer B), tagged cost_source=unpriced.
 	// Estimated tracks data.Usage.Estimated verbatim (unset here, so false)
-	// — it is a token-synthesis flag, distinct from cost_source, which is
+	// — it is a usage-authority flag, distinct from cost_source, which is
 	// what actually carries the "we could not resolve a price" signal. See
-	// costContractVersion's v1->v2 doc comment in prompt_usage_cost.go.
+	// costContractVersion's version history in prompt_usage_cost.go.
 	if costs[0].CostSubcents != 0 {
 		t.Fatalf("cost_subcents = %d, want 0 (no pricing lookup wired)", costs[0].CostSubcents)
 	}
@@ -531,6 +531,62 @@ func TestPromptUsage_RecordsCostEvent(t *testing.T) {
 	}
 	if costs[0].CostSource == nil || *costs[0].CostSource != models.CostSourceUnpriced {
 		t.Fatalf("cost_source = %v, want %q", costs[0].CostSource, models.CostSourceUnpriced)
+	}
+}
+
+func TestPromptUsage_PublishesCostRecorded(t *testing.T) {
+	svc, eb := newTestServiceWithBus(t)
+	ctx := context.Background()
+
+	createTestAgent(t, svc, "ws-1", "worker-cost-notification")
+	insertTestTask(t, svc, "task-cost-notification", "ws-1")
+	setTestTaskAssignee(t, svc, "task-cost-notification", "worker-cost-notification")
+
+	var recorded *bus.Event
+	if _, err := eb.Subscribe(events.OfficeCostRecorded, func(_ context.Context, event *bus.Event) error {
+		recorded = event
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe cost event: %v", err)
+	}
+
+	event := bus.NewEvent(events.SessionPromptUsageUpdated, "test", map[string]interface{}{
+		"task_id":    "task-cost-notification",
+		"session_id": "session-cost-notification",
+		"agent_id":   "claude-acp",
+		"model":      "gpt-4o-mini",
+		"usage": map[string]interface{}{
+			"input_tokens":  10,
+			"output_tokens": 5,
+		},
+	})
+	if err := eb.Publish(ctx, events.BuildSessionPromptUsageSubject("session-cost-notification"), event); err != nil {
+		t.Fatalf("publish prompt usage: %v", err)
+	}
+
+	if recorded == nil {
+		t.Fatal("expected office.cost.recorded event after cost insert")
+	}
+	if recorded.Type != events.OfficeCostRecorded || recorded.Subject != events.OfficeCostRecorded {
+		t.Fatalf("recorded event identity = type %q subject %q, want %q", recorded.Type, recorded.Subject, events.OfficeCostRecorded)
+	}
+	data, ok := recorded.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("recorded event data type = %T, want map[string]interface{}", recorded.Data)
+	}
+	want := map[string]string{
+		"workspace_id": "ws-1",
+		"task_id":      "task-cost-notification",
+		"session_id":   "session-cost-notification",
+		"project_id":   "",
+	}
+	for key, value := range want {
+		if got, _ := data[key].(string); got != value {
+			t.Errorf("event data[%q] = %q, want %q", key, got, value)
+		}
+	}
+	if got, ok := data["cost_subcents"].(int64); !ok || got != 0 {
+		t.Errorf("event data[cost_subcents] = %#v, want int64(0)", data["cost_subcents"])
 	}
 }
 
@@ -780,38 +836,6 @@ func TestMovedToDone_WithoutExecutionPolicy_NormalCompletion(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected activity log entry with action 'task_status_changed' for task %s, got %+v", taskID, activity)
-	}
-}
-
-func TestHandleTaskStatusChanged_LogsActivity(t *testing.T) {
-	svc, eb := newTestServiceWithBus(t)
-	ctx := context.Background()
-
-	createTestAgent(t, svc, "ws-1", "worker-status")
-	taskID := createOfficeTask(t, svc, "ws-1", "worker-status")
-
-	statusEvt := bus.NewEvent(events.OfficeTaskStatusChanged, "test", map[string]interface{}{
-		"task_id":      taskID,
-		"new_status":   "in_progress",
-		"workspace_id": "ws-1",
-	})
-	if err := eb.Publish(ctx, events.OfficeTaskStatusChanged, statusEvt); err != nil {
-		t.Fatalf("publish office.task.status_changed: %v", err)
-	}
-
-	activity, err := svc.ListActivity(ctx, "ws-1", 50)
-	if err != nil {
-		t.Fatalf("list activity: %v", err)
-	}
-	found := false
-	for _, a := range activity {
-		if a.Action == "task_status_changed" && a.TargetID == taskID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected activity entry with action 'task_status_changed' for task %s, got %+v", taskID, activity)
 	}
 }
 
