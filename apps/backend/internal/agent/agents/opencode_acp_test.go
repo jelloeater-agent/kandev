@@ -9,6 +9,10 @@ import (
 )
 
 func TestOpenCodeACPUsesManagedRuntime(t *testing.T) {
+	// InferenceConfig prefers an installed opencode on PATH (see
+	// TestOpenCodeACPInferenceConfigPrefersNativeBinaryOnPath), so pin PATH to
+	// an empty dir here to assert the npx fallback path deterministically.
+	t.Setenv("PATH", t.TempDir())
 	a := NewOpenCodeACP()
 	want := []string{"npx", "--yes", "--prefer-offline", "opencode-ai", "acp", "--print-logs", "--log-level", "ERROR"}
 
@@ -23,6 +27,43 @@ func TestOpenCodeACPUsesManagedRuntime(t *testing.T) {
 	}
 	if got, wantInstall := a.InstallScript(), "npm install -g opencode-ai"; got != wantInstall {
 		t.Fatalf("InstallScript = %q, want %q", got, wantInstall)
+	}
+}
+
+// TestOpenCodeACPBuildCommandPrefersNativeBinary is the CodeNomad-style
+// binary-first launch: when the lifecycle probe finds `opencode` on PATH,
+// BuildCommand emits the direct binary instead of the per-launch npx
+// resolution. It is the regression test for "ACP initialize failed: peer
+// disconnected before response", which happened because npx exited with
+// empty stdout on a stale packument cache / missing postinstall bootstrap.
+func TestOpenCodeACPBuildCommandPrefersNativeBinary(t *testing.T) {
+	a := NewOpenCodeACP()
+
+	if name := a.NativeBinaryName(); name != "opencode" {
+		t.Fatalf("NativeBinaryName() = %q, want %q", name, "opencode")
+	}
+
+	wantNative := []string{"opencode", "acp", "--print-logs", "--log-level", "ERROR"}
+	if got := a.BuildCommand(CommandOptions{PreferNativeBinary: true}).Args(); !slices.Equal(got, wantNative) {
+		t.Fatalf("BuildCommand(PreferNativeBinary) = %#v, want %#v", got, wantNative)
+	}
+
+	// Default (probe absent / containers / remotes) keeps the managed npx runtime.
+	if got := a.BuildCommand(CommandOptions{}).Args(); !slices.Equal(got, []string{"npx", "--yes", "--prefer-offline", "opencode-ai", "acp", "--print-logs", "--log-level", "ERROR"}) {
+		t.Fatalf("BuildCommand(default) = %#v, want npx fallback", got)
+	}
+}
+
+// TestOpenCodeACPInferenceConfigPrefersNativeBinaryOnPath pins the host-utility
+// bootstrap to the standalone binary when it is installed, so the ACP probe
+// never depends on npm cache state.
+func TestOpenCodeACPInferenceConfigPrefersNativeBinaryOnPath(t *testing.T) {
+	writeOpenCodeTestBinary(t, "exit 0")
+
+	a := NewOpenCodeACP()
+	want := []string{"opencode", "acp", "--print-logs", "--log-level", "ERROR"}
+	if got := a.InferenceConfig().Command.Args(); !slices.Equal(got, want) {
+		t.Fatalf("InferenceConfig().Command = %#v, want %#v", got, want)
 	}
 }
 

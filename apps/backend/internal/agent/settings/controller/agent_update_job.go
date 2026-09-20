@@ -173,7 +173,7 @@ func (s *AgentUpdateJobStore) run(
 	}
 
 	s.setStatus(job, dto.AgentUpdateJobStatusRefreshing)
-	caps, refreshErr := s.updater.Refresh(ctx, job.AgentName, spec.CachedACPCommand())
+	caps, refreshErr := s.updater.Refresh(ctx, job.AgentName, spec.RefreshCommand())
 	s.finishRefresh(job, ctx, caps, refreshErr, ref)
 }
 
