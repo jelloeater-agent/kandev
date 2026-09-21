@@ -668,9 +668,10 @@ func setDefaults(v *viper.Viper) {
 
 	// Agent defaults (runtime selection is now per-task based on executor type)
 	//
-	// 127.0.0.1 instead of "localhost": Go's dialer resolves localhost to ::1
-	// first and does not fall back to IPv4 on connection refused. Host utility
-	// health checks against agentctl then fail with
+	// 127.0.0.1 instead of "localhost": localhost resolution can select an IPv6
+	// loopback address before an IPv4 address. The explicit IPv4 loopback avoids
+	// address-resolution variance when host utility health checks run against
+	// agentctl bound IPv4-only and fail with
 	// "dial tcp [::1]:41001: connect: connection refused" whenever agentctl is
 	// bound IPv4-only (e.g. auth-disabled loopback binds), spinning the
 	// "host utility instance unhealthy; recreating" loop. The loopback
