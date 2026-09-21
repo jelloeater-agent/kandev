@@ -132,6 +132,7 @@ func TestBuildAgentCommand_ResumeFlag(t *testing.T) {
 }
 
 func TestBuildAgentCommand_UsesManagedNPMRuntimes(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	mgr := newTestManager(t)
 	tests := []struct {
 		name  string
@@ -162,6 +163,9 @@ func TestBuildAgentCommand_UsesManagedNPMRuntimes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			want := strings.Join(tt.agent.(agents.ManagedNPMRuntimeAgent).ManagedNPMRuntime().CachedACPCommand().Args(), " ")
+			if tt.name == "opencode" {
+				want = strings.Join(tt.agent.(agents.ManagedNPMRuntimeAgent).ManagedNPMRuntime().NativeCommand().Args(), " ")
+			}
 			cmds, err := mgr.buildAgentCommandWithContext(context.Background(), &LaunchRequest{}, nil, tt.agent, true)
 			require.NoError(t, err)
 			require.Equal(t, want, cmds.initial)

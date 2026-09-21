@@ -4,14 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 )
 
 func TestOpenCodeACPUsesManagedRuntime(t *testing.T) {
-	// InferenceConfig prefers an installed opencode on PATH (see
-	// TestOpenCodeACPInferenceConfigPrefersNativeBinaryOnPath), so pin PATH to
-	// an empty dir here to assert the npx fallback path deterministically.
+	// Pin PATH to an empty dir so the executor-safe configuration is
+	// deterministic.
 	t.Setenv("PATH", t.TempDir())
 	a := NewOpenCodeACP()
 	want := a.ManagedNPMRuntime().CachedACPCommand().Args()
@@ -49,7 +49,7 @@ func TestOpenCodeACPBuildCommandPrefersNativeBinary(t *testing.T) {
 	}
 
 	// Default (probe absent / containers / remotes) keeps the managed npx runtime.
-	if got := a.BuildCommand(CommandOptions{}).Args(); !slices.Equal(got, []string{"npx", "--yes", "--prefer-offline", "opencode-ai", "acp", "--print-logs", "--log-level", "ERROR"}) {
+	if got := a.BuildCommand(CommandOptions{}).Args(); !slices.Equal(got, a.ManagedNPMRuntime().CachedACPCommand().Args()) {
 		t.Fatalf("BuildCommand(default) = %#v, want npx fallback", got)
 	}
 }
@@ -62,12 +62,25 @@ func TestOpenCodeACPInferenceConfigPrefersNativeBinaryOnPath(t *testing.T) {
 
 	a := NewOpenCodeACP()
 	want := []string{"opencode", "acp", "--print-logs", "--log-level", "ERROR"}
+	if got := a.HostUtilityInferenceConfig().Command.Args(); !slices.Equal(got, want) {
+		t.Fatalf("HostUtilityInferenceConfig().Command = %#v, want %#v", got, want)
+	}
+}
+
+func TestOpenCodeACPInferenceConfigStaysExecutorSafeOnHostPath(t *testing.T) {
+	writeOpenCodeTestBinary(t, "exit 0")
+
+	a := NewOpenCodeACP()
+	want := a.ManagedNPMRuntime().CachedACPCommand().Args()
 	if got := a.InferenceConfig().Command.Args(); !slices.Equal(got, want) {
-		t.Fatalf("InferenceConfig().Command = %#v, want %#v", got, want)
+		t.Fatalf("InferenceConfig().Command = %#v, want executor-safe npx command %#v", got, want)
 	}
 }
 
 func TestOpenCodeACPDiscoveryRecognizesAuthenticationHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is not executable on Windows")
+	}
 	binaryPath := writeOpenCodeTestBinary(t, "exit 7")
 
 	a := NewOpenCodeACP()
@@ -84,6 +97,9 @@ func TestOpenCodeACPDiscoveryRecognizesAuthenticationHelper(t *testing.T) {
 }
 
 func TestOpenCodeACPDiscoveryDoesNotRunVersionCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is not executable on Windows")
+	}
 	writeOpenCodeTestBinary(t, "exit 7")
 
 	result, err := NewOpenCodeACP().IsInstalled(context.Background())
@@ -98,13 +114,20 @@ func TestOpenCodeACPDiscoveryDoesNotRunVersionCommand(t *testing.T) {
 func writeOpenCodeTestBinary(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
-	binaryPath := filepath.Join(dir, "opencode")
+	binaryPath := filepath.Join(dir, agentTestExecutableName("opencode"))
 	contents := "#!/bin/sh\n" + body + "\n"
 	if err := os.WriteFile(binaryPath, []byte(contents), 0o755); err != nil {
 		t.Fatalf("write fake opencode: %v", err)
 	}
 	t.Setenv("PATH", dir)
 	return binaryPath
+}
+
+func agentTestExecutableName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
 }
 
 // TestOpenCodeACPRuntime_RequiresProcessKill is the regression test for GH

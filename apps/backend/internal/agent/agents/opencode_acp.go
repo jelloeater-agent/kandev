@@ -25,11 +25,12 @@ const opencodeACPPackage = "opencode-ai"
 const opencodeNativeBinary = "opencode"
 
 var (
-	_ Agent                  = (*OpenCodeACP)(nil)
-	_ PassthroughAgent       = (*OpenCodeACP)(nil)
-	_ InferenceAgent         = (*OpenCodeACP)(nil)
-	_ ManagedNPMRuntimeAgent = (*OpenCodeACP)(nil)
-	_ NativeBinaryAgent      = (*OpenCodeACP)(nil)
+	_ Agent                     = (*OpenCodeACP)(nil)
+	_ PassthroughAgent          = (*OpenCodeACP)(nil)
+	_ InferenceAgent            = (*OpenCodeACP)(nil)
+	_ HostUtilityInferenceAgent = (*OpenCodeACP)(nil)
+	_ ManagedNPMRuntimeAgent    = (*OpenCodeACP)(nil)
+	_ NativeBinaryAgent         = (*OpenCodeACP)(nil)
 )
 
 // OpenCodeACP is the ACP protocol variant of OpenCode.
@@ -190,12 +191,19 @@ func (a *OpenCodeACP) PermissionSettings() map[string]PermissionSetting {
 	return emptyPermSettings
 }
 
-// InferenceConfig returns configuration for one-shot inference using ACP.
-// The host-utility bootstrap and probe run on the host, so prefer the
-// standalone opencode binary when it is on PATH — the probe must not depend
-// on npm cache state (stale packument / missing postinstall bootstrap) that
-// made the ACP handshake exit with empty stdout.
+// InferenceConfig returns the executor-safe configuration for one-shot
+// inference. Session inference can run inside a container or on SSH, so it
+// keeps the managed npm command unless the executor selects native use.
 func (a *OpenCodeACP) InferenceConfig() *InferenceConfig {
+	return &InferenceConfig{
+		Supported: true,
+		Command:   a.ManagedNPMRuntime().CachedACPCommand(),
+	}
+}
+
+// HostUtilityInferenceConfig prefers the native binary because host utility
+// instances run on the backend host and do not cross an executor boundary.
+func (a *OpenCodeACP) HostUtilityInferenceConfig() *InferenceConfig {
 	spec := a.ManagedNPMRuntime()
 	command := spec.CachedACPCommand()
 	if spec.NativeBinaryOnPath() {
